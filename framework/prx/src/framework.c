@@ -88,7 +88,7 @@
 #define MOD_NAME          "mhfu_framework"
 
 /* Wrapper size in instructions; must match the layout in install_trampoline_for(). */
-#define WRAPPER_INSNS     30
+#define WRAPPER_INSNS     54        /* 49 used + 5 NOP pad */
 #define WRAPPER_BYTES     (WRAPPER_INSNS * 4)
 #define CAVE_SLOTS        8        /* room for up to 8 wrappers */
 
@@ -98,13 +98,16 @@
 PSP_MODULE_INFO(MOD_NAME, 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
 
-/* pspsdk's crt0_prx _start by default calls sceKernelCreateThread +
- * sceKernelStartThread to run main() on a dedicated thread. Under
- * PPSSPP's plugin host that thread creation hangs silently — the plugin
- * thread ran once at _start, never spawned the worker, never called
- * main(). Defining this weak symbol non-zero tells crt0 to skip the
- * thread creation and call main() directly from module_start. */
-int sce_newlib_nocreate_thread_in_start = 1;
+/* Leave crt0_prx's default in place: _start (= module_start) spawns
+ * a thread for main(), then returns. This is critical for PPSSPP
+ * plugin compatibility — if main() runs synchronously in the
+ * module_start thread, our idle loop blocks sceKernelStartModule
+ * indefinitely and PPSSPP can't boot the game (black screen).
+ *
+ * The earlier "thread spawn hangs silently" symptom I observed was
+ * actually due to the module being in kernel mode (attr 0x1007); once
+ * we switched to user mode (attr 0), the default crt0 thread-spawn
+ * works correctly and main() runs in its own thread. */
 
 /* ------------------------------------------------------------------------ *
  * Per-event callback lists.
@@ -177,11 +180,32 @@ int mhfu_unregister_event(mhfu_event_id_t event_id, mhfu_event_cb_t cb)
  * builds a public mhfu_event_ctx_t; walks the callback list.
  * ------------------------------------------------------------------------ */
 
+/* Per-event last-seen cell values, so the dispatchers only fire on
+ * the meaningful transition rather than on every instruction
+ * execution. The instruction at our anchor PC runs every frame
+ * (writes the cell whether or not the value changes); we want
+ * mhfu_on_quest_beginning to fire ONCE when the timer goes 0 → 90000,
+ * not 60 times per second.
+ *
+ * BSS-zero-initialised — the first poll after game boot will see
+ * "transition from 0 to <whatever>" which is wrong only on the very
+ * first frame; for quest_timer that's fine because 0 means "no quest
+ * active" so no event fires.
+ */
+static uint32_t g_last_quest_timer = 0;
+static uint16_t g_last_area_index  = 0;
+
 void mhfu_dispatch_quest_beginning(const mhfu_anchor_regs_t *regs)
 {
+    uint32_t cur  = mhfu_get_quest_timer();
+    uint32_t prev = g_last_quest_timer;
+    g_last_quest_timer = cur;
+    /* Quest-start signal: timer transitions FROM zero TO non-zero. */
+    if (prev != 0 || cur == 0) return;
+
     mhfu_event_ctx_t ctx;
     ctx.event_id   = MHFU_EVENT_QUEST_BEGINNING;
-    ctx.cell_value = mhfu_get_quest_timer();
+    ctx.cell_value = cur;
     ctx.a0 = regs->a0; ctx.a1 = regs->a1; ctx.a2 = regs->a2; ctx.a3 = regs->a3;
     ctx.v0 = regs->v0; ctx.v1 = regs->v1;
     ctx.ra = regs->ra; ctx.sp = regs->sp; ctx.pc = regs->pc;
@@ -191,14 +215,15 @@ void mhfu_dispatch_quest_beginning(const mhfu_anchor_regs_t *regs)
 
 void mhfu_dispatch_quest_entered(const mhfu_anchor_regs_t *regs)
 {
-    /* area_index gets several writes during quest setup; only the one
-     * that lands on 98 (the in-area marker) is the actual "entered"
-     * event. Filter inline. */
-    if (mhfu_get_area_index() != 98) return;
+    uint16_t cur  = mhfu_get_area_index();
+    uint16_t prev = g_last_area_index;
+    g_last_area_index = cur;
+    /* Quest-entered signal: area_index transitions TO 98 (in-area). */
+    if (cur != 98 || prev == 98) return;
 
     mhfu_event_ctx_t ctx;
     ctx.event_id   = MHFU_EVENT_QUEST_ENTERED;
-    ctx.cell_value = mhfu_get_area_index();
+    ctx.cell_value = cur;
     ctx.a0 = regs->a0; ctx.a1 = regs->a1; ctx.a2 = regs->a2; ctx.a3 = regs->a3;
     ctx.v0 = regs->v0; ctx.v1 = regs->v1;
     ctx.ra = regs->ra; ctx.sp = regs->sp; ctx.pc = regs->pc;
@@ -278,9 +303,22 @@ static int install_trampoline_for(
     uint32_t *w = cave_slot_addr(slot_index);
     int i = 0;
 
-    /* Prologue — reserve 0x40 scratch + spill regs into the anchor_regs
-     * layout starting at offset 0. */
-    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x40);
+    /* Prologue — reserve 0x80 scratch frame. We must save every
+     * caller-saved GPR before calling our C dispatcher, otherwise the
+     * dispatcher's compiled code clobbers $at, $t0..$t9 and the game's
+     * surrounding code (which expects them to survive the original
+     * `sv.q` store) gets corrupted state. Earlier wrappers saved only
+     * $a0..$a3 + $v0..$v1 + $ra; the resulting black-screen lockup was
+     * the symptom of $t0..$t9 being garbage on return.
+     *
+     * Stack layout (matches mhfu_anchor_regs_t for the first 9 slots):
+     *   +0x00 a0      +0x14 v1     +0x28 at
+     *   +0x04 a1      +0x18 ra     +0x2C t0
+     *   +0x08 a2      +0x1C sp     +0x30 t1   ...   +0x50 t9
+     *   +0x0C a3      +0x20 pc
+     *   +0x10 v0      +0x24 (pad)
+     */
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x80);
     w[i++] = mips_sw(MIPS_REG_A0, 0x00, MIPS_REG_SP);
     w[i++] = mips_sw(MIPS_REG_A1, 0x04, MIPS_REG_SP);
     w[i++] = mips_sw(MIPS_REG_A2, 0x08, MIPS_REG_SP);
@@ -289,36 +327,52 @@ static int install_trampoline_for(
     w[i++] = mips_sw(MIPS_REG_V1, 0x14, MIPS_REG_SP);
     w[i++] = mips_sw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
 
-    /* original_sp = current_sp + 0x40, stash via $t0 */
-    w[i++] = mips_addiu(MIPS_REG_T0, MIPS_REG_SP, 0x40);
+    /* Save $at and $t0..$t9 BEFORE we use any of them as scratch. */
+    w[i++] = mips_sw(MIPS_REG_AT, 0x28, MIPS_REG_SP);
+    w[i++] = mips_sw(MIPS_REG_T0, 0x2C, MIPS_REG_SP);
+    w[i++] = mips_sw(MIPS_REG_T1, 0x30, MIPS_REG_SP);
+    w[i++] = mips_sw(MIPS_REG_T2, 0x34, MIPS_REG_SP);
+    w[i++] = mips_sw(MIPS_REG_T3, 0x38, MIPS_REG_SP);
+    w[i++] = mips_sw(MIPS_REG_T4, 0x3C, MIPS_REG_SP);
+    w[i++] = mips_sw(MIPS_REG_T5, 0x40, MIPS_REG_SP);
+    w[i++] = mips_sw(MIPS_REG_T6, 0x44, MIPS_REG_SP);
+    w[i++] = mips_sw(MIPS_REG_T7, 0x48, MIPS_REG_SP);
+    w[i++] = mips_sw(MIPS_REG_T8, 0x4C, MIPS_REG_SP);
+    w[i++] = mips_sw(MIPS_REG_T9, 0x50, MIPS_REG_SP);
+
+    /* Now safe to use $t0 as scratch — its original value is on the stack. */
+    w[i++] = mips_addiu(MIPS_REG_T0, MIPS_REG_SP, 0x80);
     w[i++] = mips_sw(MIPS_REG_T0, 0x1C, MIPS_REG_SP);
 
-    /* pc constant — lui+ori is the standard 32-bit load. lui sign-extends?
-     * No — lui shifts the imm left 16. The lo half is OR'd in zero-
-     * extended, so the two-instruction sequence reconstructs the full
-     * 32-bit anchor_pc exactly. */
     w[i++] = mips_lui(MIPS_REG_T0, (uint16_t)(anchor_pc >> 16));
     w[i++] = mips_ori(MIPS_REG_T0, MIPS_REG_T0, (uint16_t)(anchor_pc & 0xFFFF));
     w[i++] = mips_sw(MIPS_REG_T0, 0x20, MIPS_REG_SP);
-
-    /* Preserve the wrapper's own $ra (set by JAL into the cave from the
-     * patched anchor) so we can return cleanly. */
-    w[i++] = mips_sw(MIPS_REG_RA, 0x30, MIPS_REG_SP);
 
     /* Call dispatcher with $a0 = &anchor_regs (which is just $sp). */
     w[i++] = mips_move(MIPS_REG_A0, MIPS_REG_SP);
     w[i++] = mips_jal(dispatcher_addr);
     w[i++] = MIPS_NOP;   /* delay slot of jal */
 
-    /* Restore. */
+    /* Restore everything we saved, in any order. */
     w[i++] = mips_lw(MIPS_REG_A0, 0x00, MIPS_REG_SP);
     w[i++] = mips_lw(MIPS_REG_A1, 0x04, MIPS_REG_SP);
     w[i++] = mips_lw(MIPS_REG_A2, 0x08, MIPS_REG_SP);
     w[i++] = mips_lw(MIPS_REG_A3, 0x0C, MIPS_REG_SP);
     w[i++] = mips_lw(MIPS_REG_V0, 0x10, MIPS_REG_SP);
     w[i++] = mips_lw(MIPS_REG_V1, 0x14, MIPS_REG_SP);
-    w[i++] = mips_lw(MIPS_REG_RA, 0x30, MIPS_REG_SP);
-    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x40);
+    w[i++] = mips_lw(MIPS_REG_RA, 0x18, MIPS_REG_SP);   /* GAME's ra */
+    w[i++] = mips_lw(MIPS_REG_AT, 0x28, MIPS_REG_SP);
+    w[i++] = mips_lw(MIPS_REG_T0, 0x2C, MIPS_REG_SP);
+    w[i++] = mips_lw(MIPS_REG_T1, 0x30, MIPS_REG_SP);
+    w[i++] = mips_lw(MIPS_REG_T2, 0x34, MIPS_REG_SP);
+    w[i++] = mips_lw(MIPS_REG_T3, 0x38, MIPS_REG_SP);
+    w[i++] = mips_lw(MIPS_REG_T4, 0x3C, MIPS_REG_SP);
+    w[i++] = mips_lw(MIPS_REG_T5, 0x40, MIPS_REG_SP);
+    w[i++] = mips_lw(MIPS_REG_T6, 0x44, MIPS_REG_SP);
+    w[i++] = mips_lw(MIPS_REG_T7, 0x48, MIPS_REG_SP);
+    w[i++] = mips_lw(MIPS_REG_T8, 0x4C, MIPS_REG_SP);
+    w[i++] = mips_lw(MIPS_REG_T9, 0x50, MIPS_REG_SP);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x80);
 
     /* The two displaced instructions, then jump back. */
     w[i++] = insn0;
@@ -549,33 +603,39 @@ static int install_worker(SceSize args, void *argp)
     return 0;
 }
 
+/* Diagnostic levels (set MHFU_DIAG_LEVEL to control what main() does):
+ *   0 — main() returns 0 immediately. Nothing else.
+ *   1 — call detect_region + register callbacks, then return.
+ *   2 — full normal flow but no patching. Idle loop.
+ *   3 — full normal flow WITH patching.
+ */
+#define MHFU_DIAG_LEVEL 3
+
 int main(int argc, char *argv[])
 {
     (void)argc; (void)argv;
+#if MHFU_DIAG_LEVEL == 0
+    /* Minimal plugin: just exit. If the game still black-screens here,
+     * it's a PPSSPP-vs-MHFU plugin issue, not anything in our code. */
+    return 0;
+#else
     sentinel_set(0x00, 0xCAFE0001);
-    mhfu_log("[framework] %s starting", MOD_NAME);
+    mhfu_log("[framework] %s starting (diag=%d)", MOD_NAME, MHFU_DIAG_LEVEL);
     detect_region();
     sentinel_set(0x00, 0xCAFE0002);
-
-    /* Register the built-in demo callbacks immediately — they're just
-     * function pointers, no MIPS-side work yet. */
     mhfu_register_event(MHFU_EVENT_QUEST_BEGINNING, demo_on_quest_beginning);
     mhfu_register_event(MHFU_EVENT_QUEST_ENTERED,   demo_on_quest_entered);
-
     load_mods();
     sentinel_set(0x00, 0xCAFE0004);
     mhfu_log("[framework] ready");
-
-    /* Run the install poll loop DIRECTLY in main() — never return.
-     * If main() returns, crt0's _exit() calls
-     * sceKernelSelfStopUnloadModule which unloads the PRX and would
-     * leave the trampolines pointing into freed memory. So we own
-     * this thread for the life of the game. */
-    install_worker(0, NULL);
-    /* install_worker only returns on timeout or fatal error; if we
-     * fall through, idle harmlessly so the module stays resident. */
+#if MHFU_DIAG_LEVEL == 1
+    return 0;
+#else
+    if (MHFU_DIAG_LEVEL >= 3) install_worker(0, NULL);
     for (;;) sceKernelDelayThread(1000 * 1000);
     return 0;
+#endif
+#endif
 }
 
 int module_stop(SceSize args, void *argp)

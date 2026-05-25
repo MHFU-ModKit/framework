@@ -29,6 +29,12 @@
 #define MIPS_REG_A3    7
 #define MIPS_REG_T0    8
 #define MIPS_REG_T1    9
+#define MIPS_REG_T2   10
+#define MIPS_REG_T3   11
+#define MIPS_REG_T4   12
+#define MIPS_REG_T5   13
+#define MIPS_REG_T6   14
+#define MIPS_REG_T7   15
 #define MIPS_REG_T8   24
 #define MIPS_REG_T9   25
 #define MIPS_REG_SP   29
