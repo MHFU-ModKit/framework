@@ -58,7 +58,9 @@ int main(int argc, char *argv[])
 int module_stop(SceSize args, void *argp)
 {
     (void)args; (void)argp;
-    mhfu_unregister_event(MHFU_EVENT_QUEST_BEGINNING, on_quest_beginning);
-    mhfu_unregister_event(MHFU_EVENT_QUEST_ENTERED, on_quest_entered);
+    mhfu_unregister_event(MHFU_EVENT_QUEST_BEGINNING,
+                          (mhfu_event_cb_t)(void *)on_quest_beginning);
+    mhfu_unregister_event(MHFU_EVENT_QUEST_ENTERED,
+                          (mhfu_event_cb_t)(void *)on_quest_entered);
     return 0;
 }

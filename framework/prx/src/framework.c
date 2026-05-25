@@ -213,13 +213,36 @@ void mhfu_dispatch_quest_beginning(const mhfu_anchor_regs_t *regs)
         g_cbs[MHFU_EVENT_QUEST_BEGINNING][i](&ctx);
 }
 
+/* The anchor PC 0x0884CDFC runs every frame and writes area_index. We
+ * keep a software change-filter so dispatchers fire only on the real
+ * transitions. From this single anchor we drive BOTH:
+ *   • mhfu_on_quest_entered      — fires once when area_index → 98
+ *   • mhfu_on_map_section_entered — fires on every area_index transition
+ * Mod authors filter by section_id inside their callback if they only
+ * want a specific section. */
 void mhfu_dispatch_quest_entered(const mhfu_anchor_regs_t *regs)
 {
     uint16_t cur  = mhfu_get_area_index();
     uint16_t prev = g_last_area_index;
+    if (cur == prev) return;
     g_last_area_index = cur;
-    /* Quest-entered signal: area_index transitions TO 98 (in-area). */
-    if (cur != 98 || prev == 98) return;
+
+    /* 1) Map-section change — fires on EVERY transition. */
+    {
+        mhfu_map_section_ctx_t mctx;
+        mctx.event_id        = MHFU_EVENT_MAP_SECTION_ENTERED;
+        mctx.section_id      = cur;
+        mctx.prev_section_id = prev;
+        mctx.quest_timer     = mhfu_get_quest_timer();
+        mctx.screen_state    = mhfu_get_screen_state();
+        mctx.is_in_quest_area = (mctx.screen_state == 17) ? 1 : 0;
+        mctx._pad            = 0;
+        for (int i = 0; i < g_n_cbs[MHFU_EVENT_MAP_SECTION_ENTERED]; i++)
+            g_cbs[MHFU_EVENT_MAP_SECTION_ENTERED][i](&mctx);
+    }
+
+    /* 2) Quest-entered — only when transitioning TO 98 (in-area). */
+    if (cur != 98) return;
 
     mhfu_event_ctx_t ctx;
     ctx.event_id   = MHFU_EVENT_QUEST_ENTERED;
@@ -229,6 +252,70 @@ void mhfu_dispatch_quest_entered(const mhfu_anchor_regs_t *regs)
     ctx.ra = regs->ra; ctx.sp = regs->sp; ctx.pc = regs->pc;
     for (int i = 0; i < g_n_cbs[MHFU_EVENT_QUEST_ENTERED]; i++)
         g_cbs[MHFU_EVENT_QUEST_ENTERED][i](&ctx);
+}
+
+/* ------------------------------------------------------------------------ *
+ * Monster-spawn polling.
+ *
+ * No anchor PC for the entity-registry slot writes — PPSSPP's mem-BP
+ * coverage doesn't catch them and we haven't found a single writer
+ * instruction. The PRX runs ON the emulated PSP though, so polling
+ * the registry every ~200 ms is cheap and reliable.
+ *
+ * Slot 0 is the player (skipped). Slots 1..20 are monsters; a slot
+ * transitioning from 0 → non-zero is a fresh spawn. We remember every
+ * ptr we've dispatched against so a stable ptr doesn't fire twice;
+ * resetting when the slot returns to 0 lets the next spawn fire.
+ * ------------------------------------------------------------------------ */
+
+#define ENTITY_REGISTRY_ADDR  0x09C1213Cu
+#define ENTITY_REGISTRY_SLOTS 21
+#define ENTITY_OFF_SIZE_SCALE 0x024
+#define ENTITY_OFF_ENTITY_ID  0x1E4
+#define ENTITY_OFF_MONSTER_TY 0x1E8
+#define ENTITY_OFF_HP         0x2E4
+
+static uint32_t g_last_entity_ptrs[ENTITY_REGISTRY_SLOTS];
+
+static void mhfu_dispatch_monster_spawned(int slot, uint32_t entity_ptr)
+{
+    if (g_n_cbs[MHFU_EVENT_MONSTER_SPAWNED] == 0) return;
+    mhfu_monster_spawn_ctx_t ctx;
+    ctx.event_id    = MHFU_EVENT_MONSTER_SPAWNED;
+    ctx.slot        = slot;
+    ctx.entity_ptr  = entity_ptr;
+    ctx.monster_type = *(volatile uint8_t  *)(entity_ptr + ENTITY_OFF_MONSTER_TY);
+    ctx.entity_id    = *(volatile uint8_t  *)(entity_ptr + ENTITY_OFF_ENTITY_ID);
+    ctx.hp           = *(volatile uint16_t *)(entity_ptr + ENTITY_OFF_HP);
+    uint32_t size_raw = *(volatile uint32_t *)(entity_ptr + ENTITY_OFF_SIZE_SCALE);
+    /* type-pun via union to avoid strict-aliasing warnings */
+    union { uint32_t u; float f; } cvt; cvt.u = size_raw; ctx.size_scale = cvt.f;
+    for (int i = 0; i < g_n_cbs[MHFU_EVENT_MONSTER_SPAWNED]; i++)
+        g_cbs[MHFU_EVENT_MONSTER_SPAWNED][i](&ctx);
+}
+
+static int monster_spawn_poll_thread(SceSize args, void *argp)
+{
+    (void)args; (void)argp;
+    for (;;) {
+        /* 5 Hz */
+        sceKernelDelayThread(200 * 1000);
+        for (int slot = 1; slot < ENTITY_REGISTRY_SLOTS; slot++) {
+            uint32_t cur = *(volatile uint32_t *)(ENTITY_REGISTRY_ADDR + slot * 4);
+            uint32_t prev = g_last_entity_ptrs[slot];
+            if (cur == 0) {
+                /* Slot cleared — reset so the next reuse fires. */
+                if (prev != 0) g_last_entity_ptrs[slot] = 0;
+                continue;
+            }
+            if (cur == prev) continue;
+            /* Sanity-check the pointer before dereferencing. */
+            if (cur < 0x08000000u || cur > 0x0A000000u) continue;
+            g_last_entity_ptrs[slot] = cur;
+            mhfu_dispatch_monster_spawned(slot, cur);
+        }
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -531,6 +618,195 @@ static void demo_on_quest_entered(const mhfu_event_ctx_t *ctx)
     mhfu_log("[demo] * QUEST ENTERED");
 }
 
+static void demo_on_map_section_entered(const mhfu_map_section_ctx_t *ctx)
+{
+    mhfu_log("[demo] * MAP SECTION ENTERED  section=%u (prev=%u)  qtimer=%u",
+             (unsigned)ctx->section_id,
+             (unsigned)ctx->prev_section_id,
+             (unsigned)ctx->quest_timer);
+}
+
+static void demo_on_monster_spawned(const mhfu_monster_spawn_ctx_t *ctx)
+{
+    /* size_scale is float; printf %f tends to be unreliable in PSP
+     * crt0 builds — log the raw u32 instead so the value survives. */
+    union { uint32_t u; float f; } cvt; cvt.f = ctx->size_scale;
+    mhfu_log("[demo] * MONSTER SPAWNED  slot=%d  ptr=0x%08lx  type=0x%02x  hp=%u  size_raw=0x%08lx",
+             ctx->slot, (unsigned long)ctx->entity_ptr,
+             (unsigned)ctx->monster_type, (unsigned)ctx->hp,
+             (unsigned long)cvt.u);
+}
+
+/* ------------------------------------------------------------------------ *
+ * Embedded popo_growth mod.
+ *
+ * The standalone framework/prx/mods/popo_growth_prx/ builds a working
+ * .prx but PPSSPP's plugin host hangs MHFU at boot when two plugin
+ * PRXes are co-loaded (verified empirically 2026-05-25 — framework
+ * alone boots in ~12s to menu; framework + popo_growth wedges screen
+ * state at 0 forever, even with the popo mod degenerated to a no-op
+ * register-and-return). The standalone mod source remains the canonical
+ * reference for the live-framework / future-stable-stub path; for the
+ * built-in build we inline the same logic here, behind
+ * MHFU_EMBED_POPO_GROWTH so it can be toggled.
+ * ------------------------------------------------------------------------ */
+
+#define MHFU_EMBED_POPO_GROWTH 1
+
+#if MHFU_EMBED_POPO_GROWTH
+
+#define POPO_MONSTER_TYPE      0x46
+#define POPO_TARGET_AREA_INDEX 99
+#define POPO_MAX_TRACKED       8
+#define POPO_STEP_INTERVAL_MS  500
+
+/* Per-entity size_scale lives at +0x024 but the game keeps mirrors at
+ * +0x220, +0x224, +0x228 and +0x270 (per docs/agent_memory_map.md and
+ * memory note monster_size_scalar). The game's per-frame sync routine
+ * appears to copy one of the mirrors back into +0x024 each frame, so
+ * writing only +0x024 has no visible effect — the original value is
+ * restored within milliseconds. Solution: write all five cells. */
+static const uint32_t POPO_SIZE_MIRRORS[] = {
+    0x024, 0x220, 0x224, 0x228, 0x270,
+};
+#define POPO_SIZE_MIRROR_COUNT \
+    (sizeof(POPO_SIZE_MIRRORS) / sizeof(POPO_SIZE_MIRRORS[0]))
+
+static const float g_popo_size_steps[10] = {
+    0.35f, 0.85f, 1.35f, 1.85f, 2.00f,
+    1.85f, 1.35f, 0.85f, 0.35f, 0.35f,
+};
+
+typedef struct {
+    uint32_t entity_ptr;
+    float    original_size;
+} tracked_popo_t;
+
+static tracked_popo_t g_tracked_popos[POPO_MAX_TRACKED];
+static volatile int   g_popo_active = 0;
+
+static int popo_find_slot(uint32_t entity_ptr)
+{
+    for (int i = 0; i < POPO_MAX_TRACKED; i++)
+        if (g_tracked_popos[i].entity_ptr == entity_ptr) return i;
+    return -1;
+}
+
+static int popo_find_free_slot(void)
+{
+    for (int i = 0; i < POPO_MAX_TRACKED; i++)
+        if (g_tracked_popos[i].entity_ptr == 0) return i;
+    return -1;
+}
+
+static int popo_entity_still_alive(uint32_t entity_ptr)
+{
+    for (int slot = 1; slot < ENTITY_REGISTRY_SLOTS; slot++) {
+        uint32_t p = *(volatile uint32_t *)(ENTITY_REGISTRY_ADDR + slot * 4);
+        if (p == entity_ptr) return 1;
+    }
+    return 0;
+}
+
+static void popo_prune_dead(void)
+{
+    for (int i = 0; i < POPO_MAX_TRACKED; i++) {
+        if (g_tracked_popos[i].entity_ptr == 0) continue;
+        if (!popo_entity_still_alive(g_tracked_popos[i].entity_ptr)) {
+            g_tracked_popos[i].entity_ptr = 0;
+            g_tracked_popos[i].original_size = 0.0f;
+        }
+    }
+}
+
+static void popo_restore_and_purge(void)
+{
+    for (int i = 0; i < POPO_MAX_TRACKED; i++) {
+        if (g_tracked_popos[i].entity_ptr == 0) continue;
+        if (popo_entity_still_alive(g_tracked_popos[i].entity_ptr)) {
+            union { uint32_t u; float f; } cvt;
+            cvt.f = g_tracked_popos[i].original_size;
+            for (unsigned m = 0; m < POPO_SIZE_MIRROR_COUNT; m++) {
+                *(volatile uint32_t *)(g_tracked_popos[i].entity_ptr +
+                                       POPO_SIZE_MIRRORS[m]) = cvt.u;
+            }
+        }
+        g_tracked_popos[i].entity_ptr = 0;
+        g_tracked_popos[i].original_size = 0.0f;
+    }
+}
+
+static void popo_on_section(const mhfu_map_section_ctx_t *ctx)
+{
+    int now_target = (ctx->section_id      == POPO_TARGET_AREA_INDEX);
+    int was_target = (ctx->prev_section_id == POPO_TARGET_AREA_INDEX);
+
+    if (now_target && !was_target) {
+        g_popo_active = 1;
+        mhfu_log("[popo_growth] ACTIVATE  section=%u (prev=%u)",
+                 (unsigned)ctx->section_id, (unsigned)ctx->prev_section_id);
+    } else if (was_target && !now_target) {
+        g_popo_active = 0;
+        popo_restore_and_purge();
+        mhfu_log("[popo_growth] DEACTIVATE  left=%u now=%u",
+                 (unsigned)ctx->prev_section_id, (unsigned)ctx->section_id);
+    }
+}
+
+static void popo_on_monster(const mhfu_monster_spawn_ctx_t *ctx)
+{
+    if (ctx->monster_type != POPO_MONSTER_TYPE) return;
+    if (popo_find_slot(ctx->entity_ptr) >= 0) return;
+    int idx = popo_find_free_slot();
+    if (idx < 0) return;
+    union { uint32_t u; float f; } cvt;
+    cvt.u = *(volatile uint32_t *)(ctx->entity_ptr + ENTITY_OFF_SIZE_SCALE);
+    g_tracked_popos[idx].entity_ptr    = ctx->entity_ptr;
+    g_tracked_popos[idx].original_size = cvt.f;
+    mhfu_log("[popo_growth] tracking Popo @ 0x%08lx orig_size_raw=0x%08lx",
+             (unsigned long)ctx->entity_ptr, (unsigned long)cvt.u);
+}
+
+static int popo_growth_thread(SceSize args, void *argp)
+{
+    (void)args; (void)argp;
+    /* Step cadence stays 500 ms (10 steps × 500 ms = 5 s period). Within
+     * each step we re-write the current size at frame-ish cadence so the
+     * game's per-frame mirror-sync doesn't restore the original between
+     * our step transitions. 30 ms is fine — 2 writes per game-logic
+     * frame at 30 Hz, cheap, and visually solid. */
+    int step = 0;
+    int ticks_in_step = 0;
+    const int TICK_MS = 30;
+    const int TICKS_PER_STEP = POPO_STEP_INTERVAL_MS / TICK_MS;
+
+    for (;;) {
+        sceKernelDelayThread(TICK_MS * 1000);
+        if (!g_popo_active) {
+            ticks_in_step = 0; step = 0;
+            continue;
+        }
+        popo_prune_dead();
+        union { uint32_t u; float f; } cvt;
+        cvt.f = g_popo_size_steps[step];
+        for (int i = 0; i < POPO_MAX_TRACKED; i++) {
+            uint32_t p = g_tracked_popos[i].entity_ptr;
+            if (p == 0) continue;
+            for (unsigned m = 0; m < POPO_SIZE_MIRROR_COUNT; m++) {
+                *(volatile uint32_t *)(p + POPO_SIZE_MIRRORS[m]) = cvt.u;
+            }
+        }
+        if (++ticks_in_step >= TICKS_PER_STEP) {
+            ticks_in_step = 0;
+            step = (step + 1) % (int)(sizeof(g_popo_size_steps) /
+                                      sizeof(g_popo_size_steps[0]));
+        }
+    }
+    return 0;
+}
+
+#endif /* MHFU_EMBED_POPO_GROWTH */
+
 /* Sentinel cells in a known-quiet RAM region so we can verify
  * end-to-end execution from a host debugger even when log file I/O
  * NIDs are unsupported by PPSSPP. Layout: four u32s starting at
@@ -623,10 +899,56 @@ int main(int argc, char *argv[])
     mhfu_log("[framework] %s starting (diag=%d)", MOD_NAME, MHFU_DIAG_LEVEL);
     detect_region();
     sentinel_set(0x00, 0xCAFE0002);
-    mhfu_register_event(MHFU_EVENT_QUEST_BEGINNING, demo_on_quest_beginning);
-    mhfu_register_event(MHFU_EVENT_QUEST_ENTERED,   demo_on_quest_entered);
+    mhfu_on_quest_beginning(demo_on_quest_beginning);
+    mhfu_on_quest_entered(demo_on_quest_entered);
+    mhfu_on_map_section_entered(demo_on_map_section_entered);
+    mhfu_on_monster_spawned(demo_on_monster_spawned);
+#if MHFU_EMBED_POPO_GROWTH
+    mhfu_on_map_section_entered(popo_on_section);
+    mhfu_on_monster_spawned(popo_on_monster);
+#endif
     load_mods();
     sentinel_set(0x00, 0xCAFE0004);
+
+    /* Spawn the monster-spawn polling thread BEFORE we hand off to
+     * install_worker (which has its own multi-minute monitor loop).
+     * The poll thread is independent of the trampolines — it just
+     * watches the entity registry and fires MHFU_EVENT_MONSTER_SPAWNED
+     * callbacks when slots populate. */
+    SceUID th = sceKernelCreateThread(
+        "mhfu_spawn_poll", monster_spawn_poll_thread,
+        0x18, 0x1000, 0, NULL);
+    if (th >= 0) {
+        sceKernelStartThread(th, 0, NULL);
+        mhfu_log("[framework] spawn-poll thread started (uid=0x%08lx)",
+                 (unsigned long)th);
+    } else {
+        mhfu_log("[framework] sceKernelCreateThread spawn-poll failed: %d", th);
+    }
+
+#if MHFU_EMBED_POPO_GROWTH
+    {
+        SceUID pth = sceKernelCreateThread(
+            "popo_growth", popo_growth_thread,
+            0x18, 0x1000, 0, NULL);
+        if (pth >= 0) {
+            sceKernelStartThread(pth, 0, NULL);
+            mhfu_log("[popo_growth] embedded mod thread started (uid=0x%08lx)",
+                     (unsigned long)pth);
+        } else {
+            mhfu_log("[popo_growth] embedded thread create failed: %d", pth);
+        }
+        /* Publish BSS addresses so an external runner can force-activate
+         * the mod + plant a fake-spawn pointer for end-to-end verification
+         * without actually being in the snow quest. */
+        mhfu_log("[popo_growth] g_popo_active=0x%08lx g_tracked_popos=0x%08lx",
+                 (unsigned long)&g_popo_active,
+                 (unsigned long)&g_tracked_popos[0]);
+        sentinel_set(0x28, (uint32_t)(uintptr_t)&g_popo_active);
+        sentinel_set(0x2C, (uint32_t)(uintptr_t)&g_tracked_popos[0]);
+    }
+#endif
+
     mhfu_log("[framework] ready");
 #if MHFU_DIAG_LEVEL == 1
     return 0;

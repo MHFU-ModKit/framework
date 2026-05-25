@@ -37,24 +37,34 @@ extern "C" {
  * ------------------------------------------------------------------------ */
 
 typedef enum {
-    MHFU_EVENT_QUEST_BEGINNING = 0, /* player commits to a quest         */
-    MHFU_EVENT_QUEST_ENTERED   = 1, /* player spawns into the quest map  */
+    MHFU_EVENT_QUEST_BEGINNING     = 0, /* player commits to a quest        */
+    MHFU_EVENT_QUEST_ENTERED       = 1, /* player spawns into the quest map */
+    MHFU_EVENT_MAP_SECTION_ENTERED = 2, /* area_index changed (any section) */
+    MHFU_EVENT_MONSTER_SPAWNED     = 3, /* new entity in registry slot 1+   */
 
     MHFU_EVENT_COUNT_
 } mhfu_event_id_t;
 
 /* ------------------------------------------------------------------------ *
- * Callback context.
+ * Callback contexts.
  *
- * Mod callbacks receive a snapshot of the CPU registers at the moment
- * the anchor instruction was about to execute. Reading game memory
- * via mhfu_read_* is safe here; calling game functions is permitted
- * but the mod author is responsible for argument hygiene.
+ * The framework passes a struct pointer per event so mod authors get
+ * named fields instead of register slurry. Reading game memory via
+ * mhfu_read_* is safe inside any callback; calling game functions is
+ * permitted but the mod author is responsible for argument hygiene.
  *
- * `event_id` lets one callback service multiple events.
- * `cell_value` is the post-write value of the event's anchor cell;
- *   for quest_beginning this is the new quest_timer value, for
- *   quest_entered this is the new area_index (98 at map entry).
+ * Quest events (BEGINNING, ENTERED) carry the CPU register snapshot at
+ * hook entry — they fire from inside the wrapper trampoline, where the
+ * register state is meaningful.
+ *
+ * MAP_SECTION_ENTERED carries the section transition (prev → new).
+ * Fires from inside the area_index trampoline whenever the cell
+ * changes — so the *event* fires on every traversal, but the dispatcher
+ * itself runs every frame and filters via change detection.
+ *
+ * MONSTER_SPAWNED carries the new entity's slot + key stats. Fires
+ * from a polling worker thread because PSP user-mode RAM offers no
+ * single anchor instruction for the registry-slot write path.
  * ------------------------------------------------------------------------ */
 
 typedef struct {
@@ -67,7 +77,36 @@ typedef struct {
     uint32_t pc;
 } mhfu_event_ctx_t;
 
-typedef void (*mhfu_event_cb_t)(const mhfu_event_ctx_t *ctx);
+typedef struct {
+    mhfu_event_id_t event_id;
+    uint16_t section_id;          /* new area_index */
+    uint16_t prev_section_id;     /* previous area_index */
+    uint32_t quest_timer;         /* convenience: u32 @ 0x09A05DD0 */
+    uint8_t  screen_state;        /* convenience: u8 @ 0x08A8CA48 */
+    uint8_t  is_in_quest_area;    /* screen_state == 17 */
+    uint16_t _pad;
+} mhfu_map_section_ctx_t;
+
+typedef struct {
+    mhfu_event_id_t event_id;
+    int      slot;                /* entity-registry slot index (1..20) */
+    uint32_t entity_ptr;          /* u32 pointer just written to slot */
+    uint8_t  monster_type;        /* u8 at entity_ptr+0x1E8 */
+    uint8_t  entity_id;           /* u8 at entity_ptr+0x1E4 */
+    uint16_t hp;                  /* u16 at entity_ptr+0x2E4 */
+    float    size_scale;          /* f32 at entity_ptr+0x024 */
+} mhfu_monster_spawn_ctx_t;
+
+/* Generic registry storage — typed sugar wrappers below cast their
+ * specific callback type into this so a single registration list works
+ * for all events. Mod code calls the sugar fn and never sees the cast.
+ */
+typedef void (*mhfu_event_cb_t)(const void *ctx);
+
+/* Typed aliases — documentation + caller-side type safety. */
+typedef void (*mhfu_quest_cb_t)        (const mhfu_event_ctx_t *ctx);
+typedef void (*mhfu_map_section_cb_t)  (const mhfu_map_section_ctx_t *ctx);
+typedef void (*mhfu_monster_spawn_cb_t)(const mhfu_monster_spawn_ctx_t *ctx);
 
 /* ------------------------------------------------------------------------ *
  * Registration API.
@@ -87,12 +126,23 @@ typedef void (*mhfu_event_cb_t)(const mhfu_event_ctx_t *ctx);
 int mhfu_register_event(mhfu_event_id_t event_id, mhfu_event_cb_t cb);
 int mhfu_unregister_event(mhfu_event_id_t event_id, mhfu_event_cb_t cb);
 
-/* Sugar — same as mhfu_register_event(MHFU_EVENT_QUEST_BEGINNING, cb). */
-static inline int mhfu_on_quest_beginning(mhfu_event_cb_t cb) {
-    return mhfu_register_event(MHFU_EVENT_QUEST_BEGINNING, cb);
+/* Sugar — same as mhfu_register_event(<id>, cb), but typed per event so
+ * the C compiler catches signature mismatches at the call site. */
+static inline int mhfu_on_quest_beginning(mhfu_quest_cb_t cb) {
+    return mhfu_register_event(MHFU_EVENT_QUEST_BEGINNING,
+                               (mhfu_event_cb_t)(void *)cb);
 }
-static inline int mhfu_on_quest_entered(mhfu_event_cb_t cb) {
-    return mhfu_register_event(MHFU_EVENT_QUEST_ENTERED, cb);
+static inline int mhfu_on_quest_entered(mhfu_quest_cb_t cb) {
+    return mhfu_register_event(MHFU_EVENT_QUEST_ENTERED,
+                               (mhfu_event_cb_t)(void *)cb);
+}
+static inline int mhfu_on_map_section_entered(mhfu_map_section_cb_t cb) {
+    return mhfu_register_event(MHFU_EVENT_MAP_SECTION_ENTERED,
+                               (mhfu_event_cb_t)(void *)cb);
+}
+static inline int mhfu_on_monster_spawned(mhfu_monster_spawn_cb_t cb) {
+    return mhfu_register_event(MHFU_EVENT_MONSTER_SPAWNED,
+                               (mhfu_event_cb_t)(void *)cb);
 }
 
 /* ------------------------------------------------------------------------ *
