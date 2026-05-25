@@ -122,11 +122,100 @@ breaks the original delay-slot relationship. Our two anchors are plain
 before adding to the address table — disassemble the two words at the
 anchor PC and confirm neither is a branch.
 
-## Limits today
+## Validation status (verified 2026-05-25)
 
-- **First build not yet attempted** in the pspdev Docker container —
-  the source is written; the next concrete validation is `make` +
-  loading the PRX in PPSSPP with the demo savestate.
+What the first build + load-in-PPSSPP confirmed:
+
+- **Build via Docker.** `make` from this directory produces a valid
+  PRX in ~20s. The "stubs out of order" warning from `psp-fixup-imports`
+  is cosmetic — the binary loads and runs.
+- **PPSSPP loads the PRX.** With `plugin.ini` in the standard format
+  (`[games]` + `[options]` sections — *not* a flat key=value INI as
+  one might naively assume), PPSSPP's plugin host finds, parses, and
+  loads the module. Log line: `Loaded plugin: ms0:/PSP/PLUGINS/mhfu_framework/mhfu_framework.prx`.
+- **main() runs.** Sentinel writes at every stage of main confirmed
+  via debugger memory read (`STAGE = 0xCAFE0004`).
+- **Worker thread spawns and runs.** `sceKernelCreateThread` works
+  in PPSSPP plugin context once the module is user-mode (PSP_MODULE_INFO
+  attr = 0, not 0x1007), and once we avoid crt0_prx's default
+  thread-creating bootstrap by defining
+  `int sce_newlib_nocreate_thread_in_start = 1;`.
+- **Trampolines install and persist.** Both anchor PCs read back as
+  `J cave; NOP` after ~1s of game runtime, and remain that way for
+  20+ seconds. A re-install monitor loop catches any case where the
+  game's own EBOOT loading overwrites our patches and reapplies them.
+
+What's NOT yet end-to-end verified:
+
+- **The wrapper code actually executing.** To prove the full chain
+  (game's CPU hits the anchor → J's into our cave → wrapper saves
+  regs → JAL dispatcher → demo callback runs → wrapper restores →
+  J back), the game's PC must actually reach 0x088655E4 / 0x0884CDFC.
+  These addresses are only executed during quest start; from a clean
+  boot, reaching them takes ~10 menu interactions. We've proven up to
+  the trampoline-install step and that the game runs normally with
+  trampolines in place (no crash), but the dispatcher fire is a
+  manual-navigation follow-up.
+- **Savestate compatibility.** PPSSPP does NOT load PRX plugins when
+  the game state is restored from a `--state=` savestate (the savestate
+  was created without the plugin present, so its restored module table
+  doesn't include us). To use the PRX path with a quest-ready
+  starting point: boot fresh, let the plugin install, then *save a new
+  state* and use that one going forward.
+
+## Known gotchas (write these down — we already hit them all)
+
+1. **plugin.ini format.** PPSSPP parses `<plugin_dir>/plugin.ini`
+   (literally that filename) with two sections — `[games]` listing
+   `<DiscID> = true`, and `[options]` with `type = prx`,
+   `filename = <name>.prx`, `name = <human>`, `version = 1`. A flat
+   key=value file (the format you find on random forum posts) is
+   silently ignored.
+
+2. **Module attributes.** `PSP_MODULE_INFO(name, attr, ...)` — the
+   `attr` second arg controls user/kernel mode. PPSSPP plugin host is
+   user-mode-only. Use `0` (PSP_MODULE_USER), not `0x1007` or any
+   `0x10xx` (kernel). Kernel-mode triggers
+   `unsupported thread attributes 0x07` warnings and breaks startup.
+
+3. **crt0_prx wants `main`, not `module_start`.** Modern pspsdk's
+   `crt0_prx.o` already defines `module_start` (as an alias of `_start`).
+   User code provides `main()`; crt0's path runs it. Trying to define
+   your own `module_start` causes "multiple definition" link errors.
+
+4. **Default crt0 spawns a thread that hangs under PPSSPP.** `_start`
+   uses `sceKernelCreateThread` + `sceKernelStartThread` to run main()
+   on a new thread. This hangs silently in PPSSPP plugin context.
+   Define `int sce_newlib_nocreate_thread_in_start = 1;` to bypass
+   the thread bootstrap and call `main()` directly.
+
+5. **Don't return from main().** If `main()` returns, crt0's `_exit()`
+   calls `sceKernelSelfStopUnloadModule` and our PRX gets unloaded —
+   killing any background threads we spawned (and leaving anchor
+   patches pointing into freed memory). Either spin in main() forever
+   (`for (;;) sceKernelDelayThread(...);`) or call the install loop
+   directly from main without returning.
+
+6. **EBOOT loads in two waves.** On PPSSPP at least, the game's text
+   sections at our two anchor PCs arrive in memory at different times.
+   The first attempt to patch quest_beginning succeeded but the game
+   then overwrote it with the original `sv.q` opcode about a second
+   later, while quest_entered stayed patched. Solution: wait until
+   BOTH anchors show the expected original opcode (Allegrex `sv.q`,
+   op=0x3E), wait an additional 500ms, then re-check, then install.
+   And keep a monitor loop running that re-installs if either anchor
+   reverts.
+
+7. **Anchors are Allegrex VFPU stores (`sv.q`), not standard `sw`.**
+   Both `0x088655E4` and `0x0884CDFC` are `sv.q` (op 0x3E) — vector
+   quad stores. These trigger our memory write BPs on the integer cell
+   below them because `sv.q` writes 16 bytes. The trampoline copies
+   the displaced instructions verbatim, so we don't need to special-
+   case them, but anchor-PC vetting must confirm none of the two
+   displaced words is a control transfer.
+
+## Limits today (still)
+
 - **Region detection stubbed**. The framework defaults to EU. For
   NA/JP, fill in the address tables in `mhfu_framework_addresses.h`
   via `scripts/re_quest_events.py` with a regional savestate.

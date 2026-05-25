@@ -92,8 +92,19 @@
 #define WRAPPER_BYTES     (WRAPPER_INSNS * 4)
 #define CAVE_SLOTS        8        /* room for up to 8 wrappers */
 
-PSP_MODULE_INFO(MOD_NAME, 0x1007, 1, 0);
-PSP_MAIN_THREAD_ATTR(0);
+/* User-mode module (PSP_MODULE_USER = 0).  PPSSPP's plugin host is
+ * user-mode only; the 0x1000 kernel-mode bit causes "unsupported
+ * thread attributes 0x07" warnings and prevents main() from running.  */
+PSP_MODULE_INFO(MOD_NAME, 0, 1, 0);
+PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
+
+/* pspsdk's crt0_prx _start by default calls sceKernelCreateThread +
+ * sceKernelStartThread to run main() on a dedicated thread. Under
+ * PPSSPP's plugin host that thread creation hangs silently — the plugin
+ * thread ran once at _start, never spawned the worker, never called
+ * main(). Defining this weak symbol non-zero tells crt0 to skip the
+ * thread creation and call main() directly from module_start. */
+int sce_newlib_nocreate_thread_in_start = 1;
 
 /* ------------------------------------------------------------------------ *
  * Per-event callback lists.
@@ -367,9 +378,9 @@ static int install_trampolines(void)
         mhfu_log("[framework] install_trampoline_for quest_beginning: %d", rc);
         return rc;
     }
-    mhfu_log("[framework] hook installed: quest_beginning @ 0x%08x (cave 0x%08x)",
-             g_addrs->pc_quest_beginning,
-             g_install[MHFU_EVENT_QUEST_BEGINNING].wrapper_addr);
+    mhfu_log("[framework] hook installed: quest_beginning @ 0x%08lx (cave 0x%08lx)",
+             (unsigned long)g_addrs->pc_quest_beginning,
+             (unsigned long)g_install[MHFU_EVENT_QUEST_BEGINNING].wrapper_addr);
 
     rc = install_trampoline_for(
         /*slot=*/1,
@@ -380,9 +391,9 @@ static int install_trampolines(void)
         mhfu_log("[framework] install_trampoline_for quest_entered: %d", rc);
         return rc;
     }
-    mhfu_log("[framework] hook installed: quest_entered @ 0x%08x (cave 0x%08x)",
-             g_addrs->pc_quest_entered,
-             g_install[MHFU_EVENT_QUEST_ENTERED].wrapper_addr);
+    mhfu_log("[framework] hook installed: quest_entered @ 0x%08lx (cave 0x%08lx)",
+             (unsigned long)g_addrs->pc_quest_entered,
+             (unsigned long)g_install[MHFU_EVENT_QUEST_ENTERED].wrapper_addr);
 
     return 0;
 }
@@ -400,10 +411,10 @@ static int uninstall_trampolines(void)
 
 static int load_mods(void)
 {
-    /* TODO: enumerate ms0:/PSP/PLUGINS/mhfu_framework/mods/*.prx and
-     * sceKernelLoadModule + sceKernelStartModule each. For now, mods
-     * load via PPSSPP's normal plugin mechanism and register against
-     * us via their own module_start. */
+    /* TODO: enumerate ms0:/PSP/PLUGINS/mhfu_framework/mods and
+     * sceKernelLoadModule + sceKernelStartModule each .prx found.
+     * For now, mods load via PPSSPP's normal plugin mechanism and
+     * register against us via their own module_start. */
     return 0;
 }
 
@@ -423,16 +434,147 @@ static int detect_region(void)
 
 /* ------------------------------------------------------------------------ *
  * Module entry / exit.
+ *
+ * Modern pspsdk's crt0_prx.o supplies a default `module_start` that
+ * calls `main()`, so user PRXes provide `main` (not `module_start`).
+ * `module_stop` is still ours to define — it's not in crt0.
  * ------------------------------------------------------------------------ */
 
-int module_start(SceSize args, void *argp)
+/* ------------------------------------------------------------------------ *
+ * Built-in demo callbacks (will later live in a separate hello_world.prx
+ * once we wire up the PRX-import stub-library generation).
+ *
+ * These exist so the FIRST build of the framework PRX can demonstrate
+ * the trampoline path end-to-end without also needing inter-PRX
+ * symbol resolution.
+ * ------------------------------------------------------------------------ */
+
+/* Sentinel layout for callback firing:
+ *   +0x18  QB_FIRED count  (increments each call)
+ *   +0x1C  QE_FIRED count
+ *   +0x20  QB_LAST_A0      (last $a0 the wrapper captured)
+ *   +0x24  QE_LAST_A0
+ *
+ * MHFU_SENTINEL_BASE and sentinel_set are defined further down (near
+ * main); forward-declare them so the demo callbacks compile.
+ */
+#define MHFU_SENTINEL_BASE 0x08AEFFE0u
+static void sentinel_set(uint32_t offset, uint32_t value);
+
+static void demo_on_quest_beginning(const mhfu_event_ctx_t *ctx)
+{
+    uint32_t n = *(volatile uint32_t *)(MHFU_SENTINEL_BASE + 0x18) + 1;
+    sentinel_set(0x18, n);
+    sentinel_set(0x20, ctx->a0);
+    mhfu_log("[demo] * QUEST BEGINNING (built-in)");
+}
+
+static void demo_on_quest_entered(const mhfu_event_ctx_t *ctx)
+{
+    uint32_t n = *(volatile uint32_t *)(MHFU_SENTINEL_BASE + 0x1C) + 1;
+    sentinel_set(0x1C, n);
+    sentinel_set(0x24, ctx->a0);
+    mhfu_log("[demo] * QUEST ENTERED");
+}
+
+/* Sentinel cells in a known-quiet RAM region so we can verify
+ * end-to-end execution from a host debugger even when log file I/O
+ * NIDs are unsupported by PPSSPP. Layout: four u32s starting at
+ * 0x08AEFFE0 (end of the live-framework code cave, untouched by
+ * the trampoline slots).
+ *
+ *   +0x00  STAGE       — high-water "what main() got to"
+ *   +0x04  RC_INSTALL  — return code of install_trampolines()
+ *   +0x08  CAVE_ADDR   — &g_code_cave[0] (where wrappers live)
+ *   +0x0C  ANCHOR_RD   — value the framework read from anchor_pc
+ *                          right after patching (for cross-check)
+ */
+static void sentinel_set(uint32_t offset, uint32_t value)
+{
+    *(volatile uint32_t *)(MHFU_SENTINEL_BASE + offset) = value;
+}
+
+/* Worker thread: poll until the game's EBOOT is resident at the anchor
+ * PCs (Allegrex vector-store `sv.q` at op 0x3E), then install. Without
+ * this delay, our patches land on uninitialised RAM and get overwritten
+ * when the game's EBOOT loads (or when the user restores a savestate). */
+static int install_worker(SceSize args, void *argp)
 {
     (void)args; (void)argp;
+    sentinel_set(0x10, 0xC0DE0001);   /* worker started */
+    /* Phase 1: wait until BOTH anchor PCs show the expected original
+     * sv.q opcode (0x3E). Empirically the EBOOT's code section loads
+     * in waves on PPSSPP — first quest_entered's region, then
+     * quest_beginning's. Patching too early causes the game's later
+     * load to overwrite slot 0. */
+    for (int attempt = 0; attempt < 600; attempt++) {
+        uint32_t w0 = *(volatile uint32_t *)(g_addrs->pc_quest_beginning);
+        uint32_t w1 = *(volatile uint32_t *)(g_addrs->pc_quest_entered);
+        if (((w0 >> 26) & 0x3F) == 0x3E && ((w1 >> 26) & 0x3F) == 0x3E) {
+            /* Both regions loaded — wait a bit more for stability,
+             * then re-check, then patch. */
+            sceKernelDelayThread(500 * 1000);
+            w0 = *(volatile uint32_t *)(g_addrs->pc_quest_beginning);
+            w1 = *(volatile uint32_t *)(g_addrs->pc_quest_entered);
+            if (((w0 >> 26) & 0x3F) == 0x3E && ((w1 >> 26) & 0x3F) == 0x3E) {
+                sentinel_set(0x10, 0xC0DE0002);
+                int rc = install_trampolines();
+                sentinel_set(0x04, (uint32_t)rc);
+                sentinel_set(0x08, (uint32_t)&g_code_cave[0]);
+                sentinel_set(0x0C, *(volatile uint32_t *)(g_addrs->pc_quest_beginning));
+                sentinel_set(0x10, (rc == 0) ? 0xC0DE0003u : 0xC0DEDEAD);
+                /* Phase 2: keep watching — if either anchor gets
+                 * un-patched by a later game-state event, re-install. */
+                for (int re = 0; re < 1200; re++) {
+                    sceKernelDelayThread(500 * 1000);
+                    uint32_t a0 = *(volatile uint32_t *)(g_addrs->pc_quest_beginning);
+                    uint32_t a1 = *(volatile uint32_t *)(g_addrs->pc_quest_entered);
+                    if (((a0 >> 26) & 0x3F) != 0x02 ||
+                        ((a1 >> 26) & 0x3F) != 0x02) {
+                        sentinel_set(0x10, 0xC0DE0004);   /* re-installing */
+                        /* uninstall the stale records first so install
+                         * snapshots the new originals correctly. */
+                        for (int i = 0; i < MHFU_EVENT_COUNT_; i++)
+                            g_install[i].installed = 0;
+                        install_trampolines();
+                        sentinel_set(0x10, 0xC0DE0005);
+                    }
+                }
+                return 0;
+            }
+        }
+        sceKernelDelayThread(100 * 1000);
+    }
+    sentinel_set(0x10, 0xC0DE0E0E);
+    return 0;
+}
+
+int main(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+    sentinel_set(0x00, 0xCAFE0001);
     mhfu_log("[framework] %s starting", MOD_NAME);
     detect_region();
-    install_trampolines();
+    sentinel_set(0x00, 0xCAFE0002);
+
+    /* Register the built-in demo callbacks immediately — they're just
+     * function pointers, no MIPS-side work yet. */
+    mhfu_register_event(MHFU_EVENT_QUEST_BEGINNING, demo_on_quest_beginning);
+    mhfu_register_event(MHFU_EVENT_QUEST_ENTERED,   demo_on_quest_entered);
+
     load_mods();
+    sentinel_set(0x00, 0xCAFE0004);
     mhfu_log("[framework] ready");
+
+    /* Run the install poll loop DIRECTLY in main() — never return.
+     * If main() returns, crt0's _exit() calls
+     * sceKernelSelfStopUnloadModule which unloads the PRX and would
+     * leave the trampolines pointing into freed memory. So we own
+     * this thread for the life of the game. */
+    install_worker(0, NULL);
+    /* install_worker only returns on timeout or fatal error; if we
+     * fall through, idle harmlessly so the module stays resident. */
+    for (;;) sceKernelDelayThread(1000 * 1000);
     return 0;
 }
 
