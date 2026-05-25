@@ -145,17 +145,32 @@ What the first build + load-in-PPSSPP confirmed:
   20+ seconds. A re-install monitor loop catches any case where the
   game's own EBOOT loading overwrites our patches and reapplies them.
 
-What's NOT yet end-to-end verified:
+What got verified end-to-end in Section 17.4 (2026-05-25):
 
-- **The wrapper code actually executing.** To prove the full chain
-  (game's CPU hits the anchor → J's into our cave → wrapper saves
-  regs → JAL dispatcher → demo callback runs → wrapper restores →
-  J back), the game's PC must actually reach 0x088655E4 / 0x0884CDFC.
-  These addresses are only executed during quest start; from a clean
-  boot, reaching them takes ~10 menu interactions. We've proven up to
-  the trampoline-install step and that the game runs normally with
-  trampolines in place (no crash), but the dispatcher fire is a
-  manual-navigation follow-up.
+- **Wrapper executes through the full dispatcher chain.** With the
+  framework PRX loaded, the anchor at `0x0884CDFC` fires every frame
+  (the dispatcher's change-detect filters down to actual transitions),
+  driving both `mhfu_on_quest_entered` and `mhfu_on_map_section_entered`.
+  Real quest-start triggers `mhfu_on_quest_beginning`.
+- **First runtime mod ships and works.** Embedded `popo_growth`
+  oscillates Popo `size_scale` 0.35× ↔ 2.0× across a 5 s cycle while
+  the player is in section 1 (`area_index == 99`) of the snowy
+  mountains. Visually confirmed in real gameplay.
+- **Spawn poll thread tracks live entities.** Three Popos detected
+  immediately on section-load; `MHFU_EVENT_MONSTER_SPAWNED` dispatches
+  to the mod with monster_type=0x46 + per-entity size_scale +
+  current HP.
+
+Still open:
+
+- **Standalone mod-PRX co-load.** Two plugin PRXes
+  (`mhfu_framework.prx` + any second one — even a no-op test mod)
+  wedge MHFU at boot, screen state stuck at 0 forever. Workaround:
+  inline the mod into the framework PRX behind
+  `MHFU_EMBED_POPO_GROWTH 1`. The standalone mod source at
+  `mods/popo_growth_prx/` builds + links cleanly via inline stub
+  generation (`psp-build-exports -s` in the mod's `Makefile.psp`)
+  and is preserved for the eventual fix.
 - **Savestate compatibility.** PPSSPP does NOT load PRX plugins when
   the game state is restored from a `--state=` savestate (the savestate
   was created without the plugin present, so its restored module table

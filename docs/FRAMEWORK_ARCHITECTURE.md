@@ -100,9 +100,32 @@ not per-frame hot paths.
               └──────────────────────────────────────┘
 ```
 
-Same callback shape; same `mhfu_event_ctx_t`. The dispatch happens
-inside the emulated PSP CPU, at native speed. No WS round-trip, no
-breakpoint pause.
+Same registration surface; per-event struct contexts (`mhfu_event_ctx_t`
+for quest events, `mhfu_map_section_ctx_t` for section traversal,
+`mhfu_monster_spawn_ctx_t` for spawns). The dispatch happens inside the
+emulated PSP CPU, at native speed. No WS round-trip, no breakpoint pause.
+
+### Trigger modes (added Section 17.4)
+
+Some writes PPSSPP's `memory.breakpoint.add` doesn't catch — the
+sv.q-driven `area_index` 98 → arbitrary-section transition and the
+entity-registry slot pointer writes are both invisible to mem-BPs
+under `change=True` AND `change=False`. To keep the same mod-facing
+event API regardless of trigger reliability, the dispatcher carries
+TWO modes (see `events.addresses.EventMode`):
+
+* `MEM_BP_WRITE` — memory write BP on the event's cell. Used by
+  `mhfu_on_quest_beginning` (quest_timer) and `mhfu_on_quest_entered`
+  (area_index → 98).
+* `POLL` — async loop at the event's `poll_interval_s` reading the
+  watched cells. Used by `mhfu_on_map_section_entered` (area_index)
+  and `mhfu_on_monster_spawned` (entity registry slots 1..20).
+
+The PRX backend resolves the same events differently — for
+`area_index` it leans on the per-frame-executing writer PC
+`0x0884CDFC` and does change-detection inside the wrapper (one
+trampoline fires BOTH `quest_entered` and `map_section_entered`); for
+monster spawns it runs a user-mode poll thread at 5 Hz.
 
 ## The shared building blocks
 
@@ -157,9 +180,16 @@ Mod-facing high-level API.
 * `addresses.py` — the single source of truth for which PC each
   named event hooks. EU only today; multi-region structure is in
   place (just needs population).
-* `dispatcher.py` — the live-mode implementation: memory-BP triggers,
-  per-event predicate filter, background-task dispatch.
-* `api.py` — module-level convenience functions (`mhfu_on_quest_beginning`,
+* `dispatcher.py` — the live-mode implementation. Carries both
+  trigger backends: memory-BP halts with per-event predicate filter
+  + background-task dispatch (for `mhfu_on_quest_*`); async POLL
+  loops with per-event change attribution (for
+  `mhfu_on_map_section_entered` + `mhfu_on_monster_spawned`). Builds
+  per-event struct contexts (`MapSectionContext`,
+  `MonsterSpawnContext`) so mod authors get named fields.
+* `api.py` — module-level convenience functions
+  (`mhfu_on_quest_beginning`, `mhfu_on_quest_entered`,
+  `mhfu_on_map_section_entered`, `mhfu_on_monster_spawned`,
   `install_all_events`) and the process-global dispatcher singleton.
 
 ## Discovery workflow
@@ -233,5 +263,30 @@ finishes dispatch, and schedules `cpu.resume`.
   encoder (`src/mips_encoder.h`), patches anchors with `j cave; nop`,
   flushes dcache + icache via `sceKernelDcacheWritebackInvalidateAll`
   / `sceKernelIcacheInvalidateAll`. Mirrors the Python-side hook
-  installer one-for-one; same wrapper shape. Validation pending: first
-  build in the pspdev Docker container + smoke-load in PPSSPP.
+  installer one-for-one; same wrapper shape. **End-to-end verified
+  2026-05-25 Section 17.4** — first runtime mod (popo_growth)
+  visually confirmed in real gameplay.
+
+* **PPSSPP mem-BPs miss some write paths** (Section 17.4). The
+  sv.q-driven `area_index` 98 → 99 transition and the entity-
+  registry slot pointer writes don't fire `cpu.stepping` events with
+  reason `memory.breakpoint` under any combination of
+  `change=True`/`False`. Live framework events for those targets use
+  the POLL trigger mode instead. If you discover an event that
+  reproduces this behavior, default to POLL — diagnosing PPSSPP's
+  mem-BP coverage is not a productive yak.
+
+* **PPSSPP wedges MHFU at boot with two plugin PRXes co-loaded**
+  (Section 17.4). Framework alone reaches the main menu in ~12 s;
+  framework + any second plugin (even a no-op that just calls
+  `mhfu_on_*`) keeps screen state at 0 forever. Workaround in source
+  today is `MHFU_EMBED_POPO_GROWTH 1` in `framework/prx/src/framework.c`
+  inlining mod logic into the framework PRX; canonical standalone
+  mod source remains at `framework/prx/mods/popo_growth_prx/` for
+  when the co-load issue is resolved.
+
+* **`size_scale` mirrors must all be written.** The per-entity size
+  scalar at `+0x024` has mirrors at `+0x220`, `+0x224`, `+0x228`,
+  `+0x270` and the game's per-frame sync routine restores `+0x024`
+  from one of them inside one frame (≤16 ms). Mods that want a
+  visible size change must write all five cells.

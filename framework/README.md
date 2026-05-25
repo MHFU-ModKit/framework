@@ -97,15 +97,25 @@ folder into `<memstick>/PSP/PLUGINS/`.
 | 3 | Identify `quest_beginning` / `quest_entered` anchors via PPSSPP+Ghidra | ✅ done (writer PCs pinned) |
 | 4 | High-level event API + dispatcher (live mode) | ✅ done |
 | 5 | Hello-World sample mod (live mode) | ✅ verified end-to-end |
-| 6 | PRX framework SDK + skeleton mod + trampoline installer | ✅ implemented (build/install/runtime test still TODO) |
-| 7 | Documentation | ✅ done |
+| 6 | PRX framework SDK + trampoline installer | ✅ verified end-to-end (Section 17.3) |
+| 7 | Section-traversal + spawn events (POLL trigger) | ✅ done (Section 17.4) |
+| 8 | First runtime mod: popo_growth | ✅ visually verified in-game (Section 17.4) |
+| 9 | Standalone mod PRXes (linked vs framework exports) | 🟡 builds + links cleanly; co-load with framework wedges MHFU at boot — workaround `MHFU_EMBED_POPO_GROWTH 1` |
+| 10 | Region detection (NA/JP) + on-disk mod enumeration | 🟥 stubbed |
+| 11 | Documentation | ✅ done |
 
-The PRX path is feature-complete in source: MIPS encoder, wrapper
-generator, anchor patcher, cache flush, callback dispatcher. The two
-items not yet done on PRX are unrelated to the trampoline path:
-region detection (defaults to EU) and on-disk mod-PRX enumeration (mods
-currently load via PPSSPP's normal plugin mechanism). A first `make`
-inside the pspdev Docker container is the next concrete validation step.
+The PRX path is proven end-to-end: trampolines patch correctly, the
+spawn-poll thread tracks new entities, and the embedded popo_growth
+mod oscillates Popo `size_scale` 0.35× ↔ 2.0× over a 5 s cycle in
+snowy-mountains section 1 — visually confirmed in real gameplay
+2026-05-25.
+
+Known open issue: PPSSPP wedges MHFU at boot when two plugin PRXes
+are co-loaded (verified with a degenerate no-op mod), so the working
+binary today inlines mod logic into the framework PRX behind the
+`MHFU_EMBED_POPO_GROWTH 1` compile-time flag. The standalone
+`framework/prx/mods/popo_growth_prx/` source is the canonical mod
+example for when the co-load issue is resolved.
 
 ## Where to look next
 
