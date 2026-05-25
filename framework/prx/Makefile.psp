@@ -1,0 +1,22 @@
+# PSP-side build for mhfu_framework.prx.
+# Invoked inside the pspdev/pspdev Docker image.
+
+TARGET = mhfu_framework
+OBJS   = src/framework.o
+
+# Module flags — kernel-mode is unnecessary for our user-mode hooks.
+INCDIR    = include
+CFLAGS    = -O2 -G0 -Wall -fno-strict-aliasing
+CXXFLAGS  = $(CFLAGS)
+ASFLAGS   = $(CFLAGS)
+
+# We export the API symbols (mhfu_register_event, getters, log) so
+# downstream mod-PRXes can import them via the standard PSP module
+# import mechanism. See framework_exports.exp.
+BUILD_PRX  = 1
+PRX_EXPORTS = framework_exports.exp
+
+LIBS = -lpspdebug -lpspdisplay -lpspge -lpspctrl -lpspsdk -lc -lpspuser
+
+PSPSDK = $(shell psp-config --pspsdk-path)
+include $(PSPSDK)/lib/build.mak

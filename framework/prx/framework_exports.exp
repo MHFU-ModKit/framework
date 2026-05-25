@@ -1,0 +1,29 @@
+# Symbols exported from mhfu_framework.prx for downstream mod-PRXes.
+# Format follows pspsdk's BUILD_PRX export-file convention.
+
+PSP_BEGIN_EXPORTS
+
+PSP_EXPORT_START(syslib, 0, 0x8000)
+PSP_EXPORT_FUNC_HASH(module_start)
+PSP_EXPORT_FUNC_HASH(module_stop)
+PSP_EXPORT_VAR_HASH(module_info)
+PSP_EXPORT_END
+
+PSP_EXPORT_START(mhfu_framework, 0, 0x4001)
+PSP_EXPORT_FUNC_HASH(mhfu_register_event)
+PSP_EXPORT_FUNC_HASH(mhfu_unregister_event)
+PSP_EXPORT_FUNC_HASH(mhfu_get_screen_state)
+PSP_EXPORT_FUNC_HASH(mhfu_get_area_index)
+PSP_EXPORT_FUNC_HASH(mhfu_get_quest_timer)
+PSP_EXPORT_FUNC_HASH(mhfu_get_player_hp)
+PSP_EXPORT_FUNC_HASH(mhfu_get_sharpness_current)
+PSP_EXPORT_FUNC_HASH(mhfu_read_u8)
+PSP_EXPORT_FUNC_HASH(mhfu_read_u16)
+PSP_EXPORT_FUNC_HASH(mhfu_read_u32)
+PSP_EXPORT_FUNC_HASH(mhfu_write_u8)
+PSP_EXPORT_FUNC_HASH(mhfu_write_u16)
+PSP_EXPORT_FUNC_HASH(mhfu_write_u32)
+PSP_EXPORT_FUNC_HASH(mhfu_log)
+PSP_EXPORT_END
+
+PSP_END_EXPORTS

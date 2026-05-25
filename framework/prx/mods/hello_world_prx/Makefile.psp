@@ -1,0 +1,20 @@
+TARGET = hello_world
+OBJS   = src/hello_world.o
+
+INCDIR    = ../../include
+CFLAGS    = -O2 -G0 -Wall -fno-strict-aliasing
+CXXFLAGS  = $(CFLAGS)
+ASFLAGS   = $(CFLAGS)
+
+# This mod is a PRX that imports the framework's exports.
+BUILD_PRX  = 1
+PRX_EXPORTS = exports.exp
+
+# The mhfu_framework library stub gets generated when the framework PRX
+# is built. For now (skeleton) we depend on the framework's headers
+# only; final linking against framework_stub.a happens once that path
+# is wired.
+LIBS = -lpspdebug -lpspdisplay -lpspge -lpspctrl -lpspsdk -lc -lpspuser
+
+PSPSDK = $(shell psp-config --pspsdk-path)
+include $(PSPSDK)/lib/build.mak
