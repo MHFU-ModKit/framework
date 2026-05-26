@@ -651,7 +651,8 @@ static void demo_on_monster_spawned(const mhfu_monster_spawn_ctx_t *ctx)
  * MHFU_EMBED_POPO_GROWTH so it can be toggled.
  * ------------------------------------------------------------------------ */
 
-#define MHFU_EMBED_POPO_GROWTH 1
+#define MHFU_EMBED_POPO_GROWTH 0
+#define MHFU_EMBED_POPO_AGGRESSION 1
 
 #if MHFU_EMBED_POPO_GROWTH
 
@@ -807,6 +808,241 @@ static int popo_growth_thread(SceSize args, void *argp)
 
 #endif /* MHFU_EMBED_POPO_GROWTH */
 
+/* ------------------------------------------------------------------------ *
+ * Embedded popo_aggression mod.
+ *
+ * Discovered 2026-05-26 (heading-vec investigation, see memory note
+ * popo-motion-control-solved): monster motion is driven by the heading
+ * vector at entity+0x010..+0x018; engine-side rotators in popo_ovl_B
+ * over-write heading every game frame. Polling from the host debugger
+ * loses the race (JIT-cached overlay code). PSP-side writes from a PRX
+ * thread are CPU-coherent and win the race in practice — same pattern
+ * popo_growth uses for the size-mirror sync.
+ *
+ * Behavior: on entering snow-map section 1 (area_index 99), every popo
+ * in the entity registry is told to walk toward the NEXT popo in slot
+ * order; the last wraps to the first. Forms a visible chase chain that
+ * proves we control monster AI deterministically + at performant rate
+ * (no flicker, no debugger fight).
+ *
+ * Same standalone-vs-embedded story as popo_growth: PPSSPP plugin-host
+ * wedges with two PRXes co-loaded, so the canonical build embeds here
+ * while the standalone source under mods/popo_aggression_prx/ is the
+ * reference for the future stable-stub path.
+ * ------------------------------------------------------------------------ */
+
+#if MHFU_EMBED_POPO_AGGRESSION
+
+#define AGG_MONSTER_TYPE         0x46
+#define AGG_TARGET_AREA_INDEX    99
+#define AGG_MAX_TRACKED          8
+/* Run every 333 ms (~3 Hz). Earlier 30 ms cadence halted popos because
+ * the AI's per-frame wander cycle never got to complete between our
+ * writes — popo would enter walk anim, our next tick would re-arrive
+ * during anim transition, anim never advanced enough for root-motion.
+ * Verified 2026-05-26 via host-side sweep: 3 Hz is the sweet spot
+ * (tracking score +0.86 at this rate). PRX-side at 333 ms gives the
+ * AI ~10 frames to integrate position before our next override. */
+#define AGG_TICK_MS              333
+
+/* Entity-relative offsets — verified 2026-05-26.
+ * Heading + motion-gate cells. The alarmed-cell battery added in the
+ * previous build (busy_bits / +0x0C0 / +0x0C4 / +0x298 / +0x460 / +0x63C)
+ * made popos INVISIBLE in-game — entity stayed in registry but render
+ * + hitbox dropped. The diff that found those values almost certainly
+ * captured a popo passing through death (two SnS hits = ~40 dmg, likely
+ * kill on small monster). DO NOT re-enable those writes without first
+ * filtering the diff to HP > 0 samples only. */
+#define AGG_OFF_HEADING          0x010      /* vec3 — motion direction */
+#define AGG_OFF_POSITION         0x200      /* vec3 — world pos */
+#define AGG_OFF_PURSUE_TARGET    0x1C8      /* u32 — herd-follow target */
+#define AGG_OFF_ANIM_324         0x324      /* u16 — current anim ID */
+#define AGG_OFF_STATE_334        0x334      /* u16 — motion-gate state byte */
+
+#define AGG_STATE_LOCOMOTION     5
+#define AGG_ANIM_WALK_FORWARD    1011
+
+typedef struct {
+    uint32_t entity_ptr;     /* 0 = empty */
+    int      reg_slot;       /* original entity-registry slot, for ordering */
+} tracked_aggressor_t;
+
+static tracked_aggressor_t g_aggressors[AGG_MAX_TRACKED];
+static volatile int        g_aggression_active = 0;
+
+static int agg_find_slot(uint32_t entity_ptr)
+{
+    for (int i = 0; i < AGG_MAX_TRACKED; i++)
+        if (g_aggressors[i].entity_ptr == entity_ptr) return i;
+    return -1;
+}
+
+static int agg_find_free_slot(void)
+{
+    for (int i = 0; i < AGG_MAX_TRACKED; i++)
+        if (g_aggressors[i].entity_ptr == 0) return i;
+    return -1;
+}
+
+static int agg_entity_still_alive(uint32_t entity_ptr, int *out_slot)
+{
+    for (int slot = 1; slot < ENTITY_REGISTRY_SLOTS; slot++) {
+        uint32_t p = *(volatile uint32_t *)(ENTITY_REGISTRY_ADDR + slot * 4);
+        if (p == entity_ptr) {
+            if (out_slot) *out_slot = slot;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void agg_prune_dead(void)
+{
+    for (int i = 0; i < AGG_MAX_TRACKED; i++) {
+        if (g_aggressors[i].entity_ptr == 0) continue;
+        int slot;
+        if (!agg_entity_still_alive(g_aggressors[i].entity_ptr, &slot)) {
+            g_aggressors[i].entity_ptr = 0;
+            g_aggressors[i].reg_slot   = 0;
+        } else {
+            /* Keep reg_slot fresh in case the registry shuffled. */
+            g_aggressors[i].reg_slot = slot;
+        }
+    }
+}
+
+/* Aim `shooter` toward `target` via heading vec + motion-gate cells.
+ * Cadence is 333 ms which gives the AI ~10 game frames between our
+ * overrides to integrate root-motion. Writes per tick:
+ *   • heading vec (always — engine over-writes every game frame)
+ *   • state, anim, pursue (change-only — preserve engine's anim frame
+ *     counter unless it has cycled to a non-walk state)
+ *
+ * Earlier alarmed-cell battery (+0x0BC, +0x0C0, +0x0C4, +0x298, +0x460,
+ * +0x63C) made popos invisible — those values came from a hit-diff
+ * tainted by the popo dying mid-window. Re-enable only after redoing
+ * the diff with HP>0 filtering.
+ */
+static void agg_aim_at(uint32_t shooter_ptr, uint32_t target_ptr)
+{
+    union { uint32_t u; float f; } sx, sz, tx, tz, ux, uy, uz;
+    sx.u = *(volatile uint32_t *)(shooter_ptr + AGG_OFF_POSITION + 0);
+    sz.u = *(volatile uint32_t *)(shooter_ptr + AGG_OFF_POSITION + 8);
+    tx.u = *(volatile uint32_t *)(target_ptr  + AGG_OFF_POSITION + 0);
+    tz.u = *(volatile uint32_t *)(target_ptr  + AGG_OFF_POSITION + 8);
+    float dx = tx.f - sx.f;
+    float dz = tz.f - sz.f;
+    float magsq = dx * dx + dz * dz;
+    if (magsq >= 1.0f) {
+        float invmag = 1.0f / __builtin_sqrtf(magsq);
+        ux.f = dx * invmag;
+        uy.f = 0.0f;
+        uz.f = dz * invmag;
+        *(volatile uint32_t *)(shooter_ptr + AGG_OFF_HEADING + 0) = ux.u;
+        *(volatile uint32_t *)(shooter_ptr + AGG_OFF_HEADING + 4) = uy.u;
+        *(volatile uint32_t *)(shooter_ptr + AGG_OFF_HEADING + 8) = uz.u;
+    }
+    uint16_t cur_state = *(volatile uint16_t *)(shooter_ptr + AGG_OFF_STATE_334);
+    if (cur_state != AGG_STATE_LOCOMOTION) {
+        *(volatile uint16_t *)(shooter_ptr + AGG_OFF_STATE_334) = AGG_STATE_LOCOMOTION;
+    }
+    uint16_t cur_anim = *(volatile uint16_t *)(shooter_ptr + AGG_OFF_ANIM_324);
+    if (cur_anim != AGG_ANIM_WALK_FORWARD) {
+        *(volatile uint16_t *)(shooter_ptr + AGG_OFF_ANIM_324) = AGG_ANIM_WALK_FORWARD;
+    }
+    uint32_t cur_pursue = *(volatile uint32_t *)(shooter_ptr + AGG_OFF_PURSUE_TARGET);
+    if (cur_pursue != 0) {
+        *(volatile uint32_t *)(shooter_ptr + AGG_OFF_PURSUE_TARGET) = 0;
+    }
+    (void)target_ptr;
+}
+
+static void agg_on_section(const mhfu_map_section_ctx_t *ctx)
+{
+    int now_target = (ctx->section_id      == AGG_TARGET_AREA_INDEX);
+    int was_target = (ctx->prev_section_id == AGG_TARGET_AREA_INDEX);
+
+    if (now_target && !was_target) {
+        g_aggression_active = 1;
+        mhfu_log("[popo_agg] ACTIVATE  section=%u (prev=%u)",
+                 (unsigned)ctx->section_id, (unsigned)ctx->prev_section_id);
+    } else if (was_target && !now_target) {
+        g_aggression_active = 0;
+        for (int i = 0; i < AGG_MAX_TRACKED; i++) {
+            g_aggressors[i].entity_ptr = 0;
+            g_aggressors[i].reg_slot   = 0;
+        }
+        mhfu_log("[popo_agg] DEACTIVATE  left=%u now=%u",
+                 (unsigned)ctx->prev_section_id, (unsigned)ctx->section_id);
+    }
+}
+
+static void agg_on_monster(const mhfu_monster_spawn_ctx_t *ctx)
+{
+    if (ctx->monster_type != AGG_MONSTER_TYPE) return;
+    if (agg_find_slot(ctx->entity_ptr) >= 0) return;
+    int idx = agg_find_free_slot();
+    if (idx < 0) return;
+    g_aggressors[idx].entity_ptr = ctx->entity_ptr;
+    g_aggressors[idx].reg_slot   = ctx->slot;
+    mhfu_log("[popo_agg] tracking popo @ 0x%08lx (reg slot %d)",
+             (unsigned long)ctx->entity_ptr, ctx->slot);
+}
+
+/* Insertion-sort the tracked list by reg_slot. Cheap (≤ 8 items) and
+ * gives a deterministic chase order matching the user-visible slot
+ * numbering in the HUD. */
+static void agg_sort_by_slot(uint32_t *out_ptrs, int *out_n)
+{
+    int n = 0;
+    /* Collect non-empty entries first. */
+    for (int i = 0; i < AGG_MAX_TRACKED; i++) {
+        if (g_aggressors[i].entity_ptr != 0)
+            out_ptrs[n++] = g_aggressors[i].entity_ptr;
+    }
+    *out_n = n;
+    /* Sort by their current reg_slot — re-read from the registry since
+     * popos can move slots between sweeps. */
+    for (int i = 1; i < n; i++) {
+        uint32_t p = out_ptrs[i];
+        int slot_p = 0;
+        agg_entity_still_alive(p, &slot_p);
+        int j = i;
+        while (j > 0) {
+            int slot_prev = 0;
+            agg_entity_still_alive(out_ptrs[j - 1], &slot_prev);
+            if (slot_prev <= slot_p) break;
+            out_ptrs[j] = out_ptrs[j - 1];
+            j--;
+        }
+        out_ptrs[j] = p;
+    }
+}
+
+static int popo_aggression_thread(SceSize args, void *argp)
+{
+    (void)args; (void)argp;
+    for (;;) {
+        sceKernelDelayThread(AGG_TICK_MS * 1000);
+        if (!g_aggression_active) continue;
+        agg_prune_dead();
+        uint32_t ptrs[AGG_MAX_TRACKED];
+        int n = 0;
+        agg_sort_by_slot(ptrs, &n);
+        if (n < 2) continue;
+        /* Cyclic chase chain: popo[i] aims at popo[(i+1) % n].
+         * With n popos: 0 → 1 → 2 → ... → (n-1) → 0. */
+        for (int i = 0; i < n; i++) {
+            uint32_t shooter = ptrs[i];
+            uint32_t target  = ptrs[(i + 1) % n];
+            agg_aim_at(shooter, target);
+        }
+    }
+    return 0;
+}
+
+#endif /* MHFU_EMBED_POPO_AGGRESSION */
+
 /* Sentinel cells in a known-quiet RAM region so we can verify
  * end-to-end execution from a host debugger even when log file I/O
  * NIDs are unsupported by PPSSPP. Layout: four u32s starting at
@@ -907,6 +1143,10 @@ int main(int argc, char *argv[])
     mhfu_on_map_section_entered(popo_on_section);
     mhfu_on_monster_spawned(popo_on_monster);
 #endif
+#if MHFU_EMBED_POPO_AGGRESSION
+    mhfu_on_map_section_entered(agg_on_section);
+    mhfu_on_monster_spawned(agg_on_monster);
+#endif
     load_mods();
     sentinel_set(0x00, 0xCAFE0004);
 
@@ -946,6 +1186,25 @@ int main(int argc, char *argv[])
                  (unsigned long)&g_tracked_popos[0]);
         sentinel_set(0x28, (uint32_t)(uintptr_t)&g_popo_active);
         sentinel_set(0x2C, (uint32_t)(uintptr_t)&g_tracked_popos[0]);
+    }
+#endif
+#if MHFU_EMBED_POPO_AGGRESSION
+    {
+        SceUID ath = sceKernelCreateThread(
+            "popo_aggression", popo_aggression_thread,
+            0x18, 0x1000, 0, NULL);
+        if (ath >= 0) {
+            sceKernelStartThread(ath, 0, NULL);
+            mhfu_log("[popo_agg] embedded mod thread started (uid=0x%08lx)",
+                     (unsigned long)ath);
+        } else {
+            mhfu_log("[popo_agg] embedded thread create failed: %d", ath);
+        }
+        mhfu_log("[popo_agg] g_aggression_active=0x%08lx g_aggressors=0x%08lx",
+                 (unsigned long)&g_aggression_active,
+                 (unsigned long)&g_aggressors[0]);
+        sentinel_set(0x30, (uint32_t)(uintptr_t)&g_aggression_active);
+        sentinel_set(0x34, (uint32_t)(uintptr_t)&g_aggressors[0]);
     }
 #endif
 
