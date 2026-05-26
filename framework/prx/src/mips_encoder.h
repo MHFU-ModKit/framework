@@ -84,4 +84,21 @@ static inline uint32_t mips_sw(uint32_t rt, int16_t off, uint32_t base) {
          | ((uint32_t)(uint16_t)off);
 }
 
+static inline uint32_t mips_beq(uint32_t rs, uint32_t rt, int16_t off_insns) {
+    /* Branch if equal. off_insns is signed PC-relative offset in INSTRUCTIONS
+     * (PC+4-based). e.g., off_insns=2 lands at insn after delay slot + 1. */
+    return (0x04u << 26) | ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16)
+         | ((uint32_t)(uint16_t)off_insns);
+}
+
+static inline uint32_t mips_bne(uint32_t rs, uint32_t rt, int16_t off_insns) {
+    return (0x05u << 26) | ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16)
+         | ((uint32_t)(uint16_t)off_insns);
+}
+
+static inline uint32_t mips_jalr(uint32_t rs) {
+    /* R-type: op=0, rs, 0, rd=$ra(31), 0, funct=0x09 */
+    return ((rs & 0x1Fu) << 21) | (31u << 11) | 0x09u;
+}
+
 #endif /* MHFU_MIPS_ENCODER_H */

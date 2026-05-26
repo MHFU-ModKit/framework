@@ -653,6 +653,20 @@ static void demo_on_monster_spawned(const mhfu_monster_spawn_ctx_t *ctx)
 
 #define MHFU_EMBED_POPO_GROWTH 0
 #define MHFU_EMBED_POPO_AGGRESSION 1
+/* Section 22 (2026-05-26): swap popo vtable[8] (anim probability picker,
+ * 0x08865254) to a PRX-side stub that overrides $a1 = picked-anim with a
+ * host-controlled value. Combined with the popo_aggression heading-vec
+ * writes, this gives sustained "all popos walking forward" control
+ * without fighting the engine's per-frame anim selection.
+ *
+ * Mechanism: vtable swap at 0x089BC580 (popo vtable[8]). Runtime lookup
+ * (lw $t9, ($s5); lw $t9, 0x20($t9); jalr $t9), no JIT issues. Already
+ * proven by host-side demo at scripts/prefix_patch_demo.py.
+ *
+ * Self-contained — independent of popo_aggression. With both enabled,
+ * aggression provides heading direction + the vt[8] override forces
+ * walk-forward anim selection. */
+#define MHFU_EMBED_POPO_VT8_OVERRIDE 1
 
 #if MHFU_EMBED_POPO_GROWTH
 
@@ -831,6 +845,21 @@ static int popo_growth_thread(SceSize args, void *argp)
  * reference for the future stable-stub path.
  * ------------------------------------------------------------------------ */
 
+/* Forward decls for vt[8] hook symbols — actual defs further down in the
+ * MHFU_EMBED_POPO_VT8_OVERRIDE block. The vt[8] globals are NON-static
+ * specifically so this extern decl works across blocks; agg_reconcile_state
+ * below uses these to keep the swap in sync across savestate loads. */
+#if MHFU_EMBED_POPO_VT8_OVERRIDE
+#define VT8_POPO_VT8_SLOT 0x089BC580u
+#define VT8_STUB_INSNS    32
+extern volatile uint32_t g_vt8_stub_buf[VT8_STUB_INSNS];
+extern volatile uint32_t g_vt8_override_enable;
+extern volatile uint32_t g_vt8_request_install;
+extern volatile int      g_vt8_installed;
+void vt8_install(void);
+void vt8_uninstall(void);
+#endif
+
 #if MHFU_EMBED_POPO_AGGRESSION
 
 #define AGG_MONSTER_TYPE         0x46
@@ -946,6 +975,11 @@ static void agg_aim_at(uint32_t shooter_ptr, uint32_t target_ptr)
     if (cur_state != AGG_STATE_LOCOMOTION) {
         *(volatile uint16_t *)(shooter_ptr + AGG_OFF_STATE_334) = AGG_STATE_LOCOMOTION;
     }
+    /* Always pin +0x324 directly. The vt[8] hook is installed but its
+     * override is disabled by default (caused crash in first attempt —
+     * see vt8_build_stub commentary). When the override is safe to
+     * enable, this write becomes redundant and can be wrapped in
+     * `#if !MHFU_EMBED_POPO_VT8_OVERRIDE`. */
     uint16_t cur_anim = *(volatile uint16_t *)(shooter_ptr + AGG_OFF_ANIM_324);
     if (cur_anim != AGG_ANIM_WALK_FORWARD) {
         *(volatile uint16_t *)(shooter_ptr + AGG_OFF_ANIM_324) = AGG_ANIM_WALK_FORWARD;
@@ -1019,12 +1053,104 @@ static void agg_sort_by_slot(uint32_t *out_ptrs, int *out_n)
     }
 }
 
+/* Poll-based activation + vt[8] reconcile.
+ *
+ * Two scenarios where the section-transition callback (agg_on_section)
+ * doesn't fire and we'd otherwise stay deactivated:
+ *   1. The user loads a savestate already in section 99 — boot goes
+ *      straight to "in area" without firing the 98→99 transition.
+ *   2. The savestate restore wipes our previously-installed vt[8] swap
+ *      (savestates capture all RAM, including the EBOOT vtable bytes).
+ *
+ * The aggression thread runs every 333 ms and is the natural place for
+ * an idempotent reconcile: read area_index, infer should-be-active,
+ * then make the install/uninstall + flag match the desired state. */
+static void agg_reconcile_state(void)
+{
+    uint16_t area = *(volatile uint16_t *)0x08B0C7DCu;
+    int should_be_active = (area == AGG_TARGET_AREA_INDEX);
+    if (should_be_active && !g_aggression_active) {
+        g_aggression_active = 1;
+        mhfu_log("[popo_agg] AUTO-ACTIVATE  area=%u (poll path)", (unsigned)area);
+    } else if (!should_be_active && g_aggression_active) {
+        g_aggression_active = 0;
+        for (int i = 0; i < AGG_MAX_TRACKED; i++) {
+            g_aggressors[i].entity_ptr = 0;
+            g_aggressors[i].reg_slot   = 0;
+        }
+        mhfu_log("[popo_agg] AUTO-DEACTIVATE  area=%u", (unsigned)area);
+    }
+#if MHFU_EMBED_POPO_VT8_OVERRIDE
+    volatile uint32_t *slot = (volatile uint32_t *)VT8_POPO_VT8_SLOT;
+    uint32_t cur  = *slot;
+    uint32_t stub = (uint32_t)(uintptr_t)g_vt8_stub_buf;
+    /* vt[8] AUTO-INSTALL DISABLED (v4, 2026-05-26).
+     *
+     * Both v2 (replace-style) and v3 (postfix with 32B frame, $ra at
+     * +0x18, JAL not JALR — matching the framework's working wrapper
+     * layout exactly) FROZE PPSSPP on section-1 load with PC=0.
+     *
+     * Diagnostic data from frozen state:
+     *   • CPU PC = 0; RA = 0x08000020 (PSP startup); a2/a3 = 0xDEADBEEF.
+     *   • Stub bytes had PPSSPP HLE markers (`0x6817xxxx`) at 3 block
+     *     boundaries: entry, after JAL, branch target.
+     *   • The framework's working wrappers have HLE markers at 2
+     *     boundaries (entry + after JAL) and DO NOT crash.
+     *   • Theory: PPSSPP's JIT mishandles short basic blocks (the
+     *     branch-target block in my stub is ~7 insns, vs the wrapper's
+     *     long linear blocks) OR mishandles JALR-entered code (the
+     *     dispatcher reaches our stub via vtable JALR; framework
+     *     wrappers are reached via patched J).
+     *
+     * The popo_aggression cell-pin path (writing entity+0x324) works
+     * without the vt[8] swap — Section 20 verified this end-to-end
+     * (visible chase chain, ~3 Hz). Keeping that as the production
+     * mechanism; vt[8] swap stays opt-in for manual experiments.
+     *
+     * To experiment with the swap from the host:
+     *   1. Write `1` to g_vt8_request_install (address printed in log).
+     *   2. The aggression thread's next tick calls vt8_install().
+     *   3. Optionally set g_vt8_override_enable = 1 for active override.
+     *   4. Write `0` to g_vt8_request_install + `0` to override_enable
+     *      to revert.
+     */
+    if (should_be_active && g_vt8_request_install && cur != stub) {
+        g_vt8_installed = 0;
+        vt8_install();
+    } else if ((!should_be_active || !g_vt8_request_install) && cur == stub) {
+        vt8_uninstall();
+    }
+#endif
+}
+
+/* The savestate-load path doesn't fire monster_spawned events (no slot
+ * transitions during a savestate restore), so on poll activation we
+ * scan the registry ourselves to populate the tracked list. */
+static void agg_repopulate_from_registry(void)
+{
+    for (int slot = 1; slot < ENTITY_REGISTRY_SLOTS; slot++) {
+        uint32_t p = *(volatile uint32_t *)(ENTITY_REGISTRY_ADDR + slot * 4);
+        if (p == 0) continue;
+        if (agg_find_slot(p) >= 0) continue;
+        uint8_t mt = *(volatile uint8_t *)(p + 0x1E8);
+        if (mt != AGG_MONSTER_TYPE) continue;
+        int idx = agg_find_free_slot();
+        if (idx < 0) break;
+        g_aggressors[idx].entity_ptr = p;
+        g_aggressors[idx].reg_slot   = slot;
+        mhfu_log("[popo_agg] poll-tracked popo @ 0x%08lx (reg slot %d)",
+                 (unsigned long)p, slot);
+    }
+}
+
 static int popo_aggression_thread(SceSize args, void *argp)
 {
     (void)args; (void)argp;
     for (;;) {
         sceKernelDelayThread(AGG_TICK_MS * 1000);
+        agg_reconcile_state();
         if (!g_aggression_active) continue;
+        agg_repopulate_from_registry();
         agg_prune_dead();
         uint32_t ptrs[AGG_MAX_TRACKED];
         int n = 0;
@@ -1042,6 +1168,220 @@ static int popo_aggression_thread(SceSize args, void *argp)
 }
 
 #endif /* MHFU_EMBED_POPO_AGGRESSION */
+
+/* ------------------------------------------------------------------------ *
+ * Embedded popo vt[8] override hook (Section 22, 2026-05-26).
+ *
+ * Per-frame dispatcher (0x09AC5228..0x09AC5520, fully disasmed in
+ * docs/POPO_AI_STATE_HANDLER_VTABLE.md) calls popo's vtable[8] inside
+ * its action-record loop:
+ *
+ *     0x09AC5488  lw   $t9, ($s5)          ; entity vtable
+ *     0x09AC548C  andi $a1, $s2, 0xffff    ; a1 = anim_category
+ *     0x09AC5490  lw   $t9, 0x20($t9)      ; vtable[8]  (popo: 0x08865254)
+ *     0x09AC5494  jalr $t9                  ; → probability picker
+ *     0x09AC5498  move $a0, $s5             ; (delay)
+ *     ...
+ *     0x09AC54A0  beqz $a1, ...skip apply   ; vt[8] WRITES $a1 = picked anim
+ *
+ * So vt[8] is both an input port (a1=category in) AND output port
+ * (a1=specific anim out). Our stub:
+ *   1. Increment hit counter (diagnostic).
+ *   2. If override disabled → tail-call original 0x08865254 unchanged.
+ *   3. If enabled → load g_vt8_override_anim into $a1, set $v0=1, return.
+ *
+ * The dispatcher's BEQZ $a1 check then proceeds, $a1 holds OUR anim,
+ * and z_un_08863e70(entity+0x80, $a1, ...) applies the override anim.
+ *
+ * Popo vtable is at 0x089BC560 (verified live, see scripts/prefix_patch_demo.py).
+ * Slot 8 → offset 0x20 → cell 0x089BC580. Original ptr 0x08865254.
+ *
+ * Cooperates with popo_aggression: aggression writes heading vec at
+ * 3 Hz (the engine reads heading per-frame for direction), our hook
+ * forces walk-forward anim selection every time the engine asks
+ * vt[8] for an anim choice. Result = sustained chase chain without
+ * cell-write flicker on +0x324.
+ * ------------------------------------------------------------------------ */
+
+#if MHFU_EMBED_POPO_VT8_OVERRIDE
+
+#define VT8_POPO_VTABLE_BASE       0x089BC560u
+/* VT8_POPO_VT8_SLOT (0x089BC580) and VT8_STUB_INSNS (32) are already
+ * defined in the forward-decl block above so the aggression thread can
+ * reference them; redefining here would conflict — the values match. */
+#define VT8_ORIGINAL_PTR           0x08865254u
+#define VT8_DEFAULT_ANIM           1011u   /* WALK_FORWARD per popo_aggression */
+
+/* Stub buffer + control globals — NON-static so the forward-decl block
+ * above can extern-declare them. Kept volatile so the compiler doesn't
+ * cache reads/writes from the polling thread. */
+__attribute__((aligned(4)))
+volatile uint32_t g_vt8_stub_buf[VT8_STUB_INSNS];
+
+static volatile uint32_t g_vt8_override_anim   = VT8_DEFAULT_ANIM;
+volatile uint32_t        g_vt8_override_enable = 0;
+volatile uint32_t        g_vt8_request_install = 0;   /* host-write 1 to opt-in */
+static volatile uint32_t g_vt8_hit_count       = 0;
+static volatile uint32_t g_vt8_original_ptr    = 0;
+volatile int             g_vt8_installed       = 0;
+
+/* Helper: lui+ori sequence to load full 32-bit value into a reg.
+ * Caller passes the reg id and an emit buffer; returns # of insns (2). */
+static inline int vt8_emit_li32(uint32_t *out, uint32_t reg, uint32_t value)
+{
+    out[0] = mips_lui(reg, (uint16_t)(value >> 16));
+    out[1] = mips_ori(reg, reg, (uint16_t)(value & 0xFFFF));
+    return 2;
+}
+
+/* POSTFIX patch — original always runs first, then we conditionally
+ * override $a1.
+ *
+ * Bug history (2026-05-26):
+ *   v1: replace-style stub (skip original entirely). CRASHED inside
+ *       0x08863e70 because $a2 was uninit — original sets it.
+ *   v2: postfix stub with 16-byte frame, save $ra at $sp+0. FROZE on
+ *       section-1 load with PC=0. Cause: MIPS o32 ABI reserves
+ *       $sp+0..+0x0F as $a0..$a3 SAVE AREA. The called original may
+ *       write $a0 to $sp+0, overwriting our $ra save. Then our
+ *       `lw $ra, 0($sp)` reads entity ptr; `jr $ra` jumps into popo
+ *       memory → eventual PC=0 → freeze.
+ *   v3 (current): 32-byte frame, save $ra at $sp+0x18 (mirrors the
+ *       framework's working wrapper layout, which uses 0x40 frame +
+ *       $ra at $sp+0x18). The 0x10..0x1F region is "ours" — original
+ *       has no business writing there.
+ *
+ *   addiu  $sp, $sp, -32                ; 32-byte frame
+ *   sw     $ra, 0x18($sp)               ; $ra at +0x18 (beyond arg save area)
+ *
+ *   ; hit counter (diagnostic)
+ *   lui    $t0, hi(&g_vt8_hit_count)
+ *   ori    $t0, $t0, lo(&g_vt8_hit_count)
+ *   lw     $t1, 0($t0)
+ *   addiu  $t1, $t1, 1
+ *   sw     $t1, 0($t0)
+ *
+ *   ; call original via JAL (absolute, no $t9 setup needed — saves 2 insns
+ *   ; and avoids JALR which appears to interact with PPSSPP JIT differently
+ *   ; than the framework wrappers' JAL dispatcher pattern).
+ *   jal    VT8_ORIGINAL_PTR             ; preserves $a0..$a3 contract;
+ *                                       ; original returns $a1 = picked anim
+ *   nop                                 ; delay slot
+ *
+ *   ; check enable
+ *   lui    $t0, hi(&g_vt8_override_enable)
+ *   ori    $t0, $t0, lo(&g_vt8_override_enable)
+ *   lw     $t2, 0($t0)
+ *   beq    $t2, $zero, done             ; +5  (skip override branch)
+ *   nop                                 ; delay slot
+ *
+ *   ; ALSO skip if original returned $a1 == 0 (engine's "skip apply"
+ *   ; signal — we honour it).
+ *   beq    $a1, $zero, done             ; +3
+ *   nop                                 ; delay slot
+ *
+ *   ; override path: $a1 = g_vt8_override_anim
+ *   lui    $t0, hi(&g_vt8_override_anim)
+ *   ori    $t0, $t0, lo(&g_vt8_override_anim)
+ *   lw     $a1, 0($t0)
+ *
+ *  done:
+ *   lw     $ra, 0x18($sp)
+ *   addiu  $sp, $sp, 32
+ *   jr     $ra
+ *   nop                                 ; delay slot
+ *
+ * 22 instructions, 88 bytes. Fits in VT8_STUB_INSNS=32.
+ */
+static void vt8_build_stub(void)
+{
+    uint32_t *s = (uint32_t *)g_vt8_stub_buf;
+    int i = 0;
+
+    uint32_t hit_addr    = (uint32_t)(uintptr_t)&g_vt8_hit_count;
+    uint32_t enable_addr = (uint32_t)(uintptr_t)&g_vt8_override_enable;
+    uint32_t anim_addr   = (uint32_t)(uintptr_t)&g_vt8_override_anim;
+
+    /* Prologue — 32-byte frame, save $ra ABOVE the arg-save area
+     * ($sp+0..+0x0F is reserved by the o32 ABI for the callee to spill
+     * $a0..$a3). v2 bug: saved $ra at $sp+0 → original's $a0 spill
+     * clobbered it → garbage $ra on return → PC=0 freeze. */
+    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -32);
+    s[i++] = mips_sw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
+
+    /* Hit counter */
+    i += vt8_emit_li32(&s[i], MIPS_REG_T0, hit_addr);
+    s[i++] = mips_lw(MIPS_REG_T1, 0, MIPS_REG_T0);
+    s[i++] = mips_addiu(MIPS_REG_T1, MIPS_REG_T1, 1);
+    s[i++] = mips_sw(MIPS_REG_T1, 0, MIPS_REG_T0);
+
+    /* Call original via JAL (absolute target). Saves 2 insns vs JALR
+     * setup. Both PSP user RAM and EBOOT live in the same 256 MiB
+     * segment so JAL's 28-bit encoded target reaches. */
+    s[i++] = mips_jal(VT8_ORIGINAL_PTR);
+    s[i++] = MIPS_NOP;
+
+    /* Check enable. If disabled → skip 7 insns + delay-slot down to
+     * epilogue. */
+    i += vt8_emit_li32(&s[i], MIPS_REG_T0, enable_addr);
+    s[i++] = mips_lw(MIPS_REG_T2, 0, MIPS_REG_T0);
+    s[i++] = mips_beq(MIPS_REG_T2, MIPS_REG_ZERO, 7);
+    s[i++] = MIPS_NOP;
+
+    /* Skip override if original returned $a1 == 0 (engine "skip apply"
+     * signal — honouring it avoids running the applier on stale state). */
+    s[i++] = mips_beq(MIPS_REG_A1, MIPS_REG_ZERO, 4);
+    s[i++] = MIPS_NOP;
+
+    /* Override: $a1 = g_vt8_override_anim */
+    i += vt8_emit_li32(&s[i], MIPS_REG_T0, anim_addr);
+    s[i++] = mips_lw(MIPS_REG_A1, 0, MIPS_REG_T0);
+
+    /* Epilogue */
+    s[i++] = mips_lw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 32);
+    s[i++] = mips_jr(MIPS_REG_RA);
+    s[i++] = MIPS_NOP;
+}
+
+void vt8_install(void)
+{
+    if (g_vt8_installed) return;
+    vt8_build_stub();
+    /* Flush dcache + invalidate icache so the freshly written stub
+     * bytes are seen by the CPU when it executes them. */
+    sceKernelDcacheWritebackInvalidateAll();
+    sceKernelIcacheInvalidateAll();
+    /* Save original then swap. */
+    volatile uint32_t *slot = (volatile uint32_t *)VT8_POPO_VT8_SLOT;
+    g_vt8_original_ptr = *slot;
+    *slot = (uint32_t)(uintptr_t)g_vt8_stub_buf;
+    sceKernelDcacheWritebackInvalidateAll();
+    g_vt8_installed = 1;
+    mhfu_log("[vt8] installed: stub=0x%08lx orig=0x%08lx slot=0x%08lx",
+             (unsigned long)g_vt8_stub_buf,
+             (unsigned long)g_vt8_original_ptr,
+             (unsigned long)VT8_POPO_VT8_SLOT);
+}
+
+void vt8_uninstall(void)
+{
+    if (!g_vt8_installed) return;
+    volatile uint32_t *slot = (volatile uint32_t *)VT8_POPO_VT8_SLOT;
+    *slot = g_vt8_original_ptr;
+    sceKernelDcacheWritebackInvalidateAll();
+    g_vt8_installed = 0;
+    g_vt8_override_enable = 0;
+    mhfu_log("[vt8] uninstalled: restored 0x%08lx, hits=%lu",
+             (unsigned long)g_vt8_original_ptr,
+             (unsigned long)g_vt8_hit_count);
+}
+
+/* Install/uninstall is now driven entirely by the popo_aggression thread's
+ * agg_reconcile_state() (poll path), which works for both cold-boot
+ * navigation AND savestate-load. No separate map-section callback needed. */
+
+#endif /* MHFU_EMBED_POPO_VT8_OVERRIDE */
 
 /* Sentinel cells in a known-quiet RAM region so we can verify
  * end-to-end execution from a host debugger even when log file I/O
@@ -1147,6 +1487,9 @@ int main(int argc, char *argv[])
     mhfu_on_map_section_entered(agg_on_section);
     mhfu_on_monster_spawned(agg_on_monster);
 #endif
+/* vt[8] override install is driven by agg_reconcile_state() in the
+ * popo_aggression thread (poll-based, savestate-safe). No section
+ * callback registration needed here. */
     load_mods();
     sentinel_set(0x00, 0xCAFE0004);
 
@@ -1206,6 +1549,18 @@ int main(int argc, char *argv[])
         sentinel_set(0x30, (uint32_t)(uintptr_t)&g_aggression_active);
         sentinel_set(0x34, (uint32_t)(uintptr_t)&g_aggressors[0]);
     }
+#endif
+#if MHFU_EMBED_POPO_VT8_OVERRIDE
+    mhfu_log("[vt8] AUTO-INSTALL DISABLED (caused freeze v2+v3). "
+             "Host opt-in: write 1 to g_vt8_request_install=0x%08lx, "
+             "then optionally g_vt8_override_enable=0x%08lx",
+             (unsigned long)&g_vt8_request_install,
+             (unsigned long)&g_vt8_override_enable);
+    mhfu_log("[vt8] g_vt8_override_anim=0x%08lx (default %u)",
+             (unsigned long)&g_vt8_override_anim,
+             (unsigned)VT8_DEFAULT_ANIM);
+    sentinel_set(0x38, (uint32_t)(uintptr_t)&g_vt8_request_install);
+    sentinel_set(0x3C, (uint32_t)(uintptr_t)&g_vt8_override_enable);
 #endif
 
     mhfu_log("[framework] ready");
