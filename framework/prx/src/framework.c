@@ -1951,43 +1951,49 @@ static void hdg_build_stub(void)
     uint32_t *s = (uint32_t *)g_hdg_stub_buf;
     int i = 0;
 
-    uint32_t helper_addr  = (uint32_t)(uintptr_t)&hdg_chase_helper;
+    uint32_t helper_addr = (uint32_t)(uintptr_t)&hdg_chase_helper;
 
-    /* Section 25 BRANCHLESS stub (v4 design, per Section 22 finding).
+    /* Section 26b POSTFIX wrapper (Harmony-style "edit return value").
      *
-     * PPSSPP's JIT inserts HLE markers (`0x68XX_XXXX`) at every basic
-     * block boundary. Short branch-target blocks (<10 insns) cause
-     * PC=0 freezes when the JIT translates them. Our previous stub
-     * had two conditional branches (beq enable, bne type) creating
-     * 3+ short basic blocks → freeze on first save-screen render.
+     * Prior PREFIX stub wrote heading BEFORE transform_builder's body
+     * ran the yaw rotator (z_un_08865530) — engine then overwrote our
+     * heading in the same call. Chase appeared as engine-default
+     * wander. POSTFIX runs helper AFTER body returns, so our write is
+     * the last one before the next frame's read.
      *
-     * Branchless layout (12 insns, single basic block ending in J):
+     * Critical: this stub calls the original via `jal HDG_ROTATOR_ADDR`.
+     * That works ONLY if the entry point is UNPATCHED (otherwise jal
+     * hits our own `j stub` → infinite loop). Section 26b drops the
+     * entry-point patch; the only install is JAL-caller redirects
+     * (OVL_A 0x09AC51AC patched at section-99 entry; EBOOT generic
+     * 0x088D28A0 left UNPATCHED for now — first test on OVL_A path
+     * only to isolate postfix's effect).
+     *
+     * Branchless single basic block (12 insns):
      *   +0  addiu sp, sp, -0x20
-     *   +1  sw    ra, 0x18(sp)            ; save caller ra
-     *   +2  sw    a0, 0x10(sp)            ; save entity arg
-     *   +3  jal   hdg_chase_helper        ; C function — does all filtering
-     *   +4  nop                            ; delay slot
-     *   +5  lw    a0, 0x10(sp)            ; restore entity for orig
-     *   +6  lw    ra, 0x18(sp)            ; restore caller ra
-     *   +7  addiu sp, sp, 0x20
-     *   +8  <g_hdg_orig_insn0>            ; original transform_builder insn0
-     *   +9  <g_hdg_orig_insn1>            ; original insn1
-     *   +10 j     HDG_RESUME_ADDR         ; into transform_builder body
-     *   +11 nop                            ; delay slot
-     *
-     * The helper bails fast for non-popo, save-screen, etc. — see
-     * hdg_chase_helper(). Stub itself is unconditional. */
+     *   +1  sw    ra, 0x18(sp)             ; save caller ra
+     *   +2  sw    a0, 0x10(sp)             ; save entity (jal clobbers)
+     *   +3  jal   HDG_ROTATOR_ADDR          ; FULL original body
+     *   +4  nop                             ; delay slot
+     *   +5  lw    a0, 0x10(sp)             ; restore entity for helper
+     *   +6  jal   hdg_chase_helper          ; POSTFIX — writes heading
+     *   +7  nop                             ; delay slot
+     *   +8  lw    ra, 0x18(sp)             ; restore caller ra
+     *   +9  addiu sp, sp, 0x20
+     *   +10 jr    ra                        ; return to JAL caller
+     *   +11 nop                             ; delay slot
+     */
     s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);
     s[i++] = mips_sw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
     s[i++] = mips_sw(MIPS_REG_A0, 0x10, MIPS_REG_SP);
-    s[i++] = mips_jal(helper_addr);
+    s[i++] = mips_jal(HDG_ROTATOR_ADDR);
     s[i++] = MIPS_NOP;
     s[i++] = mips_lw(MIPS_REG_A0, 0x10, MIPS_REG_SP);
+    s[i++] = mips_jal(helper_addr);
+    s[i++] = MIPS_NOP;
     s[i++] = mips_lw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
     s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);
-    s[i++] = g_hdg_orig_insn0;
-    s[i++] = g_hdg_orig_insn1;
-    s[i++] = mips_j(HDG_RESUME_ADDR);
+    s[i++] = mips_jr(MIPS_REG_RA);
     s[i++] = MIPS_NOP;
 
     /* Fill rest with NOP. */
@@ -1997,21 +2003,18 @@ static void hdg_build_stub(void)
 void hdg_install(void)
 {
     if (g_hdg_installed) return;
-    /* Capture original first 2 instructions BEFORE building stub
-     * (build_stub embeds them in the fallthrough path). */
+    /* Section 26b: POSTFIX wrapper — entry-point UNPATCHED. The stub
+     * calls `jal HDG_ROTATOR_ADDR` to invoke the original full body,
+     * then runs the helper. orig_insn0/1 are no longer used by the
+     * stub (kept for log compat / future ref). */
     g_hdg_orig_insn0 = *(volatile uint32_t *)HDG_ROTATOR_ADDR;
     g_hdg_orig_insn1 = *(volatile uint32_t *)(HDG_ROTATOR_ADDR + 4);
     hdg_build_stub();
     sceKernelDcacheWritebackInvalidateAll();
     sceKernelIcacheInvalidateAll();
-    /* Patch target with j stub + nop. */
-    uint32_t patch_j = mips_j((uint32_t)(uintptr_t)g_hdg_stub_buf);
-    *(volatile uint32_t *)HDG_ROTATOR_ADDR = patch_j;
-    *(volatile uint32_t *)(HDG_ROTATOR_ADDR + 4) = MIPS_NOP;
-    sceKernelDcacheWritebackInvalidateAll();
-    sceKernelIcacheInvalidateAll();
     g_hdg_installed = 1;
-    mhfu_log("[hdg] installed: stub=0x%08lx orig0=0x%08lx orig1=0x%08lx",
+    mhfu_log("[hdg] POSTFIX stub built; entry-point UNPATCHED. "
+             "stub=0x%08lx orig0=0x%08lx orig1=0x%08lx",
              (unsigned long)g_hdg_stub_buf,
              (unsigned long)g_hdg_orig_insn0,
              (unsigned long)g_hdg_orig_insn1);
@@ -2019,14 +2022,13 @@ void hdg_install(void)
 
 void hdg_uninstall(void)
 {
+    /* Section 26b: nothing to unpatch at the entry point (we never
+     * wrote it). JAL-caller patches are reverted by
+     * hdg_unpatch_ovl_callers() at section-99 leave. */
     if (!g_hdg_installed) return;
-    *(volatile uint32_t *)HDG_ROTATOR_ADDR = g_hdg_orig_insn0;
-    *(volatile uint32_t *)(HDG_ROTATOR_ADDR + 4) = g_hdg_orig_insn1;
-    sceKernelDcacheWritebackInvalidateAll();
-    sceKernelIcacheInvalidateAll();
     g_hdg_installed = 0;
     g_hdg_enable = 0;
-    mhfu_log("[hdg] uninstalled: restored, hits=%lu",
+    mhfu_log("[hdg] uninstalled (postfix; nothing to restore at entry), hits=%lu",
              (unsigned long)g_hdg_hit_count);
 }
 
