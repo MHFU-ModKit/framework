@@ -373,6 +373,20 @@ static uint32_t * cave_slot_addr(int slot_index)
     return &g_code_cave[slot_index * WRAPPER_INSNS];
 }
 
+/* Surgical SMC helper matching PPSSPP's CWCheat invalidate pattern
+ * (Core/CwCheat.cpp:897-901, ExecuteOp:1011-1017). Per-write ranged
+ * invalidate routes through MIPSState::InvalidateICache ->
+ * JitBlockCache::DestroyBlock (Core/MIPS/MIPS.cpp:354, JitBlockCache.cpp:461),
+ * which is the only PPSSPP path proven to drop cached JIT translations
+ * for the patched address. The PSP-native ordering (dcache writeback
+ * first, then icache invalidate) is also what real hardware requires. */
+static inline void mhfu_patch_code_word(uint32_t addr, uint32_t word)
+{
+    *(volatile uint32_t *)addr = word;
+    sceKernelDcacheWritebackInvalidateRange((const void *)addr, 4);
+    sceKernelIcacheInvalidateRange((const void *)addr, 4);
+}
+
 static int install_trampoline_for(
     int             slot_index,
     uint32_t        anchor_pc,
@@ -934,8 +948,23 @@ void vt5_uninstall(void);
 #endif
 
 #if MHFU_EMBED_POPO_HEADING_HOOK
-#define HDG_ROTATOR_ADDR  0x08865044u
-#define HDG_RESUME_ADDR   0x0886504Cu  /* original + 8 (after the 2 hijacked insns) */
+/* Section 25 (2026-05-27) — corrected hook target.
+ *
+ * Section 24 identified 0x08865044 as the per-popo heading rotator. That
+ * was wrong: empirical mem-BP on a live popo's heading vec (+0x10..+0x18)
+ * fired at 0x088655B4..BC (VFPU sv.s instructions inside z_un_08865530,
+ * the YAW rotator), with the parent at z_un_088652DC the transform
+ * builder. 0x08865044 was dead code on the popo motion path — hit_count=0
+ * regardless of patch state.
+ *
+ * 0x088652DC is the real per-entity transform-builder. Takes $a0=entity,
+ * builds size+rotation matrix, calls yaw (0x08865530) + pitch (0x08865480)
+ * sub-rotators. Two callers exist: 0x088D28A0 (EBOOT, generic) and
+ * 0x09AC51AC (OVL_A, popo-specific tick path). Hooking the entry catches
+ * every entity transform tick — stub type-checks per +0x1E8 to filter to
+ * popo only. */
+#define HDG_ROTATOR_ADDR  0x088652DCu
+#define HDG_RESUME_ADDR   0x088652E4u  /* original + 8 (after the 2 hijacked insns) */
 #define HDG_STUB_INSNS    48
 extern volatile uint32_t g_hdg_stub_buf[HDG_STUB_INSNS];
 extern volatile uint32_t g_hdg_enable;
@@ -1095,10 +1124,13 @@ static void agg_aim_at(uint32_t shooter_ptr, uint32_t target_ptr)
  * inside popo's overlay. Patched at section-99 entry (= immediately after
  * popo overlay loads + before any state transition fires) so PPSSPP's JIT
  * translates OUR jal target (= stub) on first execution. */
+/* Section 25 — single popo-specific JAL caller of transform_builder.
+ * The OLD list targeted the wrong function (0x08865044) and was scanned
+ * empirically across OVL_A; those 11 sites were never on the popo motion
+ * path (BPs fired 0 times in 20s of gameplay). The new single caller is
+ * inside popo's per-frame tick dispatcher at 0x09AC5xxx. */
 static const uint32_t g_hdg_ovl_callers[] = {
-    0x09A73058u, 0x09A730B4u,
-    0x09A97248u, 0x09A977CCu, 0x09A978F4u, 0x09A97A18u,
-    0x09A97B14u, 0x09A97D40u, 0x09A97F2Cu, 0x09A98488u, 0x09A98AC4u,
+    0x09AC51ACu,
 };
 #define HDG_OVL_CALLER_COUNT (sizeof(g_hdg_ovl_callers) / sizeof(g_hdg_ovl_callers[0]))
 
@@ -1108,6 +1140,14 @@ static int      g_hdg_ovl_patched = 0;
 static void hdg_patch_ovl_callers(void)
 {
     if (g_hdg_ovl_patched) return;
+    /* Section 25 safety guard: do NOT patch OVL_A callers unless the
+     * entry-install succeeded (which captures orig_insn0/1 into the stub).
+     * Otherwise the stub falls through to two zero instructions then jumps
+     * mid-function with sp unadjusted → stack corruption → crash. */
+    if (!g_hdg_installed) {
+        mhfu_log("[hdg-ovl] skip caller patches: entry-install never ran");
+        return;
+    }
     uint32_t patch = mips_jal((uint32_t)(uintptr_t)g_hdg_stub_buf);
     int patched_n = 0;
     for (unsigned i = 0; i < HDG_OVL_CALLER_COUNT; i++) {
@@ -1122,9 +1162,13 @@ static void hdg_patch_ovl_callers(void)
             continue;
         }
         g_hdg_ovl_saved[i] = orig;
-        *(volatile uint32_t *)addr = patch;
+        mhfu_patch_code_word(addr, patch);
         patched_n++;
     }
+    /* Belt-and-suspenders global flush — the per-write ranged invalidate
+     * above is the primary mechanism, but a trailing All-call also forces
+     * InvalidateChangedBlocks() to walk the entire JIT cache and re-hash
+     * any blocks the JIT may have linked through our newly-patched JALs. */
     sceKernelDcacheWritebackInvalidateAll();
     sceKernelIcacheInvalidateAll();
     g_hdg_ovl_patched = 1;
@@ -1136,7 +1180,7 @@ static void hdg_unpatch_ovl_callers(void)
     if (!g_hdg_ovl_patched) return;
     for (unsigned i = 0; i < HDG_OVL_CALLER_COUNT; i++) {
         if (g_hdg_ovl_saved[i] != 0) {
-            *(volatile uint32_t *)g_hdg_ovl_callers[i] = g_hdg_ovl_saved[i];
+            mhfu_patch_code_word(g_hdg_ovl_callers[i], g_hdg_ovl_saved[i]);
         }
     }
     sceKernelDcacheWritebackInvalidateAll();
@@ -1304,18 +1348,36 @@ static void agg_reconcile_state(void)
     }
 #endif
 #if MHFU_EMBED_POPO_HEADING_HOOK
-    /* The heading hook is installed AT PRX INIT (in install_worker)
-     * because live install after first JIT translation fails to take
-     * effect (PPSSPP JIT cache). Re-install if the patched bytes
-     * disappear (e.g., after a savestate load that captured pre-patch
-     * memory). */
-    {
-        uint32_t cur_w0 = *(volatile uint32_t *)HDG_ROTATOR_ADDR;
-        uint32_t want_w0 = mips_j((uint32_t)(uintptr_t)g_hdg_stub_buf);
-        if (g_hdg_installed && cur_w0 != want_w0) {
-            /* Bytes reverted (savestate?). Re-patch. */
-            g_hdg_installed = 0;
-            hdg_install();
+    /* Section 26 (2026-05-27): hdg_install GATE on screen_state.
+     *
+     * Install when scr first observed as MENU (0x01) or TITLE (0x04),
+     * AND HDG_ROTATOR_ADDR holds a real sp-prologue (not zeros / JIT
+     * marker / overwrite). These are the two states verified by
+     * /tmp/diag_bp_only.py to have ZERO transform_builder calls. Any
+     * later state (especially char-select scr=0x08) risks the JIT
+     * having already translated the target block → patch ignored.
+     *
+     * One-shot: install once, never re-install (would re-capture stale
+     * bytes per Section 25 lesson). */
+    if (!g_hdg_installed) {
+        uint8_t scr = *(volatile uint8_t *)0x08A8CA48u;
+        if (scr == 0x01 || scr == 0x04) {
+            uint32_t orig_w0 = *(volatile uint32_t *)HDG_ROTATOR_ADDR;
+            int is_neg_sp_addiu = ((orig_w0 & 0xFFFF8000u) == 0x27BD8000u);
+            if (is_neg_sp_addiu) {
+                mhfu_log("[hdg-gate] scr=0x%02x → INSTALL (orig_w0=0x%08lx)",
+                         (unsigned)scr, (unsigned long)orig_w0);
+                g_hdg_request_install = 1;
+                hdg_install();
+            } else {
+                /* Not a valid prologue yet — savestate restore may still
+                 * be in progress, or EBOOT slice not resident. Re-poll. */
+                static uint32_t s_complaints = 0;
+                if ((s_complaints++ & 31) == 0) {
+                    mhfu_log("[hdg-gate] scr=0x%02x but HDG bytes 0x%08lx not sp-prologue; waiting",
+                             (unsigned)scr, (unsigned long)orig_w0);
+                }
+            }
         }
     }
 #endif
@@ -1815,8 +1877,26 @@ volatile uint32_t g_hdg_hit_count       = 0;
  * existing spawn-tracking + slot-ordering logic carries over. */
 void hdg_chase_helper(uint32_t entity)
 {
+    /* Section 26 (2026-05-27): hit counter incremented per-call BEFORE
+     * any bail-outs, so a non-zero counter proves the stub→helper path
+     * fires at all. Sub-bailout counters track which guard rejected. */
+    g_hdg_hit_count++;
+
+    /* Section 25 fast-bail guards. Helper is called from the branchless
+     * stub on EVERY transform_builder invocation — including save-screen,
+     * village, cutscene-rendered characters. The stub is intentionally
+     * branchless (single-basic-block) to avoid PPSSPP's JIT PC=0 freeze
+     * (Section 22 v4 finding: conditional branches in stubs create short
+     * basic blocks that JIT mishandles). All filtering happens in C. */
+    if (!g_hdg_enable) return;
+    /* Screen-state oracle: 17 = in-area, anything else = menu/loading.
+     * No popos exist outside in-area, so bailing here keeps helper cost
+     * to a single byte read for menu rendering. */
+    if (*(volatile uint8_t *)0x08A8CA48u != 17) return;
+    /* Type filter — only popo (0x46). Character cards on save screen,
+     * NPC villagers, etc., all fail this. */
     uint8_t mt = *(volatile uint8_t *)(entity + 0x1E8);
-    if (mt != AGG_MONSTER_TYPE) return;   /* only popo */
+    if (mt != AGG_MONSTER_TYPE) return;
 
     /* Find this entity's index in the tracked list. */
     int my_idx = -1;
@@ -1871,76 +1951,40 @@ static void hdg_build_stub(void)
     uint32_t *s = (uint32_t *)g_hdg_stub_buf;
     int i = 0;
 
-    uint32_t enable_addr  = (uint32_t)(uintptr_t)&g_hdg_enable;
-    uint32_t hit_addr     = (uint32_t)(uintptr_t)&g_hdg_hit_count;
     uint32_t helper_addr  = (uint32_t)(uintptr_t)&hdg_chase_helper;
 
-    /* --- header: check enable + type, jump to fallthrough if neither matches --- */
-
-    /* Load enable flag into $t0. */
-    i += hdg_emit_li32(&s[i], MIPS_REG_T0, enable_addr);
-    s[i++] = mips_lw(MIPS_REG_T0, 0, MIPS_REG_T0);
-    /* Insns from here to fallthrough_orig: stub-relative offsets.
-     * Layout:
-     *   +0..+1  : lui + ori for enable
-     *   +2      : lw enable
-     *   +3      : beq enable, 0, fallthrough        ← we are here, offset 3
-     *   +4      : nop (delay)
-     *   +5..+6  : lbu type + addiu compare reg
-     *   +7      : bne type, popo_const, fallthrough ← second branch
-     *   +8      : nop (delay)
-     *   +9..+25 : popo body (17 insns: addiu sp, sw ra/s0, move, hit counter
-     *             [lui+ori+lw+addiu+sw], jal helper, move a0/s0, lw s0/ra,
-     *             addiu sp, jr ra, nop)
-     *   +26     : fallthrough_orig: orig_insn0
-     *   +27     : orig_insn1
-     *   +28     : j HDG_RESUME_ADDR
-     *   +29     : nop
-     */
-    int beq_pos = i;
-    s[i++] = mips_beq(MIPS_REG_T0, MIPS_REG_ZERO, 0);   /* patched below */
-    s[i++] = MIPS_NOP;
-
-    s[i++] = mips_lbu(MIPS_REG_T0, 0x1E8, MIPS_REG_A0);
-    s[i++] = mips_addiu(MIPS_REG_T1, MIPS_REG_ZERO, AGG_MONSTER_TYPE);
-    int bne_pos = i;
-    s[i++] = mips_bne(MIPS_REG_T0, MIPS_REG_T1, 0);     /* patched below */
-    s[i++] = MIPS_NOP;
-
-    /* popo body */
+    /* Section 25 BRANCHLESS stub (v4 design, per Section 22 finding).
+     *
+     * PPSSPP's JIT inserts HLE markers (`0x68XX_XXXX`) at every basic
+     * block boundary. Short branch-target blocks (<10 insns) cause
+     * PC=0 freezes when the JIT translates them. Our previous stub
+     * had two conditional branches (beq enable, bne type) creating
+     * 3+ short basic blocks → freeze on first save-screen render.
+     *
+     * Branchless layout (12 insns, single basic block ending in J):
+     *   +0  addiu sp, sp, -0x20
+     *   +1  sw    ra, 0x18(sp)            ; save caller ra
+     *   +2  sw    a0, 0x10(sp)            ; save entity arg
+     *   +3  jal   hdg_chase_helper        ; C function — does all filtering
+     *   +4  nop                            ; delay slot
+     *   +5  lw    a0, 0x10(sp)            ; restore entity for orig
+     *   +6  lw    ra, 0x18(sp)            ; restore caller ra
+     *   +7  addiu sp, sp, 0x20
+     *   +8  <g_hdg_orig_insn0>            ; original transform_builder insn0
+     *   +9  <g_hdg_orig_insn1>            ; original insn1
+     *   +10 j     HDG_RESUME_ADDR         ; into transform_builder body
+     *   +11 nop                            ; delay slot
+     *
+     * The helper bails fast for non-popo, save-screen, etc. — see
+     * hdg_chase_helper(). Stub itself is unconditional. */
     s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);
     s[i++] = mips_sw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
-    s[i++] = mips_sw(MIPS_REG_S0, 0x10, MIPS_REG_SP);
-    s[i++] = mips_move(MIPS_REG_S0, MIPS_REG_A0);
-
-    /* hit counter ++ (diagnostic) */
-    i += hdg_emit_li32(&s[i], MIPS_REG_T0, hit_addr);
-    s[i++] = mips_lw(MIPS_REG_T1, 0, MIPS_REG_T0);
-    s[i++] = mips_addiu(MIPS_REG_T1, MIPS_REG_T1, 1);
-    s[i++] = mips_sw(MIPS_REG_T1, 0, MIPS_REG_T0);
-
-    /* JAL helper */
+    s[i++] = mips_sw(MIPS_REG_A0, 0x10, MIPS_REG_SP);
     s[i++] = mips_jal(helper_addr);
-    s[i++] = mips_move(MIPS_REG_A0, MIPS_REG_S0);   /* delay: pass entity */
-
-    /* Epilogue + return (skip original entirely) */
-    s[i++] = mips_lw(MIPS_REG_S0, 0x10, MIPS_REG_SP);
+    s[i++] = MIPS_NOP;
+    s[i++] = mips_lw(MIPS_REG_A0, 0x10, MIPS_REG_SP);
     s[i++] = mips_lw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
     s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);
-    s[i++] = mips_jr(MIPS_REG_RA);
-    s[i++] = MIPS_NOP;
-
-    /* fallthrough_orig label = current i. Patch branches to point here. */
-    int fallthrough = i;
-    /* MIPS branch offset is in INSTRUCTIONS, signed, relative to PC+4
-     * (PC of the delay slot). So target_insn_offset_from_branch =
-     * fallthrough - (branch_pos + 1). */
-    int16_t beq_off = (int16_t)(fallthrough - (beq_pos + 1));
-    int16_t bne_off = (int16_t)(fallthrough - (bne_pos + 1));
-    s[beq_pos] = mips_beq(MIPS_REG_T0, MIPS_REG_ZERO, beq_off);
-    s[bne_pos] = mips_bne(MIPS_REG_T0, MIPS_REG_T1, bne_off);
-
-    /* Saved original instructions + jump back. */
     s[i++] = g_hdg_orig_insn0;
     s[i++] = g_hdg_orig_insn1;
     s[i++] = mips_j(HDG_RESUME_ADDR);
@@ -2035,27 +2079,22 @@ static int install_worker(SceSize args, void *argp)
                 sentinel_set(0x0C, *(volatile uint32_t *)(g_addrs->pc_quest_beginning));
                 sentinel_set(0x10, (rc == 0) ? 0xC0DE0003u : 0xC0DEDEAD);
 #if MHFU_EMBED_POPO_HEADING_HOOK
-                /* Section 24: install the heading-rotator hook NOW —
-                 * BEFORE the EBOOT function at 0x08865044 gets first-
-                 * called and JIT-translated by PPSSPP. Live install
-                 * after first JIT translation does NOT take effect.
-                 * Auto-enabled (g_hdg_enable default flipped to 1 in
-                 * the declaration). Stub type-checks per entity, so
-                 * only popos (type 0x46) get re-routed; anteka/tigrex
-                 * fall through to the original. */
-                {
-                    uint32_t orig_w0 = *(volatile uint32_t *)HDG_ROTATOR_ADDR;
-                    /* Verify it's the expected `addiu $sp, $sp, -0x50`
-                     * (encoding 0x27BDFFB0). Don't patch garbage. */
-                    if (orig_w0 == 0x27BDFFB0u) {
-                        g_hdg_request_install = 1;   /* mark wanted */
-                        hdg_install();
-                    } else {
-                        mhfu_log("[hdg] 0x%08lx unexpected (got 0x%08lx, want 0x27BDFFB0); skip",
-                                 (unsigned long)HDG_ROTATOR_ADDR,
-                                 (unsigned long)orig_w0);
-                    }
-                }
+                /* Section 26 (2026-05-27): hdg_install() MOVED OUT OF
+                 * install_worker. Empirical finding: transform_builder
+                 * (0x088652DC) is JIT-translated when the char-select
+                 * 3D preview first renders (scr=0x08). At install_worker
+                 * time the savestate restore may already have
+                 * pre-translated state, AND the savestate may overwrite
+                 * our patched bytes with the saved RAM (= original
+                 * bytes), defeating the patch.
+                 *
+                 * New strategy: gate hdg_install() on the poll path in
+                 * agg_reconcile_state() — install when scr ∈ {TITLE=0x04,
+                 * MENU=0x01}, i.e., AFTER savestate restore but BEFORE
+                 * the user navigates to char-select. Verified via baseline
+                 * probe (diag_bp_only.py): 0 BP hits on TITLE+MENU, first
+                 * hit ~4s into char-select. */
+                mhfu_log("[hdg] install deferred to scr=MENU/TITLE poll gate");
 #endif
                 /* Phase 2: keep watching — if either anchor gets
                  * un-patched by a later game-state event, re-install. */
