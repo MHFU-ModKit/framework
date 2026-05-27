@@ -35,6 +35,14 @@
 #define MIPS_REG_T5   13
 #define MIPS_REG_T6   14
 #define MIPS_REG_T7   15
+#define MIPS_REG_S0   16
+#define MIPS_REG_S1   17
+#define MIPS_REG_S2   18
+#define MIPS_REG_S3   19
+#define MIPS_REG_S4   20
+#define MIPS_REG_S5   21
+#define MIPS_REG_S6   22
+#define MIPS_REG_S7   23
 #define MIPS_REG_T8   24
 #define MIPS_REG_T9   25
 #define MIPS_REG_SP   29
@@ -79,6 +87,12 @@ static inline uint32_t mips_lw(uint32_t rt, int16_t off, uint32_t base) {
          | ((uint32_t)(uint16_t)off);
 }
 
+/* LBU rt, offset(base) — load byte unsigned. opcode 0x24. */
+static inline uint32_t mips_lbu(uint32_t rt, int16_t off, uint32_t base) {
+    return (0x24u << 26) | ((base & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16)
+         | ((uint32_t)(uint16_t)off);
+}
+
 static inline uint32_t mips_sw(uint32_t rt, int16_t off, uint32_t base) {
     return (0x2Bu << 26) | ((base & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16)
          | ((uint32_t)(uint16_t)off);
@@ -99,6 +113,18 @@ static inline uint32_t mips_bne(uint32_t rs, uint32_t rt, int16_t off_insns) {
 static inline uint32_t mips_jalr(uint32_t rs) {
     /* R-type: op=0, rs, 0, rd=$ra(31), 0, funct=0x09 */
     return ((rs & 0x1Fu) << 21) | (31u << 11) | 0x09u;
+}
+
+/* MOVN: if (rt != 0) rd = rs. Branchless conditional move. R-type funct=0x0B. */
+static inline uint32_t mips_movn(uint32_t rd, uint32_t rs, uint32_t rt) {
+    return ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16)
+         | ((rd & 0x1Fu) << 11) | 0x0Bu;
+}
+
+/* MOVZ: if (rt == 0) rd = rs. R-type funct=0x0A. */
+static inline uint32_t mips_movz(uint32_t rd, uint32_t rs, uint32_t rt) {
+    return ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16)
+         | ((rd & 0x1Fu) << 11) | 0x0Au;
 }
 
 #endif /* MHFU_MIPS_ENCODER_H */

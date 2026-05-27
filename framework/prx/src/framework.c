@@ -668,6 +668,68 @@ static void demo_on_monster_spawned(const mhfu_monster_spawn_ctx_t *ctx)
  * walk-forward anim selection. */
 #define MHFU_EMBED_POPO_VT8_OVERRIDE 1
 
+/* Section 23 (2026-05-27): swap popo vtable[5] (per-frame tick, base impl
+ * 0x08864634 = ObjBase::vtable_0x14). Per-frame tick body in C++ source
+ * (mhp2g-decomp / obj_base.cpp):
+ *
+ *   void ObjBase::vtable_0x14() {
+ *       if (memFn != 0) {
+ *           (this->*memFn)();
+ *           if (flags & ALIVE) {
+ *               vtable_0x18();   // = popo vt[6] @ 0x09B062A8 (override)
+ *               vtable_0x1C();   // = popo vt[7] @ 0x088646AC (base)
+ *           }
+ *       }
+ *   }
+ *
+ * The state-handler chain (memFn -> vt[6] -> vt[7]) rotates the heading
+ * vector at entity+0x10/14/18 every frame. Section 22.6 noted vt[14]
+ * dispatcher had no direct writes; the actual writer is inside vt[6]'s
+ * dispatch ladder (massive switch on entity+0x298 state byte). Rather
+ * than chase the specific writer, we wrap the WHOLE per-frame tick with
+ * a save-restore stub: snapshot heading on entry, call original, restore
+ * heading on exit. Net effect = engine drift accumulation cancelled
+ * frame-by-frame; heading sticks at whatever value the popo_aggression
+ * thread last wrote, until the next 3 Hz aggression update.
+ *
+ * Branchless single-block stub (per §22b lessons — multi-block stubs
+ * freeze PPSSPP JIT). MOVN selects between (drifted current value) vs
+ * (saved value) based on g_vt5_freeze_enable. */
+#define MHFU_EMBED_POPO_VT5_FREEZE 1
+
+/* Section 24 (2026-05-27): hook the engine's UNIVERSAL heading rotator
+ * function at EBOOT `0x08865044`. Identified live via mem-BP write trace
+ * on entity+0x10. Confirmed shared between popo (type 0x46) AND anteka
+ * (type 0x45) — same function, same interior PCs fire for both species.
+ *
+ * Signature (reconstructed):
+ *   void heading_rotator(void *entity,    // $a0 — saved to $s0
+ *                        float *out_buf,  // $a1 — caller's sp+0x10
+ *                        u8 anim_id,      // $a2 — e.g. 6, 0x13
+ *                        float *m_row0,   // $a3 — Euler angles row
+ *                        float *m_row1,   // $t0 — speed/damping row
+ *                        float *m_row2);  // $t1 — third row
+ *
+ * Fires ~1.5x/sec/popo at state transitions (NOT per-frame). 14 JAL
+ * callers (3 EBOOT, 11 OVL_A). Writes computed heading to
+ * entity+0x10..+0x18 via VFPU math.
+ *
+ * Hook design (Harmony-style PREFIX replace):
+ *   1. Patch first 2 insns of 0x08865044 to `j stub; nop`.
+ *   2. Stub checks entity type (entity+0x1E8).
+ *   3. If type == popo (0x46) AND g_heading_enable: call C helper that
+ *      computes chase-chain direction + writes entity+0x10..+0x18, then
+ *      JR $ra to caller (skip original entirely).
+ *   4. Otherwise: execute the saved original insns + j to original+0x8
+ *      (continue original normally — anteka/tigrex unaffected).
+ *
+ * No race with engine: hook runs INSIDE the engine's call graph at the
+ * exact moment heading would have been updated. Engine fires hook only
+ * at state transitions (1.5x/sec/popo) — well under the 30 Hz halt
+ * regime that fight-the-engine approaches tripped.
+ */
+#define MHFU_EMBED_POPO_HEADING_HOOK 1
+
 #if MHFU_EMBED_POPO_GROWTH
 
 #define POPO_MONSTER_TYPE      0x46
@@ -860,6 +922,34 @@ void vt8_install(void);
 void vt8_uninstall(void);
 #endif
 
+#if MHFU_EMBED_POPO_VT5_FREEZE
+#define VT5_POPO_VT5_SLOT 0x089BC574u
+#define VT5_STUB_INSNS    48
+extern volatile uint32_t g_vt5_stub_buf[VT5_STUB_INSNS];
+extern volatile uint32_t g_vt5_freeze_enable;
+extern volatile uint32_t g_vt5_request_install;
+extern volatile int      g_vt5_installed;
+void vt5_install(void);
+void vt5_uninstall(void);
+#endif
+
+#if MHFU_EMBED_POPO_HEADING_HOOK
+#define HDG_ROTATOR_ADDR  0x08865044u
+#define HDG_RESUME_ADDR   0x0886504Cu  /* original + 8 (after the 2 hijacked insns) */
+#define HDG_STUB_INSNS    48
+extern volatile uint32_t g_hdg_stub_buf[HDG_STUB_INSNS];
+extern volatile uint32_t g_hdg_enable;
+extern volatile uint32_t g_hdg_request_install;
+extern volatile int      g_hdg_installed;
+extern volatile uint32_t g_hdg_orig_insn0;
+extern volatile uint32_t g_hdg_orig_insn1;
+extern volatile uint32_t g_hdg_hit_count;
+void hdg_install(void);
+void hdg_uninstall(void);
+/* C-side popo chase helper called from the stub. ABI: $a0 = entity. */
+void hdg_chase_helper(uint32_t entity);
+#endif
+
 #if MHFU_EMBED_POPO_AGGRESSION
 
 #define AGG_MONSTER_TYPE         0x46
@@ -898,6 +988,14 @@ typedef struct {
 
 static tracked_aggressor_t g_aggressors[AGG_MAX_TRACKED];
 static volatile int        g_aggression_active = 0;
+
+/* Section 23.12 — runtime cell-pin enable flags. Default 1 (pin everything).
+ * Host-write 0 to isolate which of the four cell writes actually drives
+ * the engine's locomotion. */
+volatile uint32_t g_agg_pin_heading = 1;   /* +0x10..+0x18 vec3 */
+volatile uint32_t g_agg_pin_state   = 1;   /* +0x334 u16 = 5 */
+volatile uint32_t g_agg_pin_anim    = 1;   /* +0x324 u16 = 1011 */
+volatile uint32_t g_agg_pin_pursue  = 1;   /* +0x1C8 u32 = 0 */
 
 static int agg_find_slot(uint32_t entity_ptr)
 {
@@ -962,7 +1060,7 @@ static void agg_aim_at(uint32_t shooter_ptr, uint32_t target_ptr)
     float dx = tx.f - sx.f;
     float dz = tz.f - sz.f;
     float magsq = dx * dx + dz * dz;
-    if (magsq >= 1.0f) {
+    if (g_agg_pin_heading && magsq >= 1.0f) {
         float invmag = 1.0f / __builtin_sqrtf(magsq);
         ux.f = dx * invmag;
         uy.f = 0.0f;
@@ -971,25 +1069,82 @@ static void agg_aim_at(uint32_t shooter_ptr, uint32_t target_ptr)
         *(volatile uint32_t *)(shooter_ptr + AGG_OFF_HEADING + 4) = uy.u;
         *(volatile uint32_t *)(shooter_ptr + AGG_OFF_HEADING + 8) = uz.u;
     }
-    uint16_t cur_state = *(volatile uint16_t *)(shooter_ptr + AGG_OFF_STATE_334);
-    if (cur_state != AGG_STATE_LOCOMOTION) {
-        *(volatile uint16_t *)(shooter_ptr + AGG_OFF_STATE_334) = AGG_STATE_LOCOMOTION;
+    if (g_agg_pin_state) {
+        uint16_t cur_state = *(volatile uint16_t *)(shooter_ptr + AGG_OFF_STATE_334);
+        if (cur_state != AGG_STATE_LOCOMOTION) {
+            *(volatile uint16_t *)(shooter_ptr + AGG_OFF_STATE_334) = AGG_STATE_LOCOMOTION;
+        }
     }
-    /* Always pin +0x324 directly. The vt[8] hook is installed but its
-     * override is disabled by default (caused crash in first attempt —
-     * see vt8_build_stub commentary). When the override is safe to
-     * enable, this write becomes redundant and can be wrapped in
-     * `#if !MHFU_EMBED_POPO_VT8_OVERRIDE`. */
-    uint16_t cur_anim = *(volatile uint16_t *)(shooter_ptr + AGG_OFF_ANIM_324);
-    if (cur_anim != AGG_ANIM_WALK_FORWARD) {
-        *(volatile uint16_t *)(shooter_ptr + AGG_OFF_ANIM_324) = AGG_ANIM_WALK_FORWARD;
+    if (g_agg_pin_anim) {
+        uint16_t cur_anim = *(volatile uint16_t *)(shooter_ptr + AGG_OFF_ANIM_324);
+        if (cur_anim != AGG_ANIM_WALK_FORWARD) {
+            *(volatile uint16_t *)(shooter_ptr + AGG_OFF_ANIM_324) = AGG_ANIM_WALK_FORWARD;
+        }
     }
-    uint32_t cur_pursue = *(volatile uint32_t *)(shooter_ptr + AGG_OFF_PURSUE_TARGET);
-    if (cur_pursue != 0) {
-        *(volatile uint32_t *)(shooter_ptr + AGG_OFF_PURSUE_TARGET) = 0;
+    if (g_agg_pin_pursue) {
+        uint32_t cur_pursue = *(volatile uint32_t *)(shooter_ptr + AGG_OFF_PURSUE_TARGET);
+        if (cur_pursue != 0) {
+            *(volatile uint32_t *)(shooter_ptr + AGG_OFF_PURSUE_TARGET) = 0;
+        }
     }
     (void)target_ptr;
 }
+
+#if MHFU_EMBED_POPO_HEADING_HOOK
+/* Section 24b — OVL_A JAL caller list. These 11 sites all `jal 0x08865044`
+ * inside popo's overlay. Patched at section-99 entry (= immediately after
+ * popo overlay loads + before any state transition fires) so PPSSPP's JIT
+ * translates OUR jal target (= stub) on first execution. */
+static const uint32_t g_hdg_ovl_callers[] = {
+    0x09A73058u, 0x09A730B4u,
+    0x09A97248u, 0x09A977CCu, 0x09A978F4u, 0x09A97A18u,
+    0x09A97B14u, 0x09A97D40u, 0x09A97F2Cu, 0x09A98488u, 0x09A98AC4u,
+};
+#define HDG_OVL_CALLER_COUNT (sizeof(g_hdg_ovl_callers) / sizeof(g_hdg_ovl_callers[0]))
+
+static uint32_t g_hdg_ovl_saved[HDG_OVL_CALLER_COUNT];
+static int      g_hdg_ovl_patched = 0;
+
+static void hdg_patch_ovl_callers(void)
+{
+    if (g_hdg_ovl_patched) return;
+    uint32_t patch = mips_jal((uint32_t)(uintptr_t)g_hdg_stub_buf);
+    int patched_n = 0;
+    for (unsigned i = 0; i < HDG_OVL_CALLER_COUNT; i++) {
+        uint32_t addr = g_hdg_ovl_callers[i];
+        uint32_t orig = *(volatile uint32_t *)addr;
+        /* Verify it's `jal 0x08865044` — opcode 0x03 with target 0x02219511
+         * (since 0x08865044 >> 2 = 0x02219511). */
+        uint32_t expected = mips_jal(HDG_ROTATOR_ADDR);
+        if (orig != expected) {
+            mhfu_log("[hdg-ovl] skip 0x%08lx: got 0x%08lx want 0x%08lx",
+                     (unsigned long)addr, (unsigned long)orig, (unsigned long)expected);
+            continue;
+        }
+        g_hdg_ovl_saved[i] = orig;
+        *(volatile uint32_t *)addr = patch;
+        patched_n++;
+    }
+    sceKernelDcacheWritebackInvalidateAll();
+    sceKernelIcacheInvalidateAll();
+    g_hdg_ovl_patched = 1;
+    mhfu_log("[hdg-ovl] patched %d/%u OVL_A callers", patched_n, (unsigned)HDG_OVL_CALLER_COUNT);
+}
+
+static void hdg_unpatch_ovl_callers(void)
+{
+    if (!g_hdg_ovl_patched) return;
+    for (unsigned i = 0; i < HDG_OVL_CALLER_COUNT; i++) {
+        if (g_hdg_ovl_saved[i] != 0) {
+            *(volatile uint32_t *)g_hdg_ovl_callers[i] = g_hdg_ovl_saved[i];
+        }
+    }
+    sceKernelDcacheWritebackInvalidateAll();
+    sceKernelIcacheInvalidateAll();
+    g_hdg_ovl_patched = 0;
+    mhfu_log("[hdg-ovl] unpatched callers");
+}
+#endif
 
 static void agg_on_section(const mhfu_map_section_ctx_t *ctx)
 {
@@ -1000,6 +1155,14 @@ static void agg_on_section(const mhfu_map_section_ctx_t *ctx)
         g_aggression_active = 1;
         mhfu_log("[popo_agg] ACTIVATE  section=%u (prev=%u)",
                  (unsigned)ctx->section_id, (unsigned)ctx->prev_section_id);
+#if MHFU_EMBED_POPO_HEADING_HOOK
+        /* Section 24b: section 99 (snow sec1) just entered → popo
+         * overlay is freshly loaded into RAM, but no state transitions
+         * have fired yet → JAL imms have NOT been JIT-translated.
+         * Patch them NOW so PPSSPP's JIT picks up our redirect on
+         * first execution. */
+        hdg_patch_ovl_callers();
+#endif
     } else if (was_target && !now_target) {
         g_aggression_active = 0;
         for (int i = 0; i < AGG_MAX_TRACKED; i++) {
@@ -1008,6 +1171,9 @@ static void agg_on_section(const mhfu_map_section_ctx_t *ctx)
         }
         mhfu_log("[popo_agg] DEACTIVATE  left=%u now=%u",
                  (unsigned)ctx->prev_section_id, (unsigned)ctx->section_id);
+#if MHFU_EMBED_POPO_HEADING_HOOK
+        hdg_unpatch_ovl_callers();
+#endif
     }
 }
 
@@ -1119,6 +1285,38 @@ static void agg_reconcile_state(void)
         vt8_install();
     } else if ((!should_be_active || !g_vt8_request_install) && cur == stub) {
         vt8_uninstall();
+    }
+#endif
+#if MHFU_EMBED_POPO_VT5_FREEZE
+    {
+        volatile uint32_t *vt5_slot = (volatile uint32_t *)VT5_POPO_VT5_SLOT;
+        uint32_t v5_cur  = *vt5_slot;
+        uint32_t v5_stub = (uint32_t)(uintptr_t)g_vt5_stub_buf;
+        /* Same opt-in pattern as vt[8]: only install when host writes
+         * g_vt5_request_install = 1. Allows safe experimentation without
+         * auto-binding the per-frame tick on every cold boot. */
+        if (should_be_active && g_vt5_request_install && v5_cur != v5_stub) {
+            g_vt5_installed = 0;
+            vt5_install();
+        } else if ((!should_be_active || !g_vt5_request_install) && v5_cur == v5_stub) {
+            vt5_uninstall();
+        }
+    }
+#endif
+#if MHFU_EMBED_POPO_HEADING_HOOK
+    /* The heading hook is installed AT PRX INIT (in install_worker)
+     * because live install after first JIT translation fails to take
+     * effect (PPSSPP JIT cache). Re-install if the patched bytes
+     * disappear (e.g., after a savestate load that captured pre-patch
+     * memory). */
+    {
+        uint32_t cur_w0 = *(volatile uint32_t *)HDG_ROTATOR_ADDR;
+        uint32_t want_w0 = mips_j((uint32_t)(uintptr_t)g_hdg_stub_buf);
+        if (g_hdg_installed && cur_w0 != want_w0) {
+            /* Bytes reverted (savestate?). Re-patch. */
+            g_hdg_installed = 0;
+            hdg_install();
+        }
     }
 #endif
 }
@@ -1383,6 +1581,413 @@ void vt8_uninstall(void)
 
 #endif /* MHFU_EMBED_POPO_VT8_OVERRIDE */
 
+/* ------------------------------------------------------------------------ *
+ * Embedded popo vt[5] freeze hook (Section 23, 2026-05-27).
+ *
+ * Wraps popo's per-frame tick (ObjBase::vtable_0x14 base impl at 0x08864634)
+ * with a save-restore stub that cancels the engine's per-frame heading
+ * drift. The aggression thread writes a fresh heading toward the chase
+ * target every 333 ms; this stub pins that value across the intervening
+ * frames so the engine's per-frame rotators (inside vt[6] = 0x09B062A8's
+ * state-dispatch ladder, and inside the monster's memFn state handler)
+ * can't drift heading between aggression updates.
+ *
+ * Stub structure (branchless single basic block per §22b lessons):
+ *   Prologue (save $ra, $s0..$s3)
+ *   $s0 = entity ($a0)
+ *   Hit counter ++
+ *   Snapshot heading: $s1=*(0x10), $s2=*(0x14), $s3=*(0x18)
+ *   JAL original 0x08864634   (delay slot: nop)
+ *   Load g_vt5_freeze_enable into $t8
+ *   For each of 3 heading components:
+ *      lw   $t1, off($s0)        ; load current (after original = drifted)
+ *      movn $t1, $sN, $t8        ; if enable!=0, $t1 = saved
+ *      sw   $t1, off($s0)
+ *   Epilogue
+ * ------------------------------------------------------------------------ */
+
+#if MHFU_EMBED_POPO_VT5_FREEZE
+
+#define VT5_POPO_VTABLE_BASE       0x089BC560u
+#define VT5_ORIGINAL_PTR           0x08864634u
+
+/* Save-area layout in our 64-byte frame:
+ *   $sp+0x00..0x0F : o32 arg-save area (callee may spill $a0..$a3 here)
+ *   $sp+0x18       : $ra
+ *   $sp+0x1C       : $s0  (entity ptr)
+ *   $sp+0x20       : $s1  (saved heading.x)
+ *   $sp+0x24       : $s2  (saved heading.y)
+ *   $sp+0x28       : $s3  (saved heading.z)
+ */
+__attribute__((aligned(4)))
+volatile uint32_t g_vt5_stub_buf[VT5_STUB_INSNS];
+
+volatile uint32_t g_vt5_freeze_enable  = 0;
+volatile uint32_t g_vt5_request_install = 0;
+static volatile uint32_t g_vt5_hit_count = 0;
+static volatile uint32_t g_vt5_original_ptr = 0;
+volatile int             g_vt5_installed = 0;
+
+static inline int vt5_emit_li32(uint32_t *out, uint32_t reg, uint32_t value)
+{
+    out[0] = mips_lui(reg, (uint16_t)(value >> 16));
+    out[1] = mips_ori(reg, reg, (uint16_t)(value & 0xFFFF));
+    return 2;
+}
+
+static void vt5_build_stub(void)
+{
+    uint32_t *s = (uint32_t *)g_vt5_stub_buf;
+    int i = 0;
+
+    uint32_t hit_addr    = (uint32_t)(uintptr_t)&g_vt5_hit_count;
+    uint32_t enable_addr = (uint32_t)(uintptr_t)&g_vt5_freeze_enable;
+
+    /* Prologue: 64-byte frame, save $ra + $s0..$s3. */
+    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -64);
+    s[i++] = mips_sw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    s[i++] = mips_sw(MIPS_REG_S0, 0x1C, MIPS_REG_SP);
+    s[i++] = mips_sw(MIPS_REG_S1, 0x20, MIPS_REG_SP);
+    s[i++] = mips_sw(MIPS_REG_S2, 0x24, MIPS_REG_SP);
+    s[i++] = mips_sw(MIPS_REG_S3, 0x28, MIPS_REG_SP);
+
+    /* $s0 = this (entity). */
+    s[i++] = mips_move(MIPS_REG_S0, MIPS_REG_A0);
+
+    /* Hit counter ++ (diagnostic). */
+    i += vt5_emit_li32(&s[i], MIPS_REG_T0, hit_addr);
+    s[i++] = mips_lw(MIPS_REG_T1, 0, MIPS_REG_T0);
+    s[i++] = mips_addiu(MIPS_REG_T1, MIPS_REG_T1, 1);
+    s[i++] = mips_sw(MIPS_REG_T1, 0, MIPS_REG_T0);
+
+    /* Snapshot heading vec into $s1..$s3 BEFORE original runs.
+     * Heading lives at entity+0x10..+0x18 per CLAUDE.md (verified live
+     * Section 20 — aggression mod writes here every 333 ms). */
+    s[i++] = mips_lw(MIPS_REG_S1, 0x10, MIPS_REG_S0);
+    s[i++] = mips_lw(MIPS_REG_S2, 0x14, MIPS_REG_S0);
+    s[i++] = mips_lw(MIPS_REG_S3, 0x18, MIPS_REG_S0);
+
+    /* Restore $a0 = entity (we clobbered $s0 above but $a0 is unchanged).
+     * Original wants $a0 = this. */
+    /* (already there — JAL only modifies $ra) */
+
+    /* Call original (vt[5] base = ObjBase::vtable_0x14). It runs memFn
+     * + vt[6] + vt[7] — any of which may rotate the heading vec. */
+    s[i++] = mips_jal(VT5_ORIGINAL_PTR);
+    s[i++] = MIPS_NOP;   /* delay slot */
+
+    /* Load freeze-enable flag into $t8. */
+    i += vt5_emit_li32(&s[i], MIPS_REG_T0, enable_addr);
+    s[i++] = mips_lw(MIPS_REG_T8, 0, MIPS_REG_T0);
+
+    /* Branchless conditional restore for each heading component:
+     *   $t1 = lw off($s0)              ; current (post-original = drifted)
+     *   movn $t1, $sN, $t8             ; if enable != 0, $t1 = saved
+     *   sw $t1, off($s0)
+     */
+    s[i++] = mips_lw(MIPS_REG_T1, 0x10, MIPS_REG_S0);
+    s[i++] = mips_movn(MIPS_REG_T1, MIPS_REG_S1, MIPS_REG_T8);
+    s[i++] = mips_sw(MIPS_REG_T1, 0x10, MIPS_REG_S0);
+
+    s[i++] = mips_lw(MIPS_REG_T1, 0x14, MIPS_REG_S0);
+    s[i++] = mips_movn(MIPS_REG_T1, MIPS_REG_S2, MIPS_REG_T8);
+    s[i++] = mips_sw(MIPS_REG_T1, 0x14, MIPS_REG_S0);
+
+    s[i++] = mips_lw(MIPS_REG_T1, 0x18, MIPS_REG_S0);
+    s[i++] = mips_movn(MIPS_REG_T1, MIPS_REG_S3, MIPS_REG_T8);
+    s[i++] = mips_sw(MIPS_REG_T1, 0x18, MIPS_REG_S0);
+
+    /* Epilogue. */
+    s[i++] = mips_lw(MIPS_REG_S3, 0x28, MIPS_REG_SP);
+    s[i++] = mips_lw(MIPS_REG_S2, 0x24, MIPS_REG_SP);
+    s[i++] = mips_lw(MIPS_REG_S1, 0x20, MIPS_REG_SP);
+    s[i++] = mips_lw(MIPS_REG_S0, 0x1C, MIPS_REG_SP);
+    s[i++] = mips_lw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 64);
+    s[i++] = mips_jr(MIPS_REG_RA);
+    s[i++] = MIPS_NOP;   /* delay slot */
+
+    /* Fill rest of buffer with NOPs so any stray exec hits a clean stop. */
+    while (i < VT5_STUB_INSNS) s[i++] = MIPS_NOP;
+}
+
+void vt5_install(void)
+{
+    if (g_vt5_installed) return;
+    vt5_build_stub();
+    sceKernelDcacheWritebackInvalidateAll();
+    sceKernelIcacheInvalidateAll();
+    volatile uint32_t *slot = (volatile uint32_t *)VT5_POPO_VT5_SLOT;
+    g_vt5_original_ptr = *slot;
+    *slot = (uint32_t)(uintptr_t)g_vt5_stub_buf;
+    sceKernelDcacheWritebackInvalidateAll();
+    g_vt5_installed = 1;
+    mhfu_log("[vt5] installed: stub=0x%08lx orig=0x%08lx slot=0x%08lx",
+             (unsigned long)g_vt5_stub_buf,
+             (unsigned long)g_vt5_original_ptr,
+             (unsigned long)VT5_POPO_VT5_SLOT);
+}
+
+void vt5_uninstall(void)
+{
+    if (!g_vt5_installed) return;
+    volatile uint32_t *slot = (volatile uint32_t *)VT5_POPO_VT5_SLOT;
+    *slot = g_vt5_original_ptr;
+    sceKernelDcacheWritebackInvalidateAll();
+    g_vt5_installed = 0;
+    g_vt5_freeze_enable = 0;
+    mhfu_log("[vt5] uninstalled: restored 0x%08lx, hits=%lu",
+             (unsigned long)g_vt5_original_ptr,
+             (unsigned long)g_vt5_hit_count);
+}
+
+#endif /* MHFU_EMBED_POPO_VT5_FREEZE */
+
+/* ------------------------------------------------------------------------ *
+ * Section 24 — heading rotator hook (Harmony-style PREFIX replace).
+ *
+ * Hooks EBOOT function 0x08865044 (the universal heading-rotation
+ * routine for all monster types). Stub structure:
+ *
+ *     ; check enable flag — if disabled, fall through to original
+ *     lui   $t0, hi(&g_hdg_enable)
+ *     ori   $t0, $t0, lo(&g_hdg_enable)
+ *     lw    $t0, 0($t0)
+ *     beq   $t0, $zero, fallthrough_orig
+ *     nop                              ; delay slot
+ *
+ *     ; check entity type — only intercept popo (0x46)
+ *     lbu   $t0, 0x1E8($a0)
+ *     addiu $t1, $zero, 0x46
+ *     bne   $t0, $t1, fallthrough_orig
+ *     nop                              ; delay slot
+ *
+ *     ; popo path — setup frame, call C helper, return
+ *     addiu $sp, $sp, -0x20
+ *     sw    $ra, 0x18($sp)
+ *     sw    $s0, 0x10($sp)
+ *     move  $s0, $a0
+ *     ; hit counter
+ *     lui   $t0, hi(&g_hdg_hit_count)
+ *     ori   $t0, $t0, lo(&g_hdg_hit_count)
+ *     lw    $t1, 0($t0)
+ *     addiu $t1, $t1, 1
+ *     sw    $t1, 0($t0)
+ *     ; call C helper
+ *     jal   hdg_chase_helper
+ *     move  $a0, $s0                   ; (delay) a0 = entity
+ *     ; epilogue + return to caller (skip original)
+ *     lw    $s0, 0x10($sp)
+ *     lw    $ra, 0x18($sp)
+ *     addiu $sp, $sp, 0x20
+ *     jr    $ra
+ *     nop                              ; delay slot
+ *
+ *  fallthrough_orig:
+ *     ; Execute the 2 saved original instructions, then jump back.
+ *     <g_hdg_orig_insn0>              ; addiu $sp, $sp, -0x50
+ *     <g_hdg_orig_insn1>              ; sw $ra, 0x1c($sp)
+ *     j     HDG_RESUME_ADDR             ; jump to 0x0886504C
+ *     nop                              ; delay slot
+ * ------------------------------------------------------------------------ */
+
+#if MHFU_EMBED_POPO_HEADING_HOOK
+
+__attribute__((aligned(4)))
+volatile uint32_t g_hdg_stub_buf[HDG_STUB_INSNS];
+
+/* Section 24: enabled by default. The stub runs unconditionally inside
+ * 0x08865044's call path (because the patch is baked at PRX init,
+ * before JIT translation) but type-checks per entity, so only popos
+ * are re-routed; anteka/tigrex fall through to the original. */
+volatile uint32_t g_hdg_enable          = 1;
+volatile uint32_t g_hdg_request_install = 0;
+volatile int      g_hdg_installed       = 0;
+volatile uint32_t g_hdg_orig_insn0      = 0;
+volatile uint32_t g_hdg_orig_insn1      = 0;
+volatile uint32_t g_hdg_hit_count       = 0;
+
+/* C-level chase helper. Called from the stub with $a0 = entity.
+ * Computes chase-chain heading: this-popo → next-popo (by tracked-list
+ * sort order) → writes entity+0x10/+0x14/+0x18.
+ *
+ * Reuses g_aggressors[] tracked list + agg_sort_by_slot() so the
+ * existing spawn-tracking + slot-ordering logic carries over. */
+void hdg_chase_helper(uint32_t entity)
+{
+    uint8_t mt = *(volatile uint8_t *)(entity + 0x1E8);
+    if (mt != AGG_MONSTER_TYPE) return;   /* only popo */
+
+    /* Find this entity's index in the tracked list. */
+    int my_idx = -1;
+    for (int i = 0; i < AGG_MAX_TRACKED; i++) {
+        if (g_aggressors[i].entity_ptr == entity) { my_idx = i; break; }
+    }
+    if (my_idx < 0) return;
+
+    /* Get current sorted-by-slot list. */
+    uint32_t ptrs[AGG_MAX_TRACKED];
+    int n = 0;
+    agg_sort_by_slot(ptrs, &n);
+    if (n < 2) return;
+
+    /* Find this popo's position in the sorted list. */
+    int pos = -1;
+    for (int i = 0; i < n; i++) {
+        if (ptrs[i] == entity) { pos = i; break; }
+    }
+    if (pos < 0) return;
+
+    /* Chase chain: aim at next popo. Last one wraps to first. */
+    uint32_t target = ptrs[(pos + 1) % n];
+
+    /* Compute (target.x, target.z) − (self.x, self.z), normalize, write. */
+    union { uint32_t u; float f; } sx, sz, tx, tz, ux, uz;
+    sx.u = *(volatile uint32_t *)(entity + 0x200);
+    sz.u = *(volatile uint32_t *)(entity + 0x208);
+    tx.u = *(volatile uint32_t *)(target + 0x200);
+    tz.u = *(volatile uint32_t *)(target + 0x208);
+    float dx = tx.f - sx.f;
+    float dz = tz.f - sz.f;
+    float magsq = dx * dx + dz * dz;
+    if (magsq < 1.0f) return;
+    float invmag = 1.0f / __builtin_sqrtf(magsq);
+    ux.f = dx * invmag;
+    uz.f = dz * invmag;
+    *(volatile uint32_t *)(entity + 0x10) = ux.u;
+    *(volatile uint32_t *)(entity + 0x14) = 0;
+    *(volatile uint32_t *)(entity + 0x18) = uz.u;
+}
+
+static inline int hdg_emit_li32(uint32_t *out, uint32_t reg, uint32_t value)
+{
+    out[0] = mips_lui(reg, (uint16_t)(value >> 16));
+    out[1] = mips_ori(reg, reg, (uint16_t)(value & 0xFFFF));
+    return 2;
+}
+
+static void hdg_build_stub(void)
+{
+    uint32_t *s = (uint32_t *)g_hdg_stub_buf;
+    int i = 0;
+
+    uint32_t enable_addr  = (uint32_t)(uintptr_t)&g_hdg_enable;
+    uint32_t hit_addr     = (uint32_t)(uintptr_t)&g_hdg_hit_count;
+    uint32_t helper_addr  = (uint32_t)(uintptr_t)&hdg_chase_helper;
+
+    /* --- header: check enable + type, jump to fallthrough if neither matches --- */
+
+    /* Load enable flag into $t0. */
+    i += hdg_emit_li32(&s[i], MIPS_REG_T0, enable_addr);
+    s[i++] = mips_lw(MIPS_REG_T0, 0, MIPS_REG_T0);
+    /* Insns from here to fallthrough_orig: stub-relative offsets.
+     * Layout:
+     *   +0..+1  : lui + ori for enable
+     *   +2      : lw enable
+     *   +3      : beq enable, 0, fallthrough        ← we are here, offset 3
+     *   +4      : nop (delay)
+     *   +5..+6  : lbu type + addiu compare reg
+     *   +7      : bne type, popo_const, fallthrough ← second branch
+     *   +8      : nop (delay)
+     *   +9..+25 : popo body (17 insns: addiu sp, sw ra/s0, move, hit counter
+     *             [lui+ori+lw+addiu+sw], jal helper, move a0/s0, lw s0/ra,
+     *             addiu sp, jr ra, nop)
+     *   +26     : fallthrough_orig: orig_insn0
+     *   +27     : orig_insn1
+     *   +28     : j HDG_RESUME_ADDR
+     *   +29     : nop
+     */
+    int beq_pos = i;
+    s[i++] = mips_beq(MIPS_REG_T0, MIPS_REG_ZERO, 0);   /* patched below */
+    s[i++] = MIPS_NOP;
+
+    s[i++] = mips_lbu(MIPS_REG_T0, 0x1E8, MIPS_REG_A0);
+    s[i++] = mips_addiu(MIPS_REG_T1, MIPS_REG_ZERO, AGG_MONSTER_TYPE);
+    int bne_pos = i;
+    s[i++] = mips_bne(MIPS_REG_T0, MIPS_REG_T1, 0);     /* patched below */
+    s[i++] = MIPS_NOP;
+
+    /* popo body */
+    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);
+    s[i++] = mips_sw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    s[i++] = mips_sw(MIPS_REG_S0, 0x10, MIPS_REG_SP);
+    s[i++] = mips_move(MIPS_REG_S0, MIPS_REG_A0);
+
+    /* hit counter ++ (diagnostic) */
+    i += hdg_emit_li32(&s[i], MIPS_REG_T0, hit_addr);
+    s[i++] = mips_lw(MIPS_REG_T1, 0, MIPS_REG_T0);
+    s[i++] = mips_addiu(MIPS_REG_T1, MIPS_REG_T1, 1);
+    s[i++] = mips_sw(MIPS_REG_T1, 0, MIPS_REG_T0);
+
+    /* JAL helper */
+    s[i++] = mips_jal(helper_addr);
+    s[i++] = mips_move(MIPS_REG_A0, MIPS_REG_S0);   /* delay: pass entity */
+
+    /* Epilogue + return (skip original entirely) */
+    s[i++] = mips_lw(MIPS_REG_S0, 0x10, MIPS_REG_SP);
+    s[i++] = mips_lw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);
+    s[i++] = mips_jr(MIPS_REG_RA);
+    s[i++] = MIPS_NOP;
+
+    /* fallthrough_orig label = current i. Patch branches to point here. */
+    int fallthrough = i;
+    /* MIPS branch offset is in INSTRUCTIONS, signed, relative to PC+4
+     * (PC of the delay slot). So target_insn_offset_from_branch =
+     * fallthrough - (branch_pos + 1). */
+    int16_t beq_off = (int16_t)(fallthrough - (beq_pos + 1));
+    int16_t bne_off = (int16_t)(fallthrough - (bne_pos + 1));
+    s[beq_pos] = mips_beq(MIPS_REG_T0, MIPS_REG_ZERO, beq_off);
+    s[bne_pos] = mips_bne(MIPS_REG_T0, MIPS_REG_T1, bne_off);
+
+    /* Saved original instructions + jump back. */
+    s[i++] = g_hdg_orig_insn0;
+    s[i++] = g_hdg_orig_insn1;
+    s[i++] = mips_j(HDG_RESUME_ADDR);
+    s[i++] = MIPS_NOP;
+
+    /* Fill rest with NOP. */
+    while (i < HDG_STUB_INSNS) s[i++] = MIPS_NOP;
+}
+
+void hdg_install(void)
+{
+    if (g_hdg_installed) return;
+    /* Capture original first 2 instructions BEFORE building stub
+     * (build_stub embeds them in the fallthrough path). */
+    g_hdg_orig_insn0 = *(volatile uint32_t *)HDG_ROTATOR_ADDR;
+    g_hdg_orig_insn1 = *(volatile uint32_t *)(HDG_ROTATOR_ADDR + 4);
+    hdg_build_stub();
+    sceKernelDcacheWritebackInvalidateAll();
+    sceKernelIcacheInvalidateAll();
+    /* Patch target with j stub + nop. */
+    uint32_t patch_j = mips_j((uint32_t)(uintptr_t)g_hdg_stub_buf);
+    *(volatile uint32_t *)HDG_ROTATOR_ADDR = patch_j;
+    *(volatile uint32_t *)(HDG_ROTATOR_ADDR + 4) = MIPS_NOP;
+    sceKernelDcacheWritebackInvalidateAll();
+    sceKernelIcacheInvalidateAll();
+    g_hdg_installed = 1;
+    mhfu_log("[hdg] installed: stub=0x%08lx orig0=0x%08lx orig1=0x%08lx",
+             (unsigned long)g_hdg_stub_buf,
+             (unsigned long)g_hdg_orig_insn0,
+             (unsigned long)g_hdg_orig_insn1);
+}
+
+void hdg_uninstall(void)
+{
+    if (!g_hdg_installed) return;
+    *(volatile uint32_t *)HDG_ROTATOR_ADDR = g_hdg_orig_insn0;
+    *(volatile uint32_t *)(HDG_ROTATOR_ADDR + 4) = g_hdg_orig_insn1;
+    sceKernelDcacheWritebackInvalidateAll();
+    sceKernelIcacheInvalidateAll();
+    g_hdg_installed = 0;
+    g_hdg_enable = 0;
+    mhfu_log("[hdg] uninstalled: restored, hits=%lu",
+             (unsigned long)g_hdg_hit_count);
+}
+
+#endif /* MHFU_EMBED_POPO_HEADING_HOOK */
+
 /* Sentinel cells in a known-quiet RAM region so we can verify
  * end-to-end execution from a host debugger even when log file I/O
  * NIDs are unsupported by PPSSPP. Layout: four u32s starting at
@@ -1429,6 +2034,29 @@ static int install_worker(SceSize args, void *argp)
                 sentinel_set(0x08, (uint32_t)&g_code_cave[0]);
                 sentinel_set(0x0C, *(volatile uint32_t *)(g_addrs->pc_quest_beginning));
                 sentinel_set(0x10, (rc == 0) ? 0xC0DE0003u : 0xC0DEDEAD);
+#if MHFU_EMBED_POPO_HEADING_HOOK
+                /* Section 24: install the heading-rotator hook NOW —
+                 * BEFORE the EBOOT function at 0x08865044 gets first-
+                 * called and JIT-translated by PPSSPP. Live install
+                 * after first JIT translation does NOT take effect.
+                 * Auto-enabled (g_hdg_enable default flipped to 1 in
+                 * the declaration). Stub type-checks per entity, so
+                 * only popos (type 0x46) get re-routed; anteka/tigrex
+                 * fall through to the original. */
+                {
+                    uint32_t orig_w0 = *(volatile uint32_t *)HDG_ROTATOR_ADDR;
+                    /* Verify it's the expected `addiu $sp, $sp, -0x50`
+                     * (encoding 0x27BDFFB0). Don't patch garbage. */
+                    if (orig_w0 == 0x27BDFFB0u) {
+                        g_hdg_request_install = 1;   /* mark wanted */
+                        hdg_install();
+                    } else {
+                        mhfu_log("[hdg] 0x%08lx unexpected (got 0x%08lx, want 0x27BDFFB0); skip",
+                                 (unsigned long)HDG_ROTATOR_ADDR,
+                                 (unsigned long)orig_w0);
+                    }
+                }
+#endif
                 /* Phase 2: keep watching — if either anchor gets
                  * un-patched by a later game-state event, re-install. */
                 for (int re = 0; re < 1200; re++) {
@@ -1548,6 +2176,15 @@ int main(int argc, char *argv[])
                  (unsigned long)&g_aggressors[0]);
         sentinel_set(0x30, (uint32_t)(uintptr_t)&g_aggression_active);
         sentinel_set(0x34, (uint32_t)(uintptr_t)&g_aggressors[0]);
+        mhfu_log("[popo_agg] cell-pin flags: heading=0x%08lx state=0x%08lx anim=0x%08lx pursue=0x%08lx",
+                 (unsigned long)&g_agg_pin_heading,
+                 (unsigned long)&g_agg_pin_state,
+                 (unsigned long)&g_agg_pin_anim,
+                 (unsigned long)&g_agg_pin_pursue);
+        sentinel_set(0x48, (uint32_t)(uintptr_t)&g_agg_pin_heading);
+        sentinel_set(0x4C, (uint32_t)(uintptr_t)&g_agg_pin_state);
+        sentinel_set(0x50, (uint32_t)(uintptr_t)&g_agg_pin_anim);
+        sentinel_set(0x54, (uint32_t)(uintptr_t)&g_agg_pin_pursue);
     }
 #endif
 #if MHFU_EMBED_POPO_VT8_OVERRIDE
@@ -1561,6 +2198,26 @@ int main(int argc, char *argv[])
              (unsigned)VT8_DEFAULT_ANIM);
     sentinel_set(0x38, (uint32_t)(uintptr_t)&g_vt8_request_install);
     sentinel_set(0x3C, (uint32_t)(uintptr_t)&g_vt8_override_enable);
+#endif
+#if MHFU_EMBED_POPO_VT5_FREEZE
+    mhfu_log("[vt5] heading-freeze stub READY (auto-install opt-in). "
+             "Host write 1 to g_vt5_request_install=0x%08lx, "
+             "then g_vt5_freeze_enable=0x%08lx",
+             (unsigned long)&g_vt5_request_install,
+             (unsigned long)&g_vt5_freeze_enable);
+    sentinel_set(0x40, (uint32_t)(uintptr_t)&g_vt5_request_install);
+    sentinel_set(0x44, (uint32_t)(uintptr_t)&g_vt5_freeze_enable);
+#endif
+#if MHFU_EMBED_POPO_HEADING_HOOK
+    mhfu_log("[hdg] heading-rotator hook READY. "
+             "Host write 1 to g_hdg_request_install=0x%08lx, "
+             "then g_hdg_enable=0x%08lx. Hit counter @ 0x%08lx",
+             (unsigned long)&g_hdg_request_install,
+             (unsigned long)&g_hdg_enable,
+             (unsigned long)&g_hdg_hit_count);
+    sentinel_set(0x58, (uint32_t)(uintptr_t)&g_hdg_request_install);
+    sentinel_set(0x5C, (uint32_t)(uintptr_t)&g_hdg_enable);
+    sentinel_set(0x60, (uint32_t)(uintptr_t)&g_hdg_hit_count);
 #endif
 
     mhfu_log("[framework] ready");
