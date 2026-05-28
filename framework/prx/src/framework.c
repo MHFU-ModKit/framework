@@ -1206,6 +1206,20 @@ static void agg_on_section(const mhfu_map_section_ctx_t *ctx)
          * Patch them NOW so PPSSPP's JIT picks up our redirect on
          * first execution. */
         hdg_patch_ovl_callers();
+
+        /* Section 28b jump-table patch REMOVED (Section 28d, 2026-05-28).
+         *
+         * Forcing all 6 damage_handler dispatch branches to case 1
+         * (0x09ACE8D4) caused a wild-pointer crash (EmuThread SIGSEGV at
+         * 0x300000000, /tmp/crash7.txt): case 1's sub-functions
+         * (0x09AD10A0, 0x09AC92B0, ...) deref entity pointer fields that
+         * are only initialised for the dispatch class the engine actually
+         * picked. Forcing case 1 on a class-3/4/5 hit ran case-1 code
+         * over un-set-up state → garbage deref.
+         *
+         * Engage is now triggered ONLY by natural hits (the proven-safe
+         * path). The user hits each popo once; our engage-gated direct-
+         * position chase (hdg_chase_helper) then drives the chase. */
 #endif
     } else if (was_target && !now_target) {
         g_aggression_active = 0;
@@ -1918,25 +1932,108 @@ void hdg_chase_helper(uint32_t entity)
     }
     if (pos < 0) return;
 
-    /* Chase chain: aim at next popo. Last one wraps to first. */
+    /* Section 28c (2026-05-28) — ENGAGE-GATED direct-position chase.
+     *
+     * Monitor finding (/tmp/monitor_chase.py + monitor_lunge.py):
+     *   - Engage mode (+0x05DC=1.0, set by damage-handler case 1) drives
+     *     a LUNGE: popo walks ~120u toward +0x07C0, arrives, then stands
+     *     for ~25s (anim=1011 in place, d=0) before re-lunging. The
+     *     engine reads +0x07C0 only at lunge-start, so a moving chase
+     *     target is never tracked → engaged popo gets stuck.
+     *   - Idle (eng=0) popos wander naturally; overriding their yaw made
+     *     idle rotation "not perfect" (facing chase target while
+     *     wandering elsewhere).
+     *
+     * New policy:
+     *   - NOT engaged → return immediately. Popo is 100% engine-native
+     *     (natural idle walk + rotation). No moonwalk.
+     *   - Engaged → WE script the motion: step position toward next-popo
+     *     a few units per call + set +0x1F4 yaw to face the step
+     *     direction. Continuous, smooth, no lunge-stop. Engine's yaw
+     *     rotator renders our angle (smooth turning).
+     */
     uint32_t target = ptrs[(pos + 1) % n];
 
-    /* Compute (target.x, target.z) − (self.x, self.z), normalize, write. */
-    union { uint32_t u; float f; } sx, sz, tx, tz, ux, uz;
+    /* Engage gate — idle popos left fully native. */
+    union { uint32_t u; float f; } eng;
+    eng.u = *(volatile uint32_t *)(entity + 0x05DC);
+    if (eng.f < 0.5f) return;
+
+    /* Section 28e (2026-05-28) — SAFE direct-position chase.
+     *
+     * crash8 (/tmp/crash8.txt): unbounded position writes followed a
+     * fleeing popo off-map → engine zone/tile code computed a garbage
+     * pointer from off-map coords → SIGSEGV at 0x300000000. Three fixes:
+     *   1. Hard-clamp every written position to the snow-section-1 box.
+     *   2. If target popo is OUT of bounds (e.g. fleeing off-map), don't
+     *      chase it — go native this frame.
+     *   3. Within CHASE_GAP: write NOTHING (no yaw either) so clustered
+     *      popos settle naturally instead of rotating in place.
+     *
+     * Snow-section-1 bounds (observed popo roam + margin):
+     *   X in [14000, 18000], Z in [9000, 12000]. */
+    const float MAP_X_MIN = 14000.0f, MAP_X_MAX = 18000.0f;
+    const float MAP_Z_MIN =  9000.0f, MAP_Z_MAX = 12000.0f;
+
+    union { uint32_t u; float f; } sx, sy, sz, tx, tz;
     sx.u = *(volatile uint32_t *)(entity + 0x200);
+    sy.u = *(volatile uint32_t *)(entity + 0x204);
     sz.u = *(volatile uint32_t *)(entity + 0x208);
     tx.u = *(volatile uint32_t *)(target + 0x200);
     tz.u = *(volatile uint32_t *)(target + 0x208);
+
+    /* Fix #2: don't chase a target that has left the playable box
+     * (fleeing popo). Leave self native this frame. */
+    if (tx.f < MAP_X_MIN || tx.f > MAP_X_MAX ||
+        tz.f < MAP_Z_MIN || tz.f > MAP_Z_MAX) {
+        return;
+    }
+    /* Also bail if OUR OWN position is already out of bounds (shouldn't
+     * happen with clamping, but defensive). */
+    if (sx.f < MAP_X_MIN || sx.f > MAP_X_MAX ||
+        sz.f < MAP_Z_MIN || sz.f > MAP_Z_MAX) {
+        return;
+    }
+
     float dx = tx.f - sx.f;
     float dz = tz.f - sz.f;
     float magsq = dx * dx + dz * dz;
     if (magsq < 1.0f) return;
     float invmag = 1.0f / __builtin_sqrtf(magsq);
-    ux.f = dx * invmag;
-    uz.f = dz * invmag;
-    *(volatile uint32_t *)(entity + 0x10) = ux.u;
-    *(volatile uint32_t *)(entity + 0x14) = 0;
-    *(volatile uint32_t *)(entity + 0x18) = uz.u;
+    float ux = dx * invmag;
+    float uz = dz * invmag;
+
+    const float CHASE_GAP   = 160.0f;
+    const float CHASE_SPEED = 4.0f;   /* units per transform_builder call */
+    float dist = __builtin_sqrtf(magsq);
+
+    /* Fix #3: within gap → write nothing, popo idles fully native. */
+    if (dist <= CHASE_GAP) return;
+
+    union { uint32_t u; float f; } nx, nz;
+    nx.f = sx.f + ux * CHASE_SPEED;
+    nz.f = sz.f + uz * CHASE_SPEED;
+
+    /* Fix #1: hard-clamp the new position into the section box. */
+    if (nx.f < MAP_X_MIN) nx.f = MAP_X_MIN;
+    if (nx.f > MAP_X_MAX) nx.f = MAP_X_MAX;
+    if (nz.f < MAP_Z_MIN) nz.f = MAP_Z_MIN;
+    if (nz.f > MAP_Z_MAX) nz.f = MAP_Z_MAX;
+
+    *(volatile uint32_t *)(entity + 0x200) = nx.u;
+    *(volatile uint32_t *)(entity + 0x208) = nz.u;
+    /* Keep transform translation mirror in sync (+0x40..+0x48). */
+    *(volatile uint32_t *)(entity + 0x40) = nx.u;
+    *(volatile uint32_t *)(entity + 0x44) = sy.u;
+    *(volatile uint32_t *)(entity + 0x48) = nz.u;
+
+    /* Yaw to face chase direction (engine's rotator renders it). Only
+     * when we actually stepped — so clustered popos don't spin in place. */
+    extern float atan2f(float, float);
+    float yaw_rad = atan2f(uz, ux);
+    int32_t yaw_hw = (int32_t)(-yaw_rad * (32768.0f / 3.14159265f));
+    yaw_hw &= 0xFFFF;
+    *(volatile uint16_t *)(entity + 0x1F4) = (uint16_t)yaw_hw;
 }
 
 static inline int hdg_emit_li32(uint32_t *out, uint32_t reg, uint32_t value)
@@ -1953,43 +2050,16 @@ static void hdg_build_stub(void)
 
     uint32_t helper_addr = (uint32_t)(uintptr_t)&hdg_chase_helper;
 
-    /* Section 26b POSTFIX wrapper (Harmony-style "edit return value").
-     *
-     * Prior PREFIX stub wrote heading BEFORE transform_builder's body
-     * ran the yaw rotator (z_un_08865530) — engine then overwrote our
-     * heading in the same call. Chase appeared as engine-default
-     * wander. POSTFIX runs helper AFTER body returns, so our write is
-     * the last one before the next frame's read.
-     *
-     * Critical: this stub calls the original via `jal HDG_ROTATOR_ADDR`.
-     * That works ONLY if the entry point is UNPATCHED (otherwise jal
-     * hits our own `j stub` → infinite loop). Section 26b drops the
-     * entry-point patch; the only install is JAL-caller redirects
-     * (OVL_A 0x09AC51AC patched at section-99 entry; EBOOT generic
-     * 0x088D28A0 left UNPATCHED for now — first test on OVL_A path
-     * only to isolate postfix's effect).
-     *
-     * Branchless single basic block (12 insns):
-     *   +0  addiu sp, sp, -0x20
-     *   +1  sw    ra, 0x18(sp)             ; save caller ra
-     *   +2  sw    a0, 0x10(sp)             ; save entity (jal clobbers)
-     *   +3  jal   HDG_ROTATOR_ADDR          ; FULL original body
-     *   +4  nop                             ; delay slot
-     *   +5  lw    a0, 0x10(sp)             ; restore entity for helper
-     *   +6  jal   hdg_chase_helper          ; POSTFIX — writes heading
-     *   +7  nop                             ; delay slot
-     *   +8  lw    ra, 0x18(sp)             ; restore caller ra
-     *   +9  addiu sp, sp, 0x20
-     *   +10 jr    ra                        ; return to JAL caller
-     *   +11 nop                             ; delay slot
-     */
+    /* Section 28 PREFIX wrapper — helper runs BEFORE body so our writes
+     * to entity+0x1F4 (yaw cell) and +0x07C0 (engage cell) take effect
+     * when transform_builder reads them in z_un_088655f8. */
     s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);
     s[i++] = mips_sw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
     s[i++] = mips_sw(MIPS_REG_A0, 0x10, MIPS_REG_SP);
-    s[i++] = mips_jal(HDG_ROTATOR_ADDR);
+    s[i++] = mips_jal(helper_addr);
     s[i++] = MIPS_NOP;
     s[i++] = mips_lw(MIPS_REG_A0, 0x10, MIPS_REG_SP);
-    s[i++] = mips_jal(helper_addr);
+    s[i++] = mips_jal(HDG_ROTATOR_ADDR);
     s[i++] = MIPS_NOP;
     s[i++] = mips_lw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
     s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);
