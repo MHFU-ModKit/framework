@@ -64,6 +64,26 @@ const char *mhfu_hook_owner_of(uint32_t addr);
  * is for the mod-owned stub memory those patches jump to. */
 void mhfu_flush_caches(void);
 
+/* ---- ergonomic install helpers (no hand-written MIPS / no gate boilerplate) ---- */
+
+/* Like mhfu_patch_word, but DEFERRED: the framework applies it only once
+ * screen_state is JIT-quiet (TITLE/MENU) AND the word at addr still equals
+ * `expect` — beating PPSSPP's JIT pre-cache (Section 26). Returns OK once
+ * queued; the patch lands later. Restored on owner shutdown like any patch. */
+mhfu_hook_rc_t mhfu_patch_word_when_quiet(uint32_t addr, uint32_t expect,
+                                          uint32_t word, const char *owner);
+
+#define MHFU_WRAP_PREFIX  0   /* helper runs BEFORE the original */
+#define MHFU_WRAP_POSTFIX 1   /* helper runs AFTER the original */
+
+/* Wrap a `jal orig_target` call site: the framework builds a wrapper stub
+ * (in its code cave) that calls helper(<the call's $a0>) prefix/postfix
+ * around orig_target, then deferred-patches the site to call the stub.
+ * Replaces hand-encoded stubs + the screen gate. owner = your mod id. */
+mhfu_hook_rc_t mhfu_install_call_wrapper(uint32_t call_site, uint32_t orig_target,
+                                         void (*helper)(uint32_t), int mode,
+                                         const char *owner);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

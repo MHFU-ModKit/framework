@@ -34,9 +34,15 @@ void mhfu_dispatch_quest_beginning(const mhfu_anchor_regs_t *regs);
 void mhfu_dispatch_quest_entered  (const mhfu_anchor_regs_t *regs);
 int  mhfu_monster_spawn_poll_thread(SceSize args, void *argp);
 
+/* --- code cave (cave.cpp) --- */
+uint32_t *mhfu_cave_alloc(int n_insns);   /* bump allocator; 0 if exhausted */
+
 /* --- cache / self-modifying-code (trampoline.cpp) --- */
 void mhfu_smc_patch_word(uint32_t addr, uint32_t word); /* ranged invalidate */
 void mhfu_flush_caches(void);                           /* dcache+icache, all */
+
+/* --- deferred / quiet-screen patch queue (install.cpp) --- */
+int  mhfu_deferred_poll_thread(SceSize args, void *argp);
 
 /* --- event trampolines (trampoline.cpp) --- */
 int  mhfu_install_event_trampolines(void);
@@ -49,6 +55,11 @@ void mhfu_hookmgr_init(void);
 /* --- mod table (modtable.cpp) --- */
 void mhfu_mods_init_all(void);
 void mhfu_mods_shutdown_all(void);
+
+/* --- quest domain (quest.cpp) --- */
+/* Installs the buildTargets wrapper IFF a mod subscribed to
+ * MHFU_EVENT_QUEST_TARGETS_BUILDING. Call after mhfu_mods_init_all(). */
+void mhfu_quest_init(void);
 
 /* --- bootstrap (bootstrap.cpp) --- */
 void mhfu_sentinel_set(uint32_t offset, uint32_t value);

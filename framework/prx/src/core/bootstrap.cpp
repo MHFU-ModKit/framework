@@ -57,10 +57,14 @@ int main(int argc, char *argv[])
 
     /* Spawn-poll runs independent of the trampolines. */
     start_thread("mhfu_spawn_poll", mhfu_monster_spawn_poll_thread);
+    /* Applies deferred "quiet-screen" code patches (mhfu_patch_word_when_quiet). */
+    start_thread("mhfu_deferred", mhfu_deferred_poll_thread);
 
     /* Bring up mods: each registers events/hooks and starts its own
      * threads in init(). */
     mhfu_mods_init_all();
+    /* Install the quest buildTargets hook only if a mod subscribed. */
+    mhfu_quest_init();
     mhfu_sentinel_set(0x00, 0xCAFE0004);
 
     mhfu_log("[framework] ready");

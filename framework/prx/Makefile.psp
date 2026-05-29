@@ -9,9 +9,13 @@ CORE_OBJS = \
   src/core/region.o \
   src/core/memory.o \
   src/core/entity.o \
+  src/core/monster.o \
   src/core/registry.o \
   src/core/trampoline.o \
+  src/core/cave.o \
   src/core/hooks.o \
+  src/core/install.o \
+  src/core/quest.o \
   src/core/modtable.o \
   src/core/bootstrap.o
 

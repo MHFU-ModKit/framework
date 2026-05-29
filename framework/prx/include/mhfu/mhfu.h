@@ -13,8 +13,11 @@
 #define MHFU_MHFU_H
 
 #include "events.h"
+#include "ids.h"
 #include "memory.h"
 #include "entity.h"
+#include "monster.h"
+#include "quest.h"
 #include "hooks.h"
 #include "mod.h"
 #include "log.h"

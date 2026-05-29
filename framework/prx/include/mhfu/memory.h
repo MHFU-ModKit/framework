@@ -33,6 +33,10 @@ void     mhfu_write_u32(uint32_t addr, uint32_t v);
 float    mhfu_read_f32 (uint32_t addr);
 void     mhfu_write_f32(uint32_t addr, float v);
 
+/* 1 if addr is in PSP user/EBOOT RAM (0x08000000..0x0A000000), else 0.
+ * Use before dereferencing a value read from game memory. */
+int      mhfu_mem_valid(uint32_t addr);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

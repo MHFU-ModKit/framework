@@ -74,6 +74,29 @@ Then add `my_mod` to `build/mods.manifest` and `make`. `init()` returns
 0 to load, negative to refuse. Register events, claim hooks, and start
 threads from `init()`.
 
+### Typed helpers (read like intent, not pointer math)
+
+Prefer these over raw `mhfu_read/write_*`. They wrap *stable, verified*
+mechanics; bleeding-edge RE still uses the raw escape hatch.
+
+- **Entity** (`entity.h`): `mhfu_entities_of_type(MON_TIGREX, out, 4)`,
+  `mhfu_entity_pos/set_pos`, `set_size` (all 5 mirrors), `yaw`, `ai_state`,
+  `engaged`, `mhfu_entity_calm()`.
+- **Monster/species** (`monster.h`): `mhfu_species_set_detection(MON_TIGREX, 0)`.
+- **Quest** (`quest.h`): `mhfu_quest_current()`, `mhfu_quest_has()`,
+  `mhfu_quest_replace_monster(q, MON_GIADROME, MON_TIGREX)`. Edit the list
+  from a `MHFU_EVENT_QUEST_TARGETS_BUILDING` callback — the framework owns
+  the buildTargets hook + JIT-safe timing.
+- **Install** (`hooks.h`): `mhfu_install_call_wrapper(site, target, helper,
+  MHFU_WRAP_PREFIX, "mod")` builds the wrapper stub for you;
+  `mhfu_patch_word_when_quiet(addr, expect, word, "mod")` defers a code
+  patch to a TITLE/MENU screen to beat the JIT. (Quiet-gating suits EBOOT
+  targets; overlay-resident hooks still install on their own section event.)
+- **IDs** (`ids.h`): `MON_POPO/ANTEKA/TIGREX/GIADROME` (list incomplete).
+
+`tigrex_inject/mod.cpp` is the worked example — quest injection + tame in
+~15 lines of logic over these helpers.
+
 ### Events vs exclusive hooks
 
 - **Events** (`mhfu_on_*` / `mhfu_hook_event(id, cb, priority)`) fan out

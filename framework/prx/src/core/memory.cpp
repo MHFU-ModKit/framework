@@ -24,6 +24,11 @@ void mhfu_write_f32(uint32_t a, float v)
     *(volatile uint32_t *)a = cvt.u;
 }
 
+int mhfu_mem_valid(uint32_t a)
+{
+    return a >= 0x08000000u && a < 0x0A000000u;
+}
+
 uint8_t mhfu_get_screen_state(void)
 {
     const mhfu_region_addrs_t *r = mhfu_region();

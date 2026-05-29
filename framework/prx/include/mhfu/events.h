@@ -17,10 +17,13 @@ extern "C" {
 #endif
 
 typedef enum {
-    MHFU_EVENT_QUEST_BEGINNING     = 0, /* player commits to a quest        */
-    MHFU_EVENT_QUEST_ENTERED       = 1, /* player spawns into the quest map */
-    MHFU_EVENT_MAP_SECTION_ENTERED = 2, /* area_index changed (any section) */
-    MHFU_EVENT_MONSTER_SPAWNED     = 3, /* new entity in registry slot 1+   */
+    MHFU_EVENT_QUEST_BEGINNING       = 0, /* player commits to a quest        */
+    MHFU_EVENT_QUEST_ENTERED         = 1, /* player spawns into the quest map */
+    MHFU_EVENT_MAP_SECTION_ENTERED   = 2, /* area_index changed (any section) */
+    MHFU_EVENT_MONSTER_SPAWNED       = 3, /* new entity in registry slot 1+   */
+    MHFU_EVENT_QUEST_TARGETS_BUILDING = 4, /* edit the quest monster list here; */
+                                           /* fires before the engine builds   */
+                                           /* targets (quest.h, mhfu_quest_ctx_t) */
 
     MHFU_EVENT_COUNT_
 } mhfu_event_id_t;

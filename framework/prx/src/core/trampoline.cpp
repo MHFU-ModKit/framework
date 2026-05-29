@@ -19,10 +19,6 @@
 #include "internal.h"
 
 #define WRAPPER_INSNS 54        /* 49 used + 5 NOP pad */
-#define CAVE_SLOTS    8
-
-__attribute__((aligned(64)))
-static uint32_t g_code_cave[CAVE_SLOTS * WRAPPER_INSNS];
 
 typedef struct {
     int      installed;
@@ -55,18 +51,16 @@ extern "C" void mhfu_flush_caches(void)
 
 /* --- wrapper builder ---------------------------------------------------- */
 
-static uint32_t *cave_slot_addr(int slot) { return &g_code_cave[slot * WRAPPER_INSNS]; }
-
-static int install_trampoline_for(int slot, uint32_t anchor_pc,
+static int install_trampoline_for(uint32_t anchor_pc,
                                    uint32_t dispatcher, install_record_t *rec)
 {
     if (anchor_pc & 0x3) return -1;
-    if (slot < 0 || slot >= CAVE_SLOTS) return -2;
 
     uint32_t insn0 = *(volatile uint32_t *)(anchor_pc + 0);
     uint32_t insn1 = *(volatile uint32_t *)(anchor_pc + 4);
 
-    uint32_t *w = cave_slot_addr(slot);
+    uint32_t *w = mhfu_cave_alloc(WRAPPER_INSNS);
+    if (!w) return -2;
     int i = 0;
 
     /* Prologue — 0x80 frame. Save every caller-saved GPR before calling
@@ -156,11 +150,11 @@ extern "C" int mhfu_install_event_trampolines(void)
     const mhfu_region_addrs_t *r = mhfu_region();
     if (!r) return -1;
 
-    int rc = install_trampoline_for(0, r->pc_quest_beginning,
+    int rc = install_trampoline_for(r->pc_quest_beginning,
                                     (uint32_t)&mhfu_dispatch_quest_beginning,
                                     &g_install[MHFU_EVENT_QUEST_BEGINNING]);
     if (rc != 0) return rc;
-    rc = install_trampoline_for(1, r->pc_quest_entered,
+    rc = install_trampoline_for(r->pc_quest_entered,
                                 (uint32_t)&mhfu_dispatch_quest_entered,
                                 &g_install[MHFU_EVENT_QUEST_ENTERED]);
     return rc;
@@ -202,7 +196,7 @@ extern "C" int mhfu_install_worker_thread(SceSize args, void *argp)
                 mhfu_sentinel_set(0x10, 0xC0DE0002);
                 int rc = mhfu_install_event_trampolines();
                 mhfu_sentinel_set(0x04, (uint32_t)rc);
-                mhfu_sentinel_set(0x08, (uint32_t)&g_code_cave[0]);
+                mhfu_sentinel_set(0x08, g_install[MHFU_EVENT_QUEST_BEGINNING].wrapper_addr);
                 mhfu_sentinel_set(0x0C, *(volatile uint32_t *)(r->pc_quest_beginning));
                 mhfu_sentinel_set(0x10, (rc == 0) ? 0xC0DE0003u : 0xC0DEDEAD);
                 for (int re = 0; re < 1200; re++) {

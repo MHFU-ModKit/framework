@@ -69,4 +69,51 @@ void mhfu_entity_set_pos(uint32_t ent, mhfu_vec3_t p)
     mhfu_write_f32(ent + MHFU_ENT_TRANSLATION + 8, p.z);
 }
 
+int mhfu_entities_of_type(mhfu_monster_id_t type, uint32_t *out, int max)
+{
+    int n = 0;
+    for (int s = 1; s < MHFU_ENTITY_REGISTRY_SLOTS && n < max; s++) {
+        uint32_t p = mhfu_entity_at(s);
+        if (p && mhfu_entity_type(p) == (uint8_t)type) out[n++] = p;
+    }
+    return n;
+}
+
+uint16_t mhfu_entity_yaw(uint32_t ent)
+{
+    return in_ram(ent) ? *(volatile uint16_t *)(ent + MHFU_ENT_YAW) : 0;
+}
+void mhfu_entity_set_yaw(uint32_t ent, uint16_t yaw)
+{
+    if (in_ram(ent)) *(volatile uint16_t *)(ent + MHFU_ENT_YAW) = yaw;
+}
+
+uint8_t mhfu_entity_ai_state(uint32_t ent)
+{
+    return in_ram(ent) ? *(volatile uint8_t *)(ent + MHFU_ENT_AI_STATE) : 0;
+}
+void mhfu_entity_set_ai_state(uint32_t ent, uint8_t s)
+{
+    if (in_ram(ent)) *(volatile uint8_t *)(ent + MHFU_ENT_AI_STATE) = s;
+}
+
+int mhfu_entity_engaged(uint32_t ent)
+{
+    return in_ram(ent) && mhfu_read_f32(ent + MHFU_ENT_ENGAGE_FLAG) >= 0.5f;
+}
+void mhfu_entity_set_engaged(uint32_t ent, int engaged)
+{
+    if (in_ram(ent)) mhfu_write_f32(ent + MHFU_ENT_ENGAGE_FLAG, engaged ? 1.0f : 0.0f);
+}
+
+void mhfu_entity_calm(uint32_t ent)
+{
+    if (!in_ram(ent)) return;
+    /* per-entity detection ranges (read-on-evaluate, the engine never
+     * writes them, so they stick) + clear the current engage flag */
+    static const uint32_t det_offs[6] = {0x064C, 0x0650, 0x0654, 0x067C, 0x0680, 0x0684};
+    for (int k = 0; k < 6; k++) mhfu_write_f32(ent + det_offs[k], 0.0f);
+    mhfu_write_f32(ent + MHFU_ENT_ENGAGE_FLAG, 0.0f);
+}
+
 } /* extern "C" */

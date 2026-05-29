@@ -10,6 +10,7 @@
 #define MHFU_ENTITY_H
 
 #include <stdint.h>
+#include "ids.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,6 +38,10 @@ uint32_t mhfu_entity_at(int slot);             /* ptr in slot, or 0 */
 int      mhfu_entity_slot_of(uint32_t ent);    /* slot of ptr, or -1 */
 int      mhfu_entity_is_alive(uint32_t ent);   /* still in the registry? */
 
+/* Collect up to `max` live entity pointers of a given type into `out`.
+ * Returns the count written. */
+int mhfu_entities_of_type(mhfu_monster_id_t type, uint32_t *out, int max);
+
 /* Typed field accessors (return 0 / no-op on a NULL/out-of-RAM ptr). */
 uint8_t     mhfu_entity_type(uint32_t ent);
 uint16_t    mhfu_entity_hp(uint32_t ent);
@@ -44,6 +49,18 @@ float       mhfu_entity_size(uint32_t ent);
 void        mhfu_entity_set_size(uint32_t ent, float v);  /* writes all 5 mirrors */
 mhfu_vec3_t mhfu_entity_pos(uint32_t ent);
 void        mhfu_entity_set_pos(uint32_t ent, mhfu_vec3_t p); /* + translation row */
+
+uint16_t    mhfu_entity_yaw(uint32_t ent);              /* +0x1F4 packed u16 */
+void        mhfu_entity_set_yaw(uint32_t ent, uint16_t yaw);
+uint8_t     mhfu_entity_ai_state(uint32_t ent);         /* +0x334 */
+void        mhfu_entity_set_ai_state(uint32_t ent, uint8_t s);
+int         mhfu_entity_engaged(uint32_t ent);          /* +0x05DC f32 >= 0.5 */
+void        mhfu_entity_set_engaged(uint32_t ent, int engaged);
+
+/* Clear an entity's aggression: zero the engage flag + the per-entity
+ * detection ranges so it won't re-acquire the player. Pair with
+ * mhfu_species_set_detection() to also block NEW aggro (monster.h). */
+void        mhfu_entity_calm(uint32_t ent);
 
 #ifdef __cplusplus
 } /* extern "C" */
