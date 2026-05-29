@@ -666,7 +666,11 @@ static void demo_on_monster_spawned(const mhfu_monster_spawn_ctx_t *ctx)
  * ------------------------------------------------------------------------ */
 
 #define MHFU_EMBED_POPO_GROWTH 0
-#define MHFU_EMBED_POPO_AGGRESSION 1
+/* Popo embeds disabled for the Tigrex runtime-inject build (Section 30+,
+ * 2026-05-29). They patch/hook popo+shared engine code (heading rotator
+ * 0x08865044 etc.) which we want OUT of the way for a clean Tigrex PoC.
+ * Re-enable for popo-aggression work. */
+#define MHFU_EMBED_POPO_AGGRESSION 0
 /* Section 22 (2026-05-26): swap popo vtable[8] (anim probability picker,
  * 0x08865254) to a PRX-side stub that overrides $a1 = picked-anim with a
  * host-controlled value. Combined with the popo_aggression heading-vec
@@ -680,7 +684,7 @@ static void demo_on_monster_spawned(const mhfu_monster_spawn_ctx_t *ctx)
  * Self-contained — independent of popo_aggression. With both enabled,
  * aggression provides heading direction + the vt[8] override forces
  * walk-forward anim selection. */
-#define MHFU_EMBED_POPO_VT8_OVERRIDE 1
+#define MHFU_EMBED_POPO_VT8_OVERRIDE 0
 
 /* Section 23 (2026-05-27): swap popo vtable[5] (per-frame tick, base impl
  * 0x08864634 = ObjBase::vtable_0x14). Per-frame tick body in C++ source
@@ -709,7 +713,7 @@ static void demo_on_monster_spawned(const mhfu_monster_spawn_ctx_t *ctx)
  * Branchless single-block stub (per §22b lessons — multi-block stubs
  * freeze PPSSPP JIT). MOVN selects between (drifted current value) vs
  * (saved value) based on g_vt5_freeze_enable. */
-#define MHFU_EMBED_POPO_VT5_FREEZE 1
+#define MHFU_EMBED_POPO_VT5_FREEZE 0
 
 /* Section 24 (2026-05-27): hook the engine's UNIVERSAL heading rotator
  * function at EBOOT `0x08865044`. Identified live via mem-BP write trace
@@ -742,7 +746,7 @@ static void demo_on_monster_spawned(const mhfu_monster_spawn_ctx_t *ctx)
  * at state transitions (1.5x/sec/popo) — well under the 30 Hz halt
  * regime that fight-the-engine approaches tripped.
  */
-#define MHFU_EMBED_POPO_HEADING_HOOK 1
+#define MHFU_EMBED_POPO_HEADING_HOOK 0
 
 #if MHFU_EMBED_POPO_GROWTH
 
@@ -897,6 +901,466 @@ static int popo_growth_thread(SceSize args, void *argp)
 }
 
 #endif /* MHFU_EMBED_POPO_GROWTH */
+
+/* ------------------------------------------------------------------------ *
+ * Embedded TIGREX quest-target injection (Section 31, 2026-05-29).
+ *
+ * Approach (the user's chosen "reuse the engine" route): add the Tigrex to the
+ * quest's NATIVE monster-target list right after the engine builds it, so the
+ * engine itself does the full load+unpack+VRAM+spawn at quest-begin. No manual
+ * model loader, no manual entity clone.
+ *
+ * RE (memory quest-singleton-monster-list, clean-image disasm + 1 live read):
+ *   Quest::objectPtr static  = 0x08A62C7C  -> Quest singleton = 0x09A05DC0
+ *   monster list targets[2]  @ Quest+0x768, stride 0x2C; QuestTarget fields:
+ *     definitions[5] @+0x00, emId(s8) @+0x14, count_0x1e(s8) @+0x1E
+ *   per-quest init func 0x08869904 does, in order:  Quest+0x50=rec_base;
+ *     Quest+0x718=node_list;  clearTargets(0x0886A444);
+ *     >>> jal buildTargets(0x0886D4D8) @ 0x08869EEC <<<  ; ...later init.
+ *   The model-load/spawn CONSUME phase (0x08849D7C <- 0x08818574) is a SEPARATE
+ *   later call, so appending target[1] right after buildTargets returns is
+ *   provably before consume.
+ *   addTarget(a0=Quest, a1=idx, a2=record)  @ 0x0886A4CC  appends:
+ *     definitions[count]=record; emId=record[0](u16); count++.
+ *   record format: emId @+0 (u16), spawn X @+0x20 (f32), spawn Z @+0x28 (f32).
+ *   Live Giadrome quest: target[0]=emId 0x4D (Giadrome) count 1; target[1] FREE.
+ *   Popo (section-1) records carry section-1 coords (X~15940, Z~10536).
+ *
+ * HOOK: redirect the single `jal 0x0886D4D8` at 0x08869EEC to a branchless
+ * postfix stub (Section 26 TITLE/MENU-gated install to beat the JIT pre-cache;
+ * Section 25 branchless single-basic-block to avoid PPSSPP PC=0 freeze). The
+ * delay slot at 0x08869EF0 (`move $a0,$s1`) still runs, so the stub gets
+ * a0 = Quest. Stub: jal real buildTargets; jal mhfu_quest_inject_helper; ret.
+ * Helper copies target[0]'s Giadrome record, retags species -> Tigrex (0x4B),
+ * relocates spawn X/Z to section 1, and calls addTarget(Quest, 1, &record).
+ * A poll thread then calms (Tigrex sight radius 0x09BC1030 -> 0, entity
+ * +0x05DC -> 0) and resizes (5 size mirrors -> 0.5x).
+ * ------------------------------------------------------------------------ */
+#define MHFU_EMBED_TIGREX_INJECT 1
+#if MHFU_EMBED_TIGREX_INJECT
+
+#define QINJ_BUILD_JAL_SITE  0x08869EECu  /* `jal 0x0886D4D8` (buildTargets) */
+#define QINJ_BUILDTARGETS    0x0886D4D8u
+#define QINJ_ADDTARGET       0x0886A4CCu  /* addTarget(Quest, idx, record) */
+#define QINJ_QUEST_OBJPTR    0x08A62C7Cu  /* Quest::objectPtr -> Quest singleton */
+#define QINJ_TARGETS_OFF     0x768u
+#define QINJ_TARGET_STRIDE   0x2Cu
+#define QINJ_EMID_OFF        0x14u
+#define QINJ_COUNT_OFF       0x1Eu
+/* Parsed quest-data buffer (rec_base = Quest+0x50). buildTargets iterates the
+ * big-monster list A = [Quest+0x71c]; each node is 0x10 bytes:
+ *   [+0]=flag, [+4]=0, [+8]=mon-header offset (0 = END), [+0xc]=record offset.
+ * record/mon-header are at rec_base+offset. Used data ends ~+0x1B84, so the new
+ * Tigrex record + mon-header go in the free tail. */
+#define QINJ_RECBASE_OFF     0x50u
+#define QINJ_LISTA_OFF       0x71Cu
+#define QINJ_NODE_STRIDE     0x10u
+#define QINJ_NODE_HDROFF     0x08u    /* mon-header offset / END marker */
+#define QINJ_NODE_RECOFF     0x0Cu    /* full-record offset */
+#define QINJ_FREE_REC        0x1C00u  /* where we write the Tigrex record */
+#define QINJ_FREE_HDR        0x1C80u  /* where we write the Tigrex mon-header */
+#define QINJ_MONHDR_COPY     0x10u
+#define QINJ_MAX_BIGMON      4        /* refuse to over-fill list A */
+#define QINJ_REC_X_OFF       0x20u        /* spawn X (f32) in the record */
+#define QINJ_REC_Z_OFF       0x28u        /* spawn Z (f32) in the record */
+#define QINJ_GIADROME_EMID   0x4D
+#define QINJ_TIGREX_EMID     0x4B
+#define QINJ_TIGREX_SIGHT    0x09BC1030u  /* Tigrex species sight/detect radius */
+#define QINJ_AREA_INDEX      0x08B0C7DCu
+
+/* Tigrex INITIAL spawn coords = its native snow-map big-monster spawn area
+ * (from the slot1 Tigrex quest's native record). A big monster CANNOT be
+ * initially spawned at section-1 coords — there's no big-monster spawn tile
+ * there at quest-begin (crash15, 0x300000000); big monsters reach section 1 by
+ * ROAMING. Distinct from Giadrome's (8957,8755) so they're not co-located. */
+#define QINJ_TIGREX_SPAWN_X  9548.0f
+#define QINJ_TIGREX_SPAWN_Z  6834.0f
+/* Section-1 override (g_qinj_force_coords). VERDICT (Section 31N, 2026-05-29):
+ * forcing the REPLACE'd Tigrex's record coords to section 1 does NOT crash
+ * (1 monster, no cap) and DOES place the entity in section 1 logically — it
+ * lands in the tick/update chain (+0x1C4/+0x1C8), ticks (frame counter advances),
+ * position is settable. BUT it is INVISIBLE + INERT: its Draw pointer +0x008
+ * stays 0 (renderer never draws it) and its AI state +0x334 stays 0 even untamed
+ * (the section-1 enemy subsystem never attaches AI). Section 1 has no big-monster
+ * provisioning (spawn tile + draw slot + AI attach) — same wall as crash15, just
+ * non-fatal under REPLACE. So force_coords defaults OFF: native coords spawn the
+ * Tigrex in its rendering sections (6/7/8). Section-1 *rendering* a big monster
+ * needs the draw-chain/section-provisioning RE (future work, cap-class). */
+#define QINJ_SECTION1_X      15940.0f
+#define QINJ_SECTION1_Z      10536.0f
+
+#define QINJ_STUB_INSNS      16
+#define QINJ_REC_WORDS       0x20         /* 0x80-byte record buffer */
+#define QINJ_REC_COPY        0x60u        /* bytes copied from the source record */
+
+/* Size mirrors (per memory monster-size-scalar) — written together. */
+static const uint32_t g_qinj_size_offs[5] = {0x024, 0x220, 0x224, 0x228, 0x270};
+
+typedef void (*qinj_addtarget_fn)(uint32_t quest, int idx, void *record);
+
+volatile uint32_t g_qinj_stub_buf[QINJ_STUB_INSNS];
+static volatile uint32_t g_qinj_rec[QINJ_REC_WORDS];  /* persists; engine holds its ptr */
+
+static volatile int      g_qinj_enable   = 1;   /* master toggle */
+static volatile int      g_qinj_require_giadrome = 1; /* only inject on the Giadrome hunt */
+/* mode: 0 = ADD (append target[1]=Tigrex, KEEP Giadrome — two big monsters;
+ * the user's actual goal). 1 = REPLACE (retag Giadrome target -> Tigrex).
+ * Default ADD. crash12 showed REPLACE crashes DURING LOAD (swapping the primary
+ * species after the quest reserved Giadrome-sized resources). crash11 was ADD
+ * but WITH forced section-1 coords (the coord mismatch, not the 2nd monster,
+ * is the suspect). So: ADD + native coords is the untested, goal-matching
+ * config — add Tigrex at Giadrome's own valid big-monster spawn (6/7/8). */
+static volatile int      g_qinj_mode      = 0;
+/* Force the spawn position to section-1 coords (record +0x20 X / +0x28 Z — the
+ * spawn position IS the record coords; verified Giadrome spawns at exactly its
+ * record coords, and 0x09A0B610 carries no coords). DEFAULT ON now: crash11's
+ * coord-force crash was dominated by the provisioning bug (now fixed via the
+ * list-A node) PLUS using a GIADROME-species record at section-1 (Giadrome is
+ * not allowed in section 1). We clone+retag to TIGREX (allowed in section 1),
+ * so a Tigrex at a section-1 position is legitimate. Coords below are a
+ * confirmed-navigable section-1 spot (between the two live Popos 15502,10179 /
+ * 16405,10769). */
+static volatile int      g_qinj_force_coords = 0;  /* section-1 spawn = invisible+inert (no draw slot / no AI attach); OFF -> native coords -> renders in 6/7/8 */
+/* REPLACE mode (Section 31L): retag the quest's existing big monster (Giadrome)
+ * -> Tigrex instead of ADDING a 2nd. Keeps the big-monster COUNT at 1, so it
+ * sidesteps the per-quest spawn CAP that crashes a 2nd big monster (crash13-16).
+ * The model-load reads the retagged node -> loads Tigrex; 1 big monster spawns. */
+static volatile int      g_qinj_replace = 1;
+static volatile int      g_qinj_installed = 0;  /* stub patched in */
+static volatile int      g_qinj_done      = 0;  /* injected once per session */
+static volatile uint32_t g_qinj_hits      = 0;  /* stub->helper fire count (sentinel) */
+static volatile uint32_t g_qinj_orig_jal  = 0;  /* original word @ JAL site */
+static volatile uint32_t g_qinj_rec_src   = 0;  /* source (Giadrome) record ptr */
+static volatile int      g_qinj_t1_emid   = -1; /* read-back retagged emId */
+static volatile int      g_qinj_split_done = 0;  /* postfix split target[0]->target[1] done */
+static volatile int      g_qinj_prep_done  = 0;  /* node added at PREP (before model-load) */
+static volatile uint32_t g_qinj_prep_hits  = 0;  /* prep-poll saw parsed quest data */
+static volatile int      g_qinj_calm      = 1;  /* write global Tigrex sight radius -> 0 */
+static volatile int      g_qinj_touch_entity = 1; /* per-entity calm (+0x05DC=0) + resize — TAME the spawned Tigrex */
+static volatile int      g_qinj_resize    = 1;
+static volatile float    g_qinj_size      = 0.5f;
+static volatile uint32_t g_qinj_tigrex_ent = 0; /* found Tigrex entity ptr */
+/* Passive AI state pinned on the Tigrex to tame it. 5 = held + non-aggressive
+ * (stuck-looping). Other values may give wander vs idle — tweakable via this
+ * sentinel without a rebuild. */
+static volatile int      g_qinj_tame_state = 5;
+
+static inline int qinj_in_ram(uint32_t a) { return a >= 0x08800000u && a < 0x0A000000u; }
+
+/* Called from the branchless stub with $a0 = Quest base, AFTER the engine's
+ * own buildTargets() has populated the native targets. Appends target[1] =
+ * Tigrex via the engine's addTarget(). Branchless-stub rule (Section 25): ALL
+ * conditional logic lives here in C, never in the stub. */
+/* Idempotent: add a Tigrex node to big-monster list A in the parsed quest
+ * buffer at `recb` (= rec_base). Works both at PREP (recb = literal 0x08A5C440,
+ * before Quest+0x50 is set) and at BEGIN (recb = Quest+0x50). listA is found via
+ * the header offset at recb+0x14 (same value the engine stores at Quest+0x71c).
+ * Returns 0 = not applicable (not the Giadrome quest / data not ready),
+ *         1 = a Tigrex node already present (no-op),
+ *         2 = node added now. */
+static int qinj_add_node_at(uint32_t recb)
+{
+    if (!qinj_in_ram(recb)) return 0;
+    uint32_t listA = recb + *(volatile uint32_t *)(recb + 0x14);
+    if (!qinj_in_ram(listA)) return 0;
+    uint32_t n0_hdr = *(volatile uint32_t *)(listA + QINJ_NODE_HDROFF);
+    uint32_t n0_rec = *(volatile uint32_t *)(listA + QINJ_NODE_RECOFF);
+    if (n0_hdr == 0 || n0_rec == 0) return 0;
+    uint32_t rec0 = recb + n0_rec;
+    if (!qinj_in_ram(rec0)) return 0;
+    if (g_qinj_require_giadrome && (*(volatile uint16_t *)rec0 & 0xFF) != QINJ_GIADROME_EMID)
+        return 0;
+
+    /* walk to END; bail (already done) if a Tigrex node is present. */
+    uint32_t node = listA; int idx = 0;
+    while (*(volatile uint32_t *)(node + QINJ_NODE_HDROFF) != 0 && idx < 6) {
+        uint32_t roff = *(volatile uint32_t *)(node + QINJ_NODE_RECOFF);
+        if (roff && (*(volatile uint16_t *)(recb + roff) & 0xFF) == QINJ_TIGREX_EMID)
+            return 1;
+        node += QINJ_NODE_STRIDE; idx++;
+    }
+    if (idx == 0 || idx >= QINJ_MAX_BIGMON) return 0;
+
+    uint32_t trec = recb + QINJ_FREE_REC;
+    uint32_t thdr = recb + QINJ_FREE_HDR;
+    for (uint32_t i = 0; i < QINJ_REC_COPY; i++)
+        *(volatile uint8_t *)(trec + i) = *(volatile uint8_t *)(rec0 + i);
+    /* Retag clone -> Tigrex. crash14 was an imperfect record (cloned Giadrome
+     * fields); the model now loads (begin node-add precedes the loading-screen
+     * model-load), so the remaining fix is making the record species-correct.
+     * Values from the NATIVE Tigrex record (slot1 quest): +0x05 model/class idx,
+     * +0x08 HP%, +0x1C id, +0x32 flags. */
+    *(volatile uint16_t *)(trec + 0x00) = (uint16_t)QINJ_TIGREX_EMID;
+    *(volatile uint8_t  *)(trec + 0x05) = 0x04;      /* model/class idx (was 0x02) */
+    *(volatile uint32_t *)(trec + 0x08) = 0x6D;      /* HP% (native Tigrex) */
+    *(volatile uint16_t *)(trec + 0x1C) = 0xF692;    /* id/hash (native Tigrex) */
+    *(volatile uint16_t *)(trec + 0x32) = 0x0960;    /* flags (native Tigrex) */
+    /* Spawn at the Tigrex's native snow-map area (valid big-monster spawn tile),
+     * NOT section 1 (initial section-1 spawn crashes — crash15). */
+    *(volatile float *)(trec + QINJ_REC_X_OFF) = QINJ_TIGREX_SPAWN_X;
+    *(volatile float *)(trec + QINJ_REC_Z_OFF) = QINJ_TIGREX_SPAWN_Z;
+    if (g_qinj_force_coords) {   /* experimental section-1 override (crashes) */
+        *(volatile float *)(trec + QINJ_REC_X_OFF) = QINJ_SECTION1_X;
+        *(volatile float *)(trec + QINJ_REC_Z_OFF) = QINJ_SECTION1_Z;
+    }
+    for (uint32_t i = 0; i < QINJ_MONHDR_COPY; i++)
+        *(volatile uint8_t *)(thdr + i) = *(volatile uint8_t *)(recb + n0_hdr + i);
+    *(volatile uint16_t *)(thdr + 0x00) = (uint16_t)QINJ_TIGREX_EMID;
+
+    *(volatile uint32_t *)(node + 0x00)             = 1;
+    *(volatile uint32_t *)(node + 0x04)             = 0;
+    *(volatile uint32_t *)(node + QINJ_NODE_HDROFF) = QINJ_FREE_HDR;
+    *(volatile uint32_t *)(node + QINJ_NODE_RECOFF) = QINJ_FREE_REC;
+    uint32_t endn = node + QINJ_NODE_STRIDE;
+    for (int k = 0; k < 4; k++) *(volatile uint32_t *)(endn + k * 4) = 0;
+    g_qinj_rec_src = rec0;
+    return 2;
+}
+
+/* REPLACE: retag the quest's existing big-monster node (Giadrome) -> Tigrex in
+ * place. ONE big monster, native spawn coords. The model-load (loading screen,
+ * after buildTargets) reads the retagged node and loads the Tigrex model; the
+ * count stays 1, so no spawn-cap overflow. Returns 0/2 like qinj_add_node_at. */
+static int qinj_replace_node0(uint32_t recb)
+{
+    if (!qinj_in_ram(recb)) return 0;
+    uint32_t listA = recb + *(volatile uint32_t *)(recb + 0x14);
+    if (!qinj_in_ram(listA)) return 0;
+    uint32_t n0_hdr = *(volatile uint32_t *)(listA + QINJ_NODE_HDROFF);
+    uint32_t n0_rec = *(volatile uint32_t *)(listA + QINJ_NODE_RECOFF);
+    if (n0_hdr == 0 || n0_rec == 0) return 0;
+    uint32_t rec0 = recb + n0_rec;
+    if (!qinj_in_ram(rec0)) return 0;
+    int em0 = *(volatile uint16_t *)rec0 & 0xFF;
+    if (em0 == QINJ_TIGREX_EMID) return 1;                 /* already done */
+    if (g_qinj_require_giadrome && em0 != QINJ_GIADROME_EMID) return 0;
+    /* retag record -> Tigrex (species-correct fields; keep native coords) */
+    *(volatile uint16_t *)(rec0 + 0x00) = (uint16_t)QINJ_TIGREX_EMID;
+    *(volatile uint8_t  *)(rec0 + 0x05) = 0x04;
+    *(volatile uint32_t *)(rec0 + 0x08) = 0x6D;
+    *(volatile uint16_t *)(rec0 + 0x1C) = 0xF692;
+    *(volatile uint16_t *)(rec0 + 0x32) = 0x0960;
+    /* retag mon-header -> Tigrex */
+    *(volatile uint16_t *)(recb + n0_hdr) = (uint16_t)QINJ_TIGREX_EMID;
+    /* Optional: relocate the NATIVE spawn to section 1 (record X/Z; the record's
+     * Y=0 so the engine grounds it at section-1 terrain). REPLACE = 1 big monster
+     * (no cap) + Tigrex (allowed in section 1) — the combo not cleanly tested
+     * before. The engine spawns it natively in section 1 (vs the live-teleport
+     * that wouldn't render). */
+    if (g_qinj_force_coords) {
+        *(volatile float *)(rec0 + QINJ_REC_X_OFF) = QINJ_SECTION1_X;
+        *(volatile float *)(rec0 + QINJ_REC_Z_OFF) = QINJ_SECTION1_Z;
+    }
+    g_qinj_rec_src = rec0;
+    return 2;
+}
+
+/* PREP injection (called fast from the poll thread): add the Tigrex node to the
+ * parsed quest buffer (literal rec_base 0x08A5C440) as soon as the ".mib" is
+ * parsed ("2NDG" magic present), BEFORE the engine's load-screen model-load
+ * reads the list -> engine loads the Tigrex model natively. */
+void qinj_prep_inject(void)
+{
+    if (!g_qinj_enable || g_qinj_prep_done || g_qinj_replace) return;  /* REPLACE: begin hook handles it */
+    uint32_t recb = 0x08A5C440u;
+    if (*(volatile uint32_t *)(recb + 0x04) != 0x47444E32u) return;  /* "2NDG" */
+    g_qinj_prep_hits++;
+    int r = qinj_add_node_at(recb);
+    if (r >= 1) {
+        g_qinj_prep_done = 1;
+        mhfu_log("[qinj] PREP %s rec_base=0x%08lx", r == 2 ? "INJECTED node" : "already present",
+                 (unsigned long)recb);
+    }
+}
+
+/* BEGIN prefix (before buildTargets): ensure the node exists (idempotent — the
+ * prep poll usually added it already). */
+void mhfu_quest_inject_helper(uint32_t quest)
+{
+    g_qinj_hits++;
+    if (!g_qinj_enable || g_qinj_done) return;
+    if (!qinj_in_ram(quest)) return;
+    uint32_t recb = *(volatile uint32_t *)(quest + QINJ_RECBASE_OFF);
+    int r = g_qinj_replace ? qinj_replace_node0(recb) : qinj_add_node_at(recb);
+    if (r == 0) return;
+    g_qinj_t1_emid = QINJ_TIGREX_EMID;
+    g_qinj_done = 1;
+    mhfu_log("[qinj] BEGIN %s r=%d rec_base=0x%08lx",
+             g_qinj_replace ? "REPLACE" : "ADD", r, (unsigned long)recb);
+}
+
+/* POSTFIX: runs AFTER buildTargets. The iterator put BOTH list-A monsters into
+ * target GROUP 0 (count=2) because it always calls addTarget with index 0 — and
+ * the spawner only spawns def[0] of a group (diagnosis: Tigrex declared but
+ * never spawned, no crash). Move the Tigrex into its OWN group target[1] so the
+ * spawner attempts it (crash13 proved target[1] triggers a spawn). The list-A
+ * node still drives provisioning, so unlike crash13 there should be a slot. */
+void mhfu_quest_split_helper(uint32_t quest)
+{
+    if (!g_qinj_enable) return;
+    if (g_qinj_replace) return;   /* REPLACE = 1 monster in target[0]; no split */
+    /* Section 31k: the Tigrex MODEL loads in the loading screen AFTER the begin
+     * hook adds the node (verified: 478 KiB em13 model resident). So the split
+     * is safe WITHOUT the prep gate — the model is loaded by the time the
+     * spawner reads target[1]. (crash14 was the imperfect record, now fixed.) */
+    if (!qinj_in_ram(quest)) return;
+    uint32_t t0 = quest + QINJ_TARGETS_OFF;          /* target[0] group */
+    if (*(volatile int8_t *)(t0 + QINJ_COUNT_OFF) != 2) return;  /* only the 2-in-group-0 case */
+    uint32_t trec = *(volatile uint32_t *)(t0 + 0x04);           /* group0 def[1] = Tigrex record */
+    if (!qinj_in_ram(trec)) return;
+    if ((*(volatile uint16_t *)trec & 0xFF) != QINJ_TIGREX_EMID) return;
+
+    /* remove the Tigrex (2nd entry) from group 0 */
+    *(volatile uint32_t *)(t0 + 0x04) = 0;           /* def[1] */
+    *(volatile uint8_t  *)(t0 + 0x18) = 0;           /* emId[1] */
+    *(volatile uint8_t  *)(t0 + 0x1D) = 0;           /* bytes_0x19[1] */
+    *(volatile int8_t   *)(t0 + QINJ_COUNT_OFF) = 1; /* count -> 1 (Giadrome only) */
+
+    /* add it to its own group via the engine's addTarget (faithful field writes) */
+    ((qinj_addtarget_fn)QINJ_ADDTARGET)(quest, 1, (void *)trec);
+
+    g_qinj_split_done = 1;
+    g_qinj_t1_emid = *(volatile int8_t *)(quest + QINJ_TARGETS_OFF
+                                          + QINJ_TARGET_STRIDE + QINJ_EMID_OFF) & 0xFF;
+    mhfu_log("[qinj] SPLIT: group0->1 trec=0x%08lx target1.emId=0x%02x",
+             (unsigned long)trec, g_qinj_t1_emid);
+}
+
+static void qinj_build_stub(void)
+{
+    uint32_t *s = (uint32_t *)g_qinj_stub_buf;
+    int i = 0;
+    uint32_t helper  = (uint32_t)(uintptr_t)&mhfu_quest_inject_helper;
+    uint32_t helperB = (uint32_t)(uintptr_t)&mhfu_quest_split_helper;
+    /* PREFIX add-node + POSTFIX split:
+     *   helperA  -> add Tigrex node to list A (provisioning sees 2)
+     *   buildTargets -> builds target group 0 with count=2
+     *   helperB  -> move the Tigrex into its own group target[1] so the spawner
+     *               actually spawns it. a0 = Quest (displaced delay slot). */
+    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);
+    s[i++] = mips_sw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    s[i++] = mips_sw(MIPS_REG_A0, 0x10, MIPS_REG_SP);   /* save Quest */
+    s[i++] = mips_jal(helper);                          /* extend list A */
+    s[i++] = MIPS_NOP;
+    s[i++] = mips_lw(MIPS_REG_A0, 0x10, MIPS_REG_SP);   /* restore Quest */
+    s[i++] = mips_jal(QINJ_BUILDTARGETS);               /* real buildTargets(a0) builds 2 */
+    s[i++] = MIPS_NOP;
+    s[i++] = mips_lw(MIPS_REG_A0, 0x10, MIPS_REG_SP);   /* restore Quest */
+    s[i++] = mips_jal(helperB);                         /* split group0 -> target[1] */
+    s[i++] = MIPS_NOP;
+    s[i++] = mips_lw(MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);
+    s[i++] = mips_jr(MIPS_REG_RA);
+    s[i++] = MIPS_NOP;
+    while (i < QINJ_STUB_INSNS) s[i++] = MIPS_NOP;
+}
+
+static void qinj_install(void)
+{
+    if (g_qinj_installed) return;
+    qinj_build_stub();
+    sceKernelDcacheWritebackInvalidateAll();
+    sceKernelIcacheInvalidateAll();
+    /* Redirect the call site (entry of buildTargets stays unpatched -> the
+     * stub's `jal QINJ_BUILDTARGETS` reaches the real function). */
+    uint32_t patch = mips_jal((uint32_t)(uintptr_t)g_qinj_stub_buf);
+    mhfu_patch_code_word(QINJ_BUILD_JAL_SITE, patch);
+    g_qinj_installed = 1;
+    mhfu_log("[qinj] INSTALLED: JAL@0x%08x %08lx->%08lx stub=0x%08lx helper=0x%08lx",
+             QINJ_BUILD_JAL_SITE, (unsigned long)g_qinj_orig_jal,
+             (unsigned long)patch, (unsigned long)(uintptr_t)g_qinj_stub_buf,
+             (unsigned long)(uintptr_t)&mhfu_quest_inject_helper);
+}
+
+/* Calm + resize the spawned Tigrex (proven recipe, memory tigrex-aggro-disable
+ * + monster-size-scalar). Cheap; safe to call every poll tick in-quest. */
+static void qinj_calm_resize(void)
+{
+    /* Global, data-only: disable NEW Tigrex aggro by zeroing the species
+     * sight radius (proven safe, memory tigrex-aggro-disable). No entity
+     * touch — safe even mid-spawn. */
+    if (g_qinj_calm) *(volatile float *)QINJ_TIGREX_SIGHT = 0.0f;
+
+    if (!g_qinj_touch_entity) return;
+    /* Clear the engage flag (+0x05DC, generic AI cell) on EVERY registry monster
+     * — the section is in combat (the Tigrex + the Giaprey pack, type 0x23, all
+     * engaged), and a section-wide alert keeps re-engaging the Tigrex. Calming
+     * only the Tigrex loses to that. Resize applies to the Tigrex (0x4B) only. */
+    static const uint32_t det_offs[6] = {0x064C, 0x0650, 0x0654, 0x067C, 0x0680, 0x0684};
+    for (int slot = 1; slot < ENTITY_REGISTRY_SLOTS; slot++) {
+        uint32_t p = *(volatile uint32_t *)(ENTITY_REGISTRY_ADDR + slot * 4);
+        if (!qinj_in_ram(p)) continue;
+        uint8_t t = *(volatile uint8_t *)(p + 0x1E8);
+        if (g_qinj_calm) {
+            /* Zero the ENTITY-LOCAL detection ranges (1000/2700/5000) — the
+             * engine READS these but never writes them, so they STICK (unlike
+             * the engage flag it rewrites every frame). 0 range -> can't acquire
+             * the player -> never re-engages. THE real tame lever (Section 31L).*/
+            for (int k = 0; k < 6; k++)
+                *(volatile float *)(p + det_offs[k]) = 0.0f;
+            *(volatile float *)(p + 0x05DC) = 0.0f;   /* clear current engage */
+        }
+        if (t == QINJ_TIGREX_EMID) {
+            g_qinj_tigrex_ent = p;
+            /* Boss tame (Section 31L): forcing AIstate (+0x334) -> 5 HELD (engine
+             * didn't reset it) and stopped the attacks — the boss tracks the
+             * player unconditionally so detection/engage clears alone don't work,
+             * but pinning a passive AI state does. (Currently stuck-looping, not
+             * wandering — a passive non-aggressive state.) */
+            *(volatile uint8_t  *)(p + 0x334) = g_qinj_tame_state;  /* passive AI state */
+            *(volatile uint32_t *)(p + 0x322) = 0;  /* stimTag (+ paired) — needed for the tame */
+            *(volatile uint32_t *)(p + 0x6D8) = 0;  /* fleeState — needed for the tame */
+            if (g_qinj_resize)
+                for (int k = 0; k < 5; k++)
+                    *(volatile float *)(p + g_qinj_size_offs[k]) = g_qinj_size;
+        }
+    }
+}
+
+static int tigrex_inject_thread(SceSize args, void *argp)
+{
+    (void)args; (void)argp;
+    mhfu_log("[qinj] quest-target inject thread started (Section 31)");
+    for (;;) {
+        /* Poll fast (20 Hz) while watching for the parsed quest data so the
+         * PREP node-add lands before the load-screen model-load; back off to
+         * ~3 Hz once that's done. */
+        /* fast poll during prep watch; ALSO once injected (g_qinj_done) so the
+         * per-entity calm out-paces the engine's per-frame engage re-set on the
+         * quest-target Tigrex (3 Hz lost the race; ~20 Hz). */
+        int fast = (g_qinj_installed && !g_qinj_prep_done && !g_qinj_replace)
+                   || g_qinj_done;
+        sceKernelDelayThread((fast ? 50 : 300) * 1000);
+        if (!g_qinj_enable) continue;
+        uint8_t scr = *(volatile uint8_t *)0x08A8CA48u;
+
+        /* PREP: add the Tigrex node to the parsed buffer as soon as it appears
+         * (after the hook is installed at TITLE/MENU). */
+        if (g_qinj_installed && !g_qinj_prep_done) qinj_prep_inject();
+
+        /* Install gate (Section 26): patch the JAL only at a verified-quiet
+         * screen (TITLE 0x04 / MENU 0x01) so the JIT hasn't cached
+         * 0x08869904 yet. One-shot. Verify the expected `jal buildTargets`
+         * is still present before patching (savestate restore may lag). */
+        if (!g_qinj_installed && (scr == 0x01 || scr == 0x04)) {
+            uint32_t w = *(volatile uint32_t *)QINJ_BUILD_JAL_SITE;
+            uint32_t expect = mips_jal(QINJ_BUILDTARGETS);
+            if (w == expect) {
+                g_qinj_orig_jal = w;
+                qinj_install();
+            } else {
+                static uint32_t c = 0;
+                if ((c++ & 31) == 0)
+                    mhfu_log("[qinj-gate] scr=0x%02x but JAL site=0x%08lx != expected 0x%08lx; waiting",
+                             (unsigned)scr, (unsigned long)w, (unsigned long)expect);
+            }
+        }
+
+        /* In-quest upkeep: calm + resize the Tigrex once it has spawned. */
+        if (scr == 17 && g_qinj_done) qinj_calm_resize();
+    }
+}
+#endif /* MHFU_EMBED_TIGREX_INJECT */
 
 /* ------------------------------------------------------------------------ *
  * Embedded popo_aggression mod.
@@ -2247,6 +2711,31 @@ int main(int argc, char *argv[])
     } else {
         mhfu_log("[framework] sceKernelCreateThread spawn-poll failed: %d", th);
     }
+
+#if MHFU_EMBED_TIGREX_INJECT
+    {
+        SceUID tth = sceKernelCreateThread(
+            "mhfu_tigrex", tigrex_inject_thread,
+            0x18, 0x1000, 0, NULL);
+        if (tth >= 0) {
+            sceKernelStartThread(tth, 0, NULL);
+            mhfu_log("[tigrex] inject thread started (uid=0x%08lx)",
+                     (unsigned long)tth);
+        } else {
+            mhfu_log("[tigrex] inject thread create failed: %d", tth);
+        }
+        /* Sentinels (read via host debugger):
+         *   0x58 &g_qinj_enable   0x5C &g_qinj_installed  0x60 &g_qinj_done
+         *   0x64 &g_qinj_hits     0x68 &g_qinj_t1_emid    0x6C &g_qinj_tigrex_ent */
+        sentinel_set(0x58, (uint32_t)(uintptr_t)&g_qinj_enable);
+        sentinel_set(0x5C, (uint32_t)(uintptr_t)&g_qinj_installed);
+        sentinel_set(0x60, (uint32_t)(uintptr_t)&g_qinj_done);
+        sentinel_set(0x64, (uint32_t)(uintptr_t)&g_qinj_hits);
+        sentinel_set(0x68, (uint32_t)(uintptr_t)&g_qinj_t1_emid);
+        sentinel_set(0x6C, (uint32_t)(uintptr_t)&g_qinj_tigrex_ent);
+        sentinel_set(0x70, (uint32_t)(uintptr_t)&g_qinj_tame_state);
+    }
+#endif
 
 #if MHFU_EMBED_POPO_GROWTH
     {
