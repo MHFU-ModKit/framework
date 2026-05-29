@@ -290,3 +290,97 @@ finishes dispatch, and schedules `cpu.resume`.
   `+0x270` and the game's per-frame sync routine restores `+0x024`
   from one of them inside one frame (≤16 ms). Mods that want a
   visible size change must write all five cells.
+  (`mhfu_entity_set_size()` does this for you.)
+
+---
+
+## 2026-05-29 refactor — C++ core, hookmgr, descriptor mods (AUTHORITATIVE for structure)
+
+The sections above describe the original monolithic design
+(`framework/prx/src/framework.c`, one 2840-line TU with `#if MHFU_EMBED_*`
+mod blocks). That file is gone. The event model, anchor PCs, trampoline
+layout, poll-based spawn detection and the PPSSPP/JIT findings all carry
+over unchanged — only the **code organization** changed. This section is
+authoritative for the new layout; treat the older "Layout"/"source" notes
+as historical.
+
+### Why
+
+`framework.c` did three jobs at once (loader/dispatcher, six embedded mods
+gated by compile flags, and a running RE narrative in block comments). Mods
+reached into core internals (`g_aggressors`, `agg_sort_by_slot`), hand-
+collided sentinel offsets, and patched raw addresses with no arbitration —
+two mods touching the same vtable slot or code word would corrupt silently.
+
+### New shape
+
+```
+include/mhfu/         PUBLIC SDK (extern "C"): events, memory, entity,
+                      hooks, mod, mips, addresses, mhfu umbrella
+src/core/             C++ core, one job per TU:
+  registry.cpp        event registration (priority fan-out) + dispatch + spawn poll
+  trampoline.cpp      event trampolines + code cave + SMC/cache helpers
+  hookmgr (hooks.cpp) ownership table + conflict detection + central restore
+  modtable.cpp        walk MHFU_MOD descriptors, resolve needs/conflicts, init/shutdown
+  memory/entity/region/log/bootstrap.cpp
+mods/<id>/mod.cpp     one mhfu_mod_t descriptor each (MHFU_MOD(...))
+build/mods.manifest   the single selector: which mods compose into the PRX
+```
+
+### C++ discipline (PSP/PRX-safe)
+
+Compiled `-fno-exceptions -fno-rtti -fno-threadsafe-statics`, no STL, no
+virtuals, **no global constructors** (verified: `.ctors` is just the empty
+`ffffffff 00000000` sentinels; no `_GLOBAL__sub_I`/`__cxa_guard`). So it
+links under psp-gcc with no libstdc++ runtime and there is no static-init-
+order hazard. `HookManager` state is a POD file-scope table initialised by
+an explicit `mhfu_hookmgr_init()` from `bootstrap`, never a file-scope
+object with a constructor. All public API is `extern "C"` so export hashes
+and the C SDK header match.
+
+### Mod table (static composition)
+
+`MHFU_MOD(...)` emits a `const mhfu_mod_t` into a linker section
+`mhfu_mods`; GNU ld auto-provides `__start_mhfu_mods` / `__stop_mhfu_mods`,
+which `modtable.cpp` walks. `bootstrap` calls each `init()` after resolving
+`.needs` (dependency ordering, multi-pass) and `.conflicts` (symmetric;
+refuses the later claimant). Adding a mod = drop a `mod.cpp` + add its path
+to `build/mods.manifest`; the Makefile turns each manifest line into a
+`mods/<path>/mod.o`. This replaces every `MHFU_EMBED_*` flag.
+
+### HookManager = the "Harmony" layer
+
+`hooks.h` exposes two hook kinds:
+
+* **Events** — `mhfu_hook_event(id, cb, priority)` (and the `mhfu_on_*`
+  sugar at priority 0). Fan-out; many mods, highest priority first.
+* **Exclusive patches** — `mhfu_hook_function(addr,stub,owner)`,
+  `mhfu_hook_vtable(slot,fn,owner)`, `mhfu_patch_word(addr,word,owner)`.
+  Each claims ONE address; the manager records `{kind, addr, orig, owner}`.
+  A second claimant on the same address gets `MHFU_HOOK_CONFLICT` and is
+  refused — no silent fight. `mhfu_unhook_owner(id)` restores every patch a
+  mod made; the mod table calls it automatically on shutdown, so mods no
+  longer carry their own save/restore code.
+
+### Status & what's verified
+
+Builds green (Docker pspdev); default manifest = `diag` + `tigrex_inject`
+(parity with the historical live behavior); mod-table collects exactly the
+manifest's descriptors; exports intact; no global ctors. **Not yet
+re-verified in-game** — the structural port preserves the live mechanism
+byte-for-byte (same trampoline layout, same tigrex stub + JAL-site patch
+via `mhfu_patch_word`) but PPSSPP runtime re-confirmation is the open item.
+Pre-refactor source is in git at commit `0f634cc`.
+
+### Approach B spike (not done)
+
+True drop-in (the framework `sceKernelLoadModule`s mod PRXes from a folder
+instead of static composition) hinges on whether PPSSPP's 2-plugin wedge
+recurs when the **framework** loads the second module rather than the
+plugin host. Seam: `load_mods()` was the stub for this; in the new core it
+would live in a `src/modtable` dynamic loader. Spike: build one trivial mod
+as a separate `.prx` exporting nothing, have the framework `LoadModule` +
+`StartModule` it after its own init, and watch for the boot wedge. If it
+loads, wire descriptor discovery over loaded modules; if it wedges, approach
+A (static) stays the shipping path. The mod-author API is identical either
+way.

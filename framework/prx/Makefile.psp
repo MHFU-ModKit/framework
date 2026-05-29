@@ -1,19 +1,39 @@
-# PSP-side build for mhfu_framework.prx.
-# Invoked inside the pspdev/pspdev Docker image.
+# PSP-side build for mhfu_framework.prx (C++ core + statically-linked mods).
+# Invoked inside the pspdev/pspdev Docker image (see ./Makefile wrapper).
 
 TARGET = mhfu_framework
-OBJS   = src/framework.o
 
-# Module flags — kernel-mode is unnecessary for our user-mode hooks.
-INCDIR    = include
-CFLAGS    = -O2 -G0 -Wall -fno-strict-aliasing
-CXXFLAGS  = $(CFLAGS)
-ASFLAGS   = $(CFLAGS)
+# Core framework TUs.
+CORE_OBJS = \
+  src/core/log.o \
+  src/core/region.o \
+  src/core/memory.o \
+  src/core/entity.o \
+  src/core/registry.o \
+  src/core/trampoline.o \
+  src/core/hooks.o \
+  src/core/modtable.o \
+  src/core/bootstrap.o
 
-# We export the API symbols (mhfu_register_event, getters, log) so
-# downstream mod-PRXes can import them via the standard PSP module
-# import mechanism. See framework_exports.exp.
-BUILD_PRX  = 1
+# Statically-composed mods come from build/mods.manifest (one path per
+# line, relative to mods/; '#' disables). This is the single selector —
+# add/remove a mod there, no Makefile edit needed.
+MODS     := $(shell grep -vE '^[[:space:]]*(#|$$)' build/mods.manifest)
+MOD_OBJS := $(foreach m,$(MODS),mods/$(m)/mod.o)
+
+OBJS = $(CORE_OBJS) $(MOD_OBJS)
+
+# include/ = public SDK; src/core/ = internal.h
+INCDIR   = include src/core
+CFLAGS   = -O2 -G0 -Wall -fno-strict-aliasing
+# Light C++ only: no exceptions / RTTI / threadsafe-static guards, so the
+# objects link with psp-gcc and pull no libstdc++ runtime.
+CXXFLAGS = $(CFLAGS) -std=gnu++17 -fno-exceptions -fno-rtti -fno-threadsafe-statics
+ASFLAGS  = $(CFLAGS)
+
+# Export the public API symbols so a future separately-loaded mod PRX
+# (approach B) can import them. Static mods resolve directly and ignore this.
+BUILD_PRX   = 1
 PRX_EXPORTS = framework_exports.exp
 
 LIBS = -lpspdebug -lpspdisplay -lpspge -lpspctrl -lpspsdk -lc -lpspuser

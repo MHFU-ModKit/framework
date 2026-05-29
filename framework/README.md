@@ -11,7 +11,7 @@ Two backends share **one event API**:
 | Backend                 | Where it runs                | When to use                                  |
 |-------------------------|------------------------------|----------------------------------------------|
 | **Live (Python)**       | Outside PPSSPP, over the WS debugger | Iterate, debug, RE new events, hot-reload  |
-| **PRX (C, compiled)**   | Inside the emulated PSP, via PPSSPP's plugin loader | Ship to other players, native game speed |
+| **PRX (C++, compiled)** | Inside the emulated PSP, via PPSSPP's plugin loader | Ship to other players, native game speed |
 
 Both expose the same event names; a mod proven out in live mode can be
 ported to a PRX with minimal changes.
@@ -22,17 +22,14 @@ ported to a PRX with minimal changes.
 framework/
 ├── README.md                  this file
 └── prx/
-    ├── README.md              PRX-specific notes
-    ├── include/
-    │   ├── mhfu_framework.h           public mod API
-    │   └── mhfu_framework_addresses.h per-region address table
-    ├── src/
-    │   └── framework.c        the framework PRX itself
-    ├── Makefile               wrapper that drives pspdev Docker
-    ├── Makefile.psp           the actual PSP build
-    ├── framework_exports.exp  symbols downstream mods import
-    └── mods/
-        └── hello_world_prx/   sample mod (mirrors mods/hello_world/)
+    ├── README.md              PRX SDK: layout, authoring, arbitration, gotchas
+    ├── include/mhfu/          public SDK (events, memory, entity, hooks, mod, mips)
+    ├── src/core/              C++ core: registry, trampoline, hookmgr, modtable, bootstrap
+    ├── mods/<id>/mod.cpp      one descriptor mod each (MHFU_MOD(...))
+    ├── mods/experimental/     research hooks (off by default)
+    ├── build/mods.manifest    which mods compose into the single PRX
+    ├── Makefile / Makefile.psp wrapper + PSP build (pspdev Docker)
+    └── framework_exports.exp  symbols a future separate mod PRX imports
 
 src/mhfu_bot/                   (sibling) — Python live-framework runtime
 ├── events/                    high-level mod-facing event API
@@ -65,28 +62,35 @@ def register():
 
 That's it. Run via `scripts/run_hello_world_mod.py` to see it fire.
 
-### PRX (C)
+### PRX (C++)
+
+A mod is one descriptor TU; the framework collects it from the mod table
+and calls `init()`:
 
 ```c
-#include "mhfu_framework.h"
+#include "mhfu/mhfu.h"
 
 static void on_beginning(const mhfu_event_ctx_t *ctx) {
     mhfu_log("Quest starting — timer becoming %u", ctx->cell_value);
 }
-
 static void on_entered(const mhfu_event_ctx_t *ctx) {
+    (void)ctx;
     mhfu_log("Quest entered — area_index = %u", mhfu_get_area_index());
 }
 
-int module_start(SceSize args, void *argp) {
+static int my_init(void) {
     mhfu_on_quest_beginning(on_beginning);
     mhfu_on_quest_entered(on_entered);
     return 0;
 }
+
+MHFU_MOD(.id = "my_mod", .version = "1.0",
+         .needs = 0, .conflicts = 0, .init = my_init, .shutdown = 0);
 ```
 
-Compiles to `hello_world.prx` via the pspdev Docker image; user drops the
-folder into `<memstick>/PSP/PLUGINS/`.
+Add `my_mod` to `prx/build/mods.manifest`, `make` — it composes into the
+single `mhfu_framework.prx`. See `prx/README.md` for hook arbitration
+(events vs exclusive patches) and the JIT-bypass install pattern.
 
 ## Status
 
@@ -100,28 +104,31 @@ folder into `<memstick>/PSP/PLUGINS/`.
 | 6 | PRX framework SDK + trampoline installer | ✅ verified end-to-end (Section 17.3) |
 | 7 | Section-traversal + spawn events (POLL trigger) | ✅ done (Section 17.4) |
 | 8 | First runtime mod: popo_growth | ✅ visually verified in-game (Section 17.4) |
-| 9 | Standalone mod PRXes (linked vs framework exports) | 🟡 builds + links cleanly; co-load with framework wedges MHFU at boot — workaround `MHFU_EMBED_POPO_GROWTH 1` |
-| 10 | Region detection (NA/JP) + on-disk mod enumeration | 🟥 stubbed |
-| 11 | Documentation | ✅ done |
+| 9 | Quest monster-injection mod (Tigrex into Giadrome) | ✅ verified in-game (Section 31) |
+| 10 | **Framework refactor → C++ core + hookmgr + descriptor mods** | ✅ builds (2026-05-29); in-PPSSPP runtime re-verify pending |
+| 11 | Region detection (NA/JP) + approach-B drop-in loader | 🟥 stubbed / spike pending |
+| 12 | Documentation | ✅ done |
 
 The PRX path is proven end-to-end: trampolines patch correctly, the
-spawn-poll thread tracks new entities, and the embedded popo_growth
-mod oscillates Popo `size_scale` 0.35× ↔ 2.0× over a 5 s cycle in
-snowy-mountains section 1 — visually confirmed in real gameplay
-2026-05-25.
+spawn-poll thread tracks new entities, and mods (popo_growth size
+oscillator; tigrex_inject quest injection) drive the engine — visually
+confirmed in real gameplay.
 
-Known open issue: PPSSPP wedges MHFU at boot when two plugin PRXes
-are co-loaded (verified with a degenerate no-op mod), so the working
-binary today inlines mod logic into the framework PRX behind the
-`MHFU_EMBED_POPO_GROWTH 1` compile-time flag. The standalone
-`framework/prx/mods/popo_growth_prx/` source is the canonical mod
-example for when the co-load issue is resolved.
+Architecture (2026-05-29): the old monolithic `framework.c` with
+`#if MHFU_EMBED_*` blocks was replaced by a C++ core (`prx/src/core/`),
+a public SDK (`prx/include/mhfu/`), a **hookmgr** arbitration layer, and
+self-contained descriptor mods (`prx/mods/<id>/mod.cpp`). Because PPSSPP
+wedges with two plugin PRXes co-loaded, mods are **statically composed**
+into the single `mhfu_framework.prx` ("approach A") via
+`prx/build/mods.manifest`. True drop-in loading ("approach B" — the
+framework `LoadModule`s mod PRXes itself) is a pending spike.
 
 ## Where to look next
 
 - **Add a new event**: edit `src/mhfu_bot/events/addresses.py`, then
-  mirror the entry into `framework/prx/include/mhfu_framework_addresses.h`
-  and add an `MHFU_EVENT_*` enum + dispatcher in `framework.c`.
+  mirror the entry into `framework/prx/include/mhfu/addresses.h`, add an
+  `MHFU_EVENT_*` id in `include/mhfu/events.h` + a dispatcher in
+  `src/core/registry.cpp` (and its trampoline in `src/core/trampoline.cpp`).
 - **Add an event filter**: the `_is_event_fire` predicate in
   `src/mhfu_bot/events/dispatcher.py` decides whether a memory-BP fire
   actually corresponds to the event. Tighten it per event.

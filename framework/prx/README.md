@@ -1,245 +1,160 @@
 # MHFU PRX SDK
 
-C SDK for shipping MHFU mods as compiled `.prx` plugins.
+C/C++ SDK for shipping MHFU mods at native game speed as a single
+`mhfu_framework.prx`. Mods are small descriptor modules statically
+composed into that one PRX (PPSSPP wedges with two plugin PRXes
+co-loaded — see "Why one PRX" below).
 
 ## Prerequisites
 
-- **Docker** (the pspdev toolchain ships as a Docker image; building
-  outside it is possible but supported only as a fast path inside
-  the container).
-- Working memstick directory used by PPSSPP — usually
-  `~/Documents/PPSSPP/` on macOS, `~/.config/ppsspp/PSP/` on Linux
-  (and `%USERPROFILE%\Documents\PSP\` on Windows).
+- **Docker** — the pspdev toolchain ships as `pspdev/pspdev:latest`.
+- A PPSSPP memstick dir (macOS: `~/Documents/PPSSPP/PSP/`, Linux:
+  `~/.config/ppsspp/PSP/`, Windows: `%USERPROFILE%/Documents/PSP/`).
 
-## Building the framework PRX
+## Build
 
 ```bash
 cd framework/prx
-make
-# → produces mhfu_framework.prx
+make            # → mhfu_framework.prx (composes the mods in build/mods.manifest)
 ```
 
-The first build pulls `pspdev/pspdev:latest` if you don't have it.
+Which mods are baked in is controlled by **`build/mods.manifest`** (one
+mod path per line, `#` disables). No Makefile edit needed — add a line,
+rebuild. Override for a one-off build with `make host-make MODS="diag tigrex_inject"`.
 
-## Building the sample mod
+## Layout
 
-```bash
-cd framework/prx/mods/hello_world_prx
-make
-# → produces hello_world.prx
+```
+include/mhfu/          PUBLIC SDK — what a mod #includes
+  mhfu.h               umbrella (pulls everything below)
+  events.h             event ids, ctx structs, mhfu_on_* registration
+  memory.h             read/write + named cell getters
+  entity.h             typed entity accessors + registry walk
+  hooks.h              hook arbitration: events + exclusive patches
+  mod.h                mhfu_mod_t descriptor + MHFU_MOD() macro
+  mips.h               Allegrex/MIPS encoder (for mods that build stubs)
+  addresses.h          per-region address table
+src/core/              framework internals (one job per TU)
+  registry.cpp         event registration + dispatch + spawn poll
+  trampoline.cpp       event trampolines + code cave + SMC helpers
+  hooks.cpp            HookManager: ownership table + conflict detection
+  modtable.cpp         walks the MHFU_MOD descriptors, resolves deps
+  memory.cpp entity.cpp region.cpp log.cpp bootstrap.cpp
+  internal.h           cross-TU contract (NOT public)
+mods/<id>/mod.cpp      one descriptor mod each
+mods/experimental/     research hooks (off by default; see status notes)
+build/mods.manifest    which mods compose into the PRX
+framework_exports.exp  symbols exported to a future separate mod PRX
 ```
 
-## Installing on PPSSPP
+The core compiles as light C++ (`-fno-exceptions -fno-rtti
+-fno-threadsafe-statics`, no STL, **no global constructors** — verified
+empty `.ctors`) so it links under psp-gcc with no libstdc++ runtime and
+dodges PSP's unspecified static-init order. All public API is `extern "C"`.
+
+## Authoring a mod
+
+A mod is one TU exposing a descriptor. Minimal:
+
+```c
+#include "mhfu/mhfu.h"
+
+static void on_spawn(const mhfu_monster_spawn_ctx_t *c) {
+    if (c->monster_type == 0x46) mhfu_entity_set_size(c->entity_ptr, 2.0f);
+}
+static int  my_init(void)     { mhfu_on_monster_spawned(on_spawn); return 0; }
+static void my_shutdown(void) {}
+
+MHFU_MOD(.id = "my_mod", .version = "1.0",
+         .needs = 0, .conflicts = 0,
+         .init = my_init, .shutdown = my_shutdown);
+```
+
+Then add `my_mod` to `build/mods.manifest` and `make`. `init()` returns
+0 to load, negative to refuse. Register events, claim hooks, and start
+threads from `init()`.
+
+### Events vs exclusive hooks
+
+- **Events** (`mhfu_on_*` / `mhfu_hook_event(id, cb, priority)`) fan out
+  — many mods may subscribe; all run, highest priority first.
+- **Exclusive patches** claim one address and the framework records the
+  owner + original bytes:
+  - `mhfu_hook_function(addr, stub, "my_mod")` — redirect a function entry.
+  - `mhfu_hook_vtable(slot_addr, fn, "my_mod")` — swap a vtable slot (JIT-immune).
+  - `mhfu_patch_word(addr, word, "my_mod")` — patch one code word (ranged invalidate).
+
+  A second mod claiming the same address gets `MHFU_HOOK_CONFLICT` and is
+  refused. Declare known clashes up front with `.conflicts = "other_mod"`
+  (symmetric) and ordering with `.needs = "dep_mod"`. The framework
+  restores all of a mod's patches on shutdown — mods never save/restore
+  original bytes themselves. Build stubs with `mhfu/mips.h`; after writing
+  a stub buffer call `mhfu_flush_caches()` so the CPU runs it as code.
+
+### Beating the PPSSPP JIT
+
+For a code patch on a function PPSSPP may have already JIT-translated,
+claim it while `mhfu_get_screen_state()` is TITLE (0x04) or MENU (0x01),
+before the target block first executes. `tigrex_inject` does this; see
+docs/FRAMEWORK_ARCHITECTURE.md and the CLAUDE.md JIT notes.
+
+## Why one PRX (and the path to many)
+
+PPSSPP's plugin host wedges MHFU at boot when two plugin PRXes are
+co-loaded (verified; black screen). So mods are **statically composed**
+into `mhfu_framework.prx` via the mod table — one PRX, many mods, with
+conflict arbitration. This is "approach A".
+
+"Approach B" (true drop-in: the framework itself `sceKernelLoadModule`s
+mod PRXes from a folder) is a stretch goal — the wedge *may* not recur
+when the framework loads the module instead of the plugin host, but that
+needs a spike (`load_mods()` is the seam). The mod-author API is
+identical for both, so nothing here is wasted toward B.
+
+## Install on PPSSPP
 
 ```
 <memstick>/PSP/PLUGINS/mhfu_framework/
     mhfu_framework.prx
-    mhfu_framework.ini       (game-id allowlist)
-    framework.log            (created at runtime)
-    mods/
-        hello_world.prx
-        hello_world.ini
+    plugin.ini
+    framework.log        (runtime)
 ```
 
-`mhfu_framework.ini`:
+`plugin.ini` (note: NOT flat key=value — PPSSPP wants these sections):
 ```
-ULES01213 = 1
-ULUS10391 = 1
-ULJM05500 = 1
-```
-
-PPSSPP loads the PRX automatically when one of the listed game IDs is
-detected. Both PRXes appear under **Settings → System → Plugins** (toggle
-to enable/disable without removing files).
-
-## How the SDK is laid out
-
-```
-include/mhfu_framework.h
-    Mod-facing API: mhfu_register_event, mhfu_on_quest_beginning,
-    state getters, logging. STABLE — don't break.
-
-include/mhfu_framework_addresses.h
-    Per-region anchor PCs and observable cells. Updated when new
-    addresses are discovered via the live framework.
-
-src/framework.c
-    The runtime: callback registry, dispatcher functions, log file
-    handling. Skeleton — MIPS trampoline installer is the next thing
-    to land.
-
-framework_exports.exp
-    Symbol export list — controls what downstream mods can import.
-
-mods/hello_world_prx/
-    Sample mod that mirrors mods/hello_world/ (the Python live mod).
-    Same event coverage; same intent; different language and runtime.
+[games]
+ULES01213 = true
+ULUS10391 = true
+ULJM05500 = true
+[options]
+type = prx
+filename = mhfu_framework.prx
+name = MHFU Framework
+version = 1
 ```
 
-## Authoring a new mod
+## Gotchas (all hit the hard way)
 
-1. Copy `mods/hello_world_prx/` to a new directory.
-2. Edit `PSP_MODULE_INFO`, the callback bodies, and the
-   `mhfu_on_*` calls in `module_start`.
-3. `make` — produces `<your_mod>.prx`.
-4. Drop into `<memstick>/PSP/PLUGINS/mhfu_framework/mods/`.
+1. **plugin.ini needs `[games]` + `[options]` sections** — a flat
+   key=value file is silently ignored.
+2. **Module attr = 0 (user mode).** PPSSPP's plugin host is user-mode
+   only; `0x10xx` (kernel) breaks startup.
+3. **crt0_prx provides `module_start`; you provide `main()`.** Defining
+   your own `module_start` is a multiple-definition error.
+4. **Don't return from `main()`** — crt0 then unloads the PRX, killing
+   spawned threads. Spin (`for(;;) sceKernelDelayThread(...)`).
+5. **EBOOT loads in waves.** The install worker waits until both anchor
+   PCs show the original Allegrex `sv.q` (op 0x3E), then patches, then
+   re-installs if a savestate/later load reverts them.
+6. **Savestates created without the plugin don't load it.** Boot fresh,
+   let it install, then save a new state.
+7. **C++ atan2f etc. need `extern "C"`** (or `<math.h>`) or the linker
+   looks for the mangled name.
 
-The headers expose the same name surface as the Python live framework,
-so a mod's callback bodies can usually be ported verbatim — only the
-language changes.
+## Limits today
 
-## How the trampoline installer works
-
-At `module_start`, for each known event the framework:
-
-1. Snapshots the two 4-byte instructions at the anchor PC.
-2. Picks a slot in the static code cave (`g_code_cave[]` — 64-byte
-   aligned BSS array, 30 instructions per slot, 8 slots reserved).
-3. Builds a wrapper into the slot using the local MIPS encoder
-   (`src/mips_encoder.h`):
-   - reserve a 0x40 scratch frame
-   - spill `$a0..$a3`, `$v0`, `$v1`, `$ra`, original `$sp`, anchor PC
-     into 9 contiguous u32 slots (the on-stack
-     `mhfu_anchor_regs_t` layout)
-   - `move $a0, $sp` then `jal mhfu_dispatch_<event>`
-   - restore everything, tear down the frame
-   - replay the two displaced instructions
-   - `j anchor_pc + 8; nop` to resume the original code path
-4. Patches the anchor PC with `j cave; nop`.
-5. Flushes the dcache + icache via `sceKernelDcacheWritebackInvalidateAll`
-   and `sceKernelIcacheInvalidateAll`. PPSSPP picks these up as the
-   signal to retranslate; on real PSP they flush the real CPU caches.
-
-`module_stop` runs the reverse: restore the two original instructions,
-flush caches.
-
-### Vetting an anchor PC
-
-The wrapper copies the two displaced instructions verbatim. If anchor[0]
-or anchor[1] is itself a control-transfer (j/jal/branch), the wrapper
-breaks the original delay-slot relationship. Our two anchors are plain
-`sw` instructions and are safe. Any new event anchor must be checked
-before adding to the address table — disassemble the two words at the
-anchor PC and confirm neither is a branch.
-
-## Validation status (verified 2026-05-25)
-
-What the first build + load-in-PPSSPP confirmed:
-
-- **Build via Docker.** `make` from this directory produces a valid
-  PRX in ~20s. The "stubs out of order" warning from `psp-fixup-imports`
-  is cosmetic — the binary loads and runs.
-- **PPSSPP loads the PRX.** With `plugin.ini` in the standard format
-  (`[games]` + `[options]` sections — *not* a flat key=value INI as
-  one might naively assume), PPSSPP's plugin host finds, parses, and
-  loads the module. Log line: `Loaded plugin: ms0:/PSP/PLUGINS/mhfu_framework/mhfu_framework.prx`.
-- **main() runs.** Sentinel writes at every stage of main confirmed
-  via debugger memory read (`STAGE = 0xCAFE0004`).
-- **Worker thread spawns and runs.** `sceKernelCreateThread` works
-  in PPSSPP plugin context once the module is user-mode (PSP_MODULE_INFO
-  attr = 0, not 0x1007), and once we avoid crt0_prx's default
-  thread-creating bootstrap by defining
-  `int sce_newlib_nocreate_thread_in_start = 1;`.
-- **Trampolines install and persist.** Both anchor PCs read back as
-  `J cave; NOP` after ~1s of game runtime, and remain that way for
-  20+ seconds. A re-install monitor loop catches any case where the
-  game's own EBOOT loading overwrites our patches and reapplies them.
-
-What got verified end-to-end in Section 17.4 (2026-05-25):
-
-- **Wrapper executes through the full dispatcher chain.** With the
-  framework PRX loaded, the anchor at `0x0884CDFC` fires every frame
-  (the dispatcher's change-detect filters down to actual transitions),
-  driving both `mhfu_on_quest_entered` and `mhfu_on_map_section_entered`.
-  Real quest-start triggers `mhfu_on_quest_beginning`.
-- **First runtime mod ships and works.** Embedded `popo_growth`
-  oscillates Popo `size_scale` 0.35× ↔ 2.0× across a 5 s cycle while
-  the player is in section 1 (`area_index == 99`) of the snowy
-  mountains. Visually confirmed in real gameplay.
-- **Spawn poll thread tracks live entities.** Three Popos detected
-  immediately on section-load; `MHFU_EVENT_MONSTER_SPAWNED` dispatches
-  to the mod with monster_type=0x46 + per-entity size_scale +
-  current HP.
-
-Still open:
-
-- **Standalone mod-PRX co-load.** Two plugin PRXes
-  (`mhfu_framework.prx` + any second one — even a no-op test mod)
-  wedge MHFU at boot, screen state stuck at 0 forever. Workaround:
-  inline the mod into the framework PRX behind
-  `MHFU_EMBED_POPO_GROWTH 1`. The standalone mod source at
-  `mods/popo_growth_prx/` builds + links cleanly via inline stub
-  generation (`psp-build-exports -s` in the mod's `Makefile.psp`)
-  and is preserved for the eventual fix.
-- **Savestate compatibility.** PPSSPP does NOT load PRX plugins when
-  the game state is restored from a `--state=` savestate (the savestate
-  was created without the plugin present, so its restored module table
-  doesn't include us). To use the PRX path with a quest-ready
-  starting point: boot fresh, let the plugin install, then *save a new
-  state* and use that one going forward.
-
-## Known gotchas (write these down — we already hit them all)
-
-1. **plugin.ini format.** PPSSPP parses `<plugin_dir>/plugin.ini`
-   (literally that filename) with two sections — `[games]` listing
-   `<DiscID> = true`, and `[options]` with `type = prx`,
-   `filename = <name>.prx`, `name = <human>`, `version = 1`. A flat
-   key=value file (the format you find on random forum posts) is
-   silently ignored.
-
-2. **Module attributes.** `PSP_MODULE_INFO(name, attr, ...)` — the
-   `attr` second arg controls user/kernel mode. PPSSPP plugin host is
-   user-mode-only. Use `0` (PSP_MODULE_USER), not `0x1007` or any
-   `0x10xx` (kernel). Kernel-mode triggers
-   `unsupported thread attributes 0x07` warnings and breaks startup.
-
-3. **crt0_prx wants `main`, not `module_start`.** Modern pspsdk's
-   `crt0_prx.o` already defines `module_start` (as an alias of `_start`).
-   User code provides `main()`; crt0's path runs it. Trying to define
-   your own `module_start` causes "multiple definition" link errors.
-
-4. **Default crt0 spawns a thread that hangs under PPSSPP.** `_start`
-   uses `sceKernelCreateThread` + `sceKernelStartThread` to run main()
-   on a new thread. This hangs silently in PPSSPP plugin context.
-   Define `int sce_newlib_nocreate_thread_in_start = 1;` to bypass
-   the thread bootstrap and call `main()` directly.
-
-5. **Don't return from main().** If `main()` returns, crt0's `_exit()`
-   calls `sceKernelSelfStopUnloadModule` and our PRX gets unloaded —
-   killing any background threads we spawned (and leaving anchor
-   patches pointing into freed memory). Either spin in main() forever
-   (`for (;;) sceKernelDelayThread(...);`) or call the install loop
-   directly from main without returning.
-
-6. **EBOOT loads in two waves.** On PPSSPP at least, the game's text
-   sections at our two anchor PCs arrive in memory at different times.
-   The first attempt to patch quest_beginning succeeded but the game
-   then overwrote it with the original `sv.q` opcode about a second
-   later, while quest_entered stayed patched. Solution: wait until
-   BOTH anchors show the expected original opcode (Allegrex `sv.q`,
-   op=0x3E), wait an additional 500ms, then re-check, then install.
-   And keep a monitor loop running that re-installs if either anchor
-   reverts.
-
-7. **Anchors are Allegrex VFPU stores (`sv.q`), not standard `sw`.**
-   Both `0x088655E4` and `0x0884CDFC` are `sv.q` (op 0x3E) — vector
-   quad stores. These trigger our memory write BPs on the integer cell
-   below them because `sv.q` writes 16 bytes. The trampoline copies
-   the displaced instructions verbatim, so we don't need to special-
-   case them, but anchor-PC vetting must confirm none of the two
-   displaced words is a control transfer.
-
-## Limits today (still)
-
-- **Region detection stubbed**. The framework defaults to EU. For
-  NA/JP, fill in the address tables in `mhfu_framework_addresses.h`
-  via `scripts/re_quest_events.py` with a regional savestate.
-- **On-disk mod enumeration not implemented.** Mod PRXes currently
-  load via PPSSPP's normal plugin mechanism (each gets its own
-  `<memstick>/PSP/PLUGINS/<id>/` folder + INI). The framework's
-  `load_mods()` is a stub.
-- **No hot-reload** — that's a Python-side capability the live
-  framework can give you; for PRX you ship and restart.
-- **Kernel APIs not available**. PPSSPP's plugin host is user-mode
-  only; that's plenty for the events we care about but worth knowing
-  if you start chasing low-level syscall hooks.
+- **Region detection stubbed** → defaults to EU (ULES01213). Fill NA/JP
+  in `include/mhfu/addresses.h`.
+- **Approach B (`load_mods()`) not wired** — static composition only.
+- **No hot reload** — ship and restart (the Python live framework has
+  hot reload for interactive iteration).

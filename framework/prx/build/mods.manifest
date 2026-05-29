@@ -1,0 +1,21 @@
+# Mods statically composed into mhfu_framework.prx.
+#
+# One mod per line, path relative to mods/. Lines starting with # are
+# disabled. The Makefile turns each entry into mods/<entry>/mod.o.
+#
+# Default set = parity with the historical live build (Tigrex inject)
+# plus the diag smoke-test observer. Uncomment a mod to compose it in.
+# Experimental popo hooks are mutually exclusive (they all claim popo
+# vtable/transform code) — the mod table enforces this via .conflicts.
+
+diag
+tigrex_inject
+
+# --- popo behaviour mods (off by default) ---
+# popo_growth
+# popo_aggression
+
+# --- experimental hook techniques (off by default; see docs) ---
+# experimental/popo_vt8_override
+# experimental/popo_vt5_freeze
+# experimental/popo_heading_hook
