@@ -122,6 +122,38 @@ mhfu_hook_rc_t mhfu_off_bigmonster_ai_step      (mhfu_ai_step_cb_t        cb);
 mhfu_hook_rc_t mhfu_off_bigmonster_spawn        (mhfu_bigmonster_spawn_cb_t cb);
 mhfu_hook_rc_t mhfu_off_bigmonster_death        (mhfu_bigmonster_death_cb_t cb);
 
+/* ---- action-ptr cache (tigrex-style pointer resolution) ----------------
+ *
+ * For big monsters whose vt[8] returns a POINTER (currently: tigrex), the
+ * framework snoops every (vt8_input -> engine_id) pair seen on action_decided
+ * and caches it per species. mhfu_action_ptr_for() returns the cached ptr
+ * for an input — 0 if not yet observed.
+ *
+ * This is the convenience surface for forcing a specific tigrex action:
+ *
+ *   static uint32_t pin_to_charge(const mhfu_action_decision_ctx_t *ctx,
+ *                                  uint32_t engine_value) {
+ *       if (ctx->monster_type == MON_TIGREX) {
+ *           uint32_t p = mhfu_action_ptr_for(MON_TIGREX,
+ *                                            TIGREX_VT8_INPUT_0x04B1);
+ *           if (p) return p;       // force this action whenever cached
+ *       }
+ *       return engine_value;       // abstain if not seen yet
+ *   }
+ *
+ * Returns 0 if the input hasn't been observed yet — the engine must have
+ * picked that action at least once this run. (A future helper would call
+ * the original vt[8] directly to populate the cache eagerly; deferred
+ * because vt[8] has VFPU + RNG side effects that we don't want to
+ * perturb on speculative calls.)
+ *
+ * Cache size: 96 entries per species (popo/anteka/tigrex/giadrome).
+ */
+uint32_t mhfu_action_ptr_for(uint8_t monster_type, uint16_t vt8_input);
+int      mhfu_action_cache_size(uint8_t monster_type);
+int      mhfu_action_cache_entry(uint8_t monster_type, int index,
+                                 uint16_t *out_input, uint32_t *out_ptr);
+
 /* --- helpers --------------------------------------------------------- */
 
 /* Returns the entity ptr whose +0x190 == action_list_ptr by scanning the

@@ -200,15 +200,96 @@ extern "C" uint32_t mhfu_entity_from_action_list(uint32_t action_list_ptr)
  * Dispatcher ABI: (a0=entity, a1=vt8_input, a2=engine_action_id) -> v0
  */
 
+/* --- per-species (vt8_input -> ptr) cache --------------------------------
+ * Big-monster (tigrex-style) vt[8] returns a per-run pointer into a
+ * per-entity probability sub-table; the pointer varies across runs but the
+ * input is stable. We snoop every observed pair and expose the cache via
+ * mhfu_action_ptr_for() so mods can pin "give me the ptr the engine
+ * resolved for THIS input last time we saw it" — the only safe way to
+ * force a specific tigrex action without re-running vt[8] (which has
+ * VFPU side effects and a small RNG path that we don't want to perturb).
+ *
+ * 4 species slots (popo / anteka / tigrex / giadrome); 96 entries each is
+ * comfortably above the 54 unique inputs observed live for tigrex.
+ */
+#define ACT_CACHE_PER_SPECIES 96
+
+typedef struct { uint16_t input; uint16_t _pad; uint32_t ptr; } act_cache_entry_t;
+
+static act_cache_entry_t g_act_cache[4][ACT_CACHE_PER_SPECIES];
+static int               g_act_cache_n[4];
+
+static int species_cache_index(uint8_t type)
+{
+    switch (type) {
+        case 0x46: return 0;   /* POPO     */
+        case 0x45: return 1;   /* ANTEKA   */
+        case 0x4B: return 2;   /* TIGREX   */
+        case 0x4D: return 3;   /* GIADROME */
+        default:   return -1;
+    }
+}
+
+static void ai_cache_remember(uint8_t type, uint16_t input, uint32_t ptr)
+{
+    if (ptr == 0) return;          /* probe miss — don't cache "no action" */
+    int sp = species_cache_index(type);
+    if (sp < 0) return;
+    /* Refresh existing entry if present. */
+    for (int i = 0; i < g_act_cache_n[sp]; i++) {
+        if (g_act_cache[sp][i].input == input) {
+            g_act_cache[sp][i].ptr = ptr;
+            return;
+        }
+    }
+    if (g_act_cache_n[sp] >= ACT_CACHE_PER_SPECIES) return;   /* full — drop */
+    g_act_cache[sp][g_act_cache_n[sp]].input = input;
+    g_act_cache[sp][g_act_cache_n[sp]].ptr   = ptr;
+    g_act_cache_n[sp]++;
+}
+
+extern "C" uint32_t mhfu_action_ptr_for(uint8_t monster_type, uint16_t input)
+{
+    int sp = species_cache_index(monster_type);
+    if (sp < 0) return 0;
+    for (int i = 0; i < g_act_cache_n[sp]; i++) {
+        if (g_act_cache[sp][i].input == input) return g_act_cache[sp][i].ptr;
+    }
+    return 0;
+}
+
+extern "C" int mhfu_action_cache_size(uint8_t monster_type)
+{
+    int sp = species_cache_index(monster_type);
+    return (sp < 0) ? 0 : g_act_cache_n[sp];
+}
+
+extern "C" int mhfu_action_cache_entry(uint8_t monster_type, int i,
+                                       uint16_t *out_input, uint32_t *out_ptr)
+{
+    int sp = species_cache_index(monster_type);
+    if (sp < 0 || i < 0 || i >= g_act_cache_n[sp]) return 0;
+    if (out_input) *out_input = g_act_cache[sp][i].input;
+    if (out_ptr)   *out_ptr   = g_act_cache[sp][i].ptr;
+    return 1;
+}
+
 extern "C" uint32_t mhfu_ai_action_dispatch_c(
     uint32_t entity, uint32_t vt8_input, uint32_t engine_action_id)
 {
-    if (g_action_n == 0) return engine_action_id;
     if (!mhfu_entity_is_big_monster(entity)) return engine_action_id;
+
+    /* Snoop the (input, ptr) pair into the per-species cache regardless of
+     * whether any mod has subscribed — so resolution works the moment a
+     * mod calls mhfu_action_ptr_for(). */
+    uint8_t type = mhfu_entity_type(entity);
+    ai_cache_remember(type, (uint16_t)(vt8_input & 0xFFFF), engine_action_id);
+
+    if (g_action_n == 0) return engine_action_id;
 
     mhfu_action_decision_ctx_t ctx;
     ctx.entity_ptr   = entity;
-    ctx.monster_type = mhfu_entity_type(entity);
+    ctx.monster_type = type;
     ctx.slot         = 0;                          /* lost at vt[8] return  */
     ctx.vt8_input    = (uint16_t)(vt8_input & 0xFFFF);
 
