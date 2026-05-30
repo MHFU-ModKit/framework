@@ -8,9 +8,11 @@
  * the species table, fixed by the engine.
  *
  * SMALL monsters (popo/anteka) use the species data table +0x0C action list.
- * BIG monsters (Tigrex/Giadrome) have an empty +0x0C; their action list lives
- * elsewhere (per CLAUDE.md §19g.3 the dispatcher swaps entity+0x640 at runtime
- * from a global table 0x09BD38F0). Extracting it needs the monster live; deferred.
+ * GIADROME (also classified 'big' in quest UI but with small-mon AI shape) DOES
+ * have a +0x0C action list — runtime-allocated, identical record format.
+ * TIGREX is the true outlier: its +0x0C is hitzone data, not an action list.
+ * vt[8] returns POINTERS into the probability table at entity+0x1AC for tigrex,
+ * so an action_id enum doesn't apply cleanly — TIGREX_ACTION_* macros are omitted.
  *
  * Regenerate after a species data table change:
  *   PYTHONPATH=src python tools/dump_species_actions.py
@@ -83,7 +85,41 @@ extern "C" {
 
 /* tigrex (0x4B) — no action list available */
 
-/* giadrome (0x4D) — no action list available */
+/* giadrome (type 0x4D) — 34 actions */
+#define GIADROME_ACTION_0x0060           0x0060u  /* slot 0, dur 9000 (300.0s) */
+#define GIADROME_ACTION_0x0061           0x0061u  /* slot 1, dur 9000 (300.0s) */
+#define GIADROME_ACTION_0x044B           0x044Bu  /* slot 2, dur 5400 (180.0s) */
+#define GIADROME_ACTION_0x044C           0x044Cu  /* slot 3, dur 3600 (120.0s) */
+#define GIADROME_ACTION_0x0070           0x0070u  /* slot 4, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x0459           0x0459u  /* slot 5, dur 5400 (180.0s) */
+#define GIADROME_ACTION_0x0073           0x0073u  /* slot 6, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x045C           0x045Cu  /* slot 7, dur 5400 (180.0s) */
+#define GIADROME_ACTION_0x045E           0x045Eu  /* slot 8, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x008D           0x008Du  /* slot 9, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x0476           0x0476u  /* slot 10, dur 3600 (120.0s) */
+#define GIADROME_ACTION_0x0477           0x0477u  /* slot 11, dur 3600 (120.0s) */
+#define GIADROME_ACTION_0x0091           0x0091u  /* slot 12, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x047D           0x047Du  /* slot 13, dur 5400 (180.0s) */
+#define GIADROME_ACTION_0x00C9           0x00C9u  /* slot 14, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x00CA           0x00CAu  /* slot 15, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x04B3           0x04B3u  /* slot 16, dur 3600 (120.0s) */
+#define GIADROME_ACTION_0x04B7           0x04B7u  /* slot 17, dur 5400 (180.0s) */
+#define GIADROME_ACTION_0x00D3           0x00D3u  /* slot 18, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x00D4           0x00D4u  /* slot 19, dur 9000 (300.0s) */
+#define GIADROME_ACTION_0x04C2           0x04C2u  /* slot 20, dur 5400 (180.0s) */
+#define GIADROME_ACTION_0x04C3           0x04C3u  /* slot 21, dur 3600 (120.0s) */
+#define GIADROME_ACTION_0x00DE           0x00DEu  /* slot 22, dur 9000 (300.0s) */
+#define GIADROME_ACTION_0x00DF           0x00DFu  /* slot 23, dur 9000 (300.0s) */
+#define GIADROME_ACTION_0x00E1           0x00E1u  /* slot 24, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x00E2           0x00E2u  /* slot 25, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x00E4           0x00E4u  /* slot 26, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x00E6           0x00E6u  /* slot 27, dur 3600 (120.0s) */
+#define GIADROME_ACTION_0x00E7           0x00E7u  /* slot 28, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x00F9           0x00F9u  /* slot 29, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x00FB           0x00FBu  /* slot 30, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x00FC           0x00FCu  /* slot 31, dur 7200 (240.0s) */
+#define GIADROME_ACTION_0x00FD           0x00FDu  /* slot 32, dur 5400 (180.0s) */
+#define GIADROME_ACTION_0x00FE           0x00FEu  /* slot 33, dur 7200 (240.0s) */
 
 /* Predicate: is `id` a valid action for `species` (member of its list)? */
 int mhfu_action_is_valid(uint8_t monster_type, uint32_t action_id);

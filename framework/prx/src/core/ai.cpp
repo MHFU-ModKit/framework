@@ -26,34 +26,42 @@
 #include "mhfu/hooks.h"
 #include "internal.h"
 
-/* Action-validity tables (popo + anteka), generated alongside ai_actions.h.
- * Big monsters have no static table — accept all IDs for them. */
-static const uint16_t POPO_VALID[] = {
-    0x0060, 0x0061, 0x0064, 0x0070, 0x0071, 0x0073, 0x0074, 0x0076,
-    0x009C, 0x009D, 0x009E, 0x009F, 0x00A0,
-};
-#define POPO_VALID_N (int)(sizeof(POPO_VALID)/sizeof(POPO_VALID[0]))
-
-static const uint16_t ANTEKA_VALID[] = {
-    0x0043, 0x0044, 0x0045, 0x0047, 0x0048, 0x0049, 0x004B, 0x0457,
-    0x0071, 0x0072, 0x008C, 0x008D, 0x008E, 0x008F, 0x0091, 0x0094,
-    0x0095, 0x0096, 0x00A6, 0x00A7, 0x00C9, 0x00CA, 0x00CB, 0x00D2,
-    0x00D3, 0x00D4, 0x04C1, 0x00DE, 0x00DF, 0x00E2, 0x00E4, 0x00E7,
-    0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00EF, 0x00F0, 0x00F5, 0x00F6,
-};
-#define ANTEKA_VALID_N (int)(sizeof(ANTEKA_VALID)/sizeof(ANTEKA_VALID[0]))
+/* Action-validity walker — reads the species data table at runtime so the
+ * predicate auto-updates if the game's species data changes. Eliminates the
+ * need for hand-maintained tables in lockstep with ai_actions.h.
+ *
+ * Popo / anteka / giadrome all use the same (u16 id, u16 dur) record format
+ * at species_entry+0x0C (8-byte header skipped). Tigrex's +0x0C is hitzone
+ * data instead — its action selection is pointer-based via the probability
+ * table at entity+0x1AC (Section 32h, 2026-05-30) — so id validation can't
+ * apply; we accept all for tigrex.
+ */
+#define SPECIES_TABLE_BASE   0x09BB87C0u
+#define SPECIES_STRIDE       0x1D0u
+#define ACTION_LIST_PTR_OFF  0x0Cu
+#define ACTION_LIST_HEADER   0x08u
+#define ACTION_REC_SIZE      0x04u
 
 extern "C" int mhfu_action_is_valid(uint8_t monster_type, uint32_t action_id)
 {
-    const uint16_t *t = 0; int n = 0;
-    switch (monster_type) {
-        case 0x46: t = POPO_VALID;   n = POPO_VALID_N;   break;
-        case 0x45: t = ANTEKA_VALID; n = ANTEKA_VALID_N; break;
-        case 0x4B: case 0x4D: return 1;   /* big monster — no static table; accept */
-        default: return 0;
+    /* True big monster — engine returns pointers, not IDs. */
+    if (monster_type == 0x4B) return 1;
+    /* Unknown / unsupported species. */
+    if (monster_type != 0x45 && monster_type != 0x46 && monster_type != 0x4D)
+        return 0;
+
+    uint32_t entry = SPECIES_TABLE_BASE + (uint32_t)monster_type * SPECIES_STRIDE;
+    uint32_t list_ptr = *(volatile uint32_t *)(entry + ACTION_LIST_PTR_OFF);
+    if (list_ptr < 0x08000000u || list_ptr >= 0x0A000000u) return 0;
+
+    uint16_t id16 = (uint16_t)(action_id & 0xFFFFu);
+    uint32_t rec  = list_ptr + ACTION_LIST_HEADER;
+    for (int i = 0; i < 128; i++) {
+        uint16_t aid = *(volatile uint16_t *)(rec + 0);
+        if (aid == 0xFFFFu || aid == 0) return 0;
+        if (aid == id16) return 1;
+        rec += ACTION_REC_SIZE;
     }
-    uint16_t id16 = (uint16_t)(action_id & 0xFFFF);
-    for (int i = 0; i < n; i++) if (t[i] == id16) return 1;
     return 0;
 }
 
@@ -277,18 +285,65 @@ extern "C" void mhfu_ai_step_dispatch_c(uint32_t entity)
     for (int i = 0; i < g_step_n; i++) g_step_chain[i].cb(&ctx);
 }
 
+/* Entry-detour wrapper for z_un_08865648 (the per-frame per-entity AI tick).
+ *
+ * Patches:
+ *    addr+0x00:  ADDIU sp,sp,-0x20  -> J wrapper        (0x27BDFFE0 -> J)
+ *    addr+0x04:  SW    ra,0xC(sp)   -> NOP              (0xAFBF000C -> 0)
+ *
+ * Wrapper executes (12 insns):
+ *    its own frame -> save ra/a0 -> jal helper(a0=entity) -> restore ra/a0
+ *    -> displaced ADDIU sp,sp,-0x20 -> displaced SW ra,0xC(sp)
+ *    -> J  addr+0x08  (resume function body where it expects post-prologue
+ *                      state — sp decremented, ra saved).
+ *
+ * Quiet-gate the two patches at TITLE/MENU (Section 26 pattern): the EBOOT
+ * is loaded but z_un_08865648 hasn't yet executed, so JIT pre-cache is
+ * dodged — first translation of the block picks up our redirect.
+ */
 static int install_step_hook(void)
 {
     if (g_step_hook_installed) return 0;
-    /* z_un_08865648 has many call sites; the call-wrapper API needs a real
-     * call_site argument. The clean wiring is to patch the function entry
-     * with `J wrapper; NOP` where the wrapper preserves a0, calls the
-     * helper, and resumes the function body by jumping back to addr+8 with
-     * the orig insns copied into the wrapper -- a proper detour. Deferred
-     * to a follow-up so we don't ship a half-wired hook. */
-    mhfu_log("[ai] ai_step wiring not implemented yet -- registered handlers "
-             "will not fire until detour lands");
-    g_step_hook_installed = 1;   /* mark to avoid retry-spam */
+
+    uint32_t *w = mhfu_cave_alloc(16);
+    if (!w) { mhfu_log("[ai] cave exhausted for ai_step wrapper"); return -1; }
+
+    uint32_t helper = (uint32_t)(uintptr_t)&mhfu_ai_step_dispatch_c;
+    int i = 0;
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);     /* our frame */
+    w[i++] = mips_sw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A0, 0x10, MIPS_REG_SP);
+    w[i++] = mips_jal  (helper);
+    w[i++] = MIPS_NOP;                                         /* delay slot */
+    w[i++] = mips_lw   (MIPS_REG_A0, 0x10, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);       /* pop our frame */
+    /* Replay displaced prologue (2 insns we overwrote). */
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);
+    w[i++] = mips_sw   (MIPS_REG_RA, 0x0C, MIPS_REG_SP);
+    /* Resume function at the next un-displaced insn. */
+    w[i++] = mips_j    (AI_STEP_TICK_ENTRY + 0x08);
+    w[i++] = MIPS_NOP;                                         /* J delay slot */
+    while (i < 16) w[i++] = MIPS_NOP;
+    mhfu_flush_caches();
+
+    uint32_t orig0 = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);
+    uint32_t orig1 = mips_sw(MIPS_REG_RA, 0x0C, MIPS_REG_SP);
+    uint32_t new0  = mips_j((uint32_t)(uintptr_t)w);
+    uint32_t new1  = MIPS_NOP;
+
+    mhfu_hook_rc_t r0 = mhfu_patch_word_when_quiet(
+        AI_STEP_TICK_ENTRY + 0x00, orig0, new0, AI_OWNER_TAG);
+    mhfu_hook_rc_t r1 = mhfu_patch_word_when_quiet(
+        AI_STEP_TICK_ENTRY + 0x04, orig1, new1, AI_OWNER_TAG);
+    if (r0 != MHFU_HOOK_OK || r1 != MHFU_HOOK_OK) {
+        mhfu_log("[ai] ai_step queue failed (r0=%d r1=%d)", (int)r0, (int)r1);
+        return -1;
+    }
+
+    g_step_hook_installed = 1;
+    mhfu_log("[ai] ai_step entry detour queued @ 0x%08X (wrapper 0x%08X)",
+             AI_STEP_TICK_ENTRY, (unsigned)(uintptr_t)w);
     return 0;
 }
 

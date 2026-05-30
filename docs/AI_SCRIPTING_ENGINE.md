@@ -548,3 +548,128 @@ different semantics — not the same as the engine's anim resolve).
    it appears; correlate with action ID.
 6. **Disasm `z_un_0885f928`** (action→anim resolver) — confirm it has
    no third pick layer and document its anim-graph traversal.
+
+# Section 32h — `ai_step` entry detour LIVE + big-monster action list RE (2026-05-30)
+
+## ai_step wiring (task #35)
+
+`mhfu_on_bigmonster_ai_step(cb, priority)` is now LIVE-installed via an
+entry-detour on `z_un_08865648` (the per-frame per-entity AI tick).
+
+### Mechanism
+
+JAL-caller scan of EBOOT + overlay found only **2** call sites:
+
+| Caller | Region | Context |
+|--------|--------|---------|
+| `0x09A74ECC` | OVL_A | per-entity tick chain (a0=entity from $s0) |
+| `0x09AD3D6C` | OVL_B | transform/init path (reads +0x1F0/1F4/1F8 first) |
+
+Both are in overlay (`0x09Axxxxx`), so we can't wrap a call-site behind
+the TITLE/MENU gate (overlay isn't loaded then; `expect`-check fails).
+Instead we patch the EBOOT entry of `z_un_08865648` itself.
+
+Prologue (5 insns, only first 2 displaced):
+
+```
+0x08865648  ADDIU sp,sp,-0x20    = 0x27BDFFE0   <- replaced with J wrapper
+0x0886564C  SW    ra,0xC(sp)     = 0xAFBF000C   <- replaced with NOP
+0x08865650  SW    s2,0x8(sp)     = 0xAFB20008   (untouched — function resumes here)
+0x08865654  SW    s1,0x4(sp)     = 0xAFB10004
+0x08865658  MOVE  s2,a0          = 0x00809021
+```
+
+### Wrapper (12 insns, in code cave)
+
+```
+wrapper:
+  addiu sp,sp,-0x20             ; our frame
+  sw    ra,0x18(sp)             ; save caller ra
+  sw    a0,0x10(sp)             ; save entity arg
+  jal   mhfu_ai_step_dispatch_c ; helper(a0=entity)
+  nop
+  lw    a0,0x10(sp)             ; restore a0
+  lw    ra,0x18(sp)             ; restore ra
+  addiu sp,sp, 0x20             ; pop our frame
+  addiu sp,sp,-0x20             ; replay displaced insn 1
+  sw    ra,0xC(sp)              ; replay displaced insn 2
+  j     0x08865650              ; resume function at entry+0x08
+  nop                           ; J delay slot
+```
+
+Two deferred-quiet-patches land both words in the same poll iteration so
+the JIT race window is microseconds.
+
+### Live verification (cold boot, no PRX bypass)
+
+```
+[ai] action_decided installed on 4 species vt[8] slots
+[ai] ai_step entry detour queued @ 0x08865648 (wrapper 0x09D87F50)
+[hook] 'mhfu_ai' word @0x08865648 = 0x0a761fd4 (was 0x27bdffe0)  <- J 0x09D87F50
+[install] quiet-patched 0x08865648 for 'mhfu_ai'
+[hook] 'mhfu_ai' word @0x0886564c = 0x00000000 (was 0xafbf000c)  <- NOP
+[install] quiet-patched 0x0886564c for 'mhfu_ai'
+```
+
+Wrapper disasm matches the spec exactly. `JAL` target lands on the
+PRX-resident `mhfu_ai_step_dispatch_c` (`0x09D677F4` in this build).
+
+## Big-monster action list RE (task #36)
+
+### Tigrex (type 0x4B)
+
+* `species_entry @ 0x09BC0FB0` (`0x09BB87C0 + 0x4B * 0x1D0`).
+* **`+0x0C = 0x09BCF138` is NOT an action list** — it's hitzone data:
+  16-byte (u16,u16) header `(0x0708, 0x2328)`, then a hitzone-material
+  byte table (00/01/02/03 quadrants), then u32 numerics + float
+  hitbox/range values.
+* `entity+0x640` deref points at a per-entity scratch list with 8-byte
+  records `(u8 idx, u8 0xFF marker, u32 zeros, u16 param_a, u16 param_b)`
+  — looks like per-action damage/range params, not the action repertoire.
+* Action selection for tigrex flows through vt[8] (`0x08865254`) reading
+  the **probability table at `entity+0x1AC` = 0x09426760**, and vt[8]
+  returns POINTERS into that table — not u16 action IDs.
+
+Override mods on tigrex therefore return *pointer values* (e.g.
+`0x094270F8`, `0x094D69F4` — observed engine picks in the giadrome smoke
+log) rather than enum IDs. A u16 action-id enum doesn't apply cleanly,
+so `mhfu/ai_actions.h` omits TIGREX_ACTION_*.
+
+### Giadrome (type 0x4D)
+
+* `species_entry @ 0x09BC1350` (`0x09BB87C0 + 0x4D * 0x1D0`).
+* `+0x0C = 0x09D58570` (runtime-allocated in RAM heap; not present in
+  giadrome_intro_sec6_edge but populated in tigrex_s6).
+* Same `(u16 id, u16 duration_ticks)` record format as popo/anteka after
+  an 8-byte header. **34 actions** — enumerated in `mhfu/ai_actions.h`
+  as `GIADROME_ACTION_0x????`. Tigrex_s6 was the state where the list is
+  fully resident.
+
+Giadrome is classified "big" in the quest UI (counts as a quest target)
+but its AI shape is the same as small monsters — fixed action list,
+duration ticks, vt[8] returns u16 IDs not pointers.
+
+### Global `0x09BD38F0`
+
+Per CLAUDE.md §19g.3 this is the "big-monster runtime action list table".
+First 11 records have format `(u8 action_id, u8 0xFF, u8 0, u8 sub_idx,
+u16 0, u16 duration_ticks)` with action IDs `{0x00, 0x14, 0x16, 0x17,
+0x18, 0x19, 0x1A, 0x1C, 0x1D, 0x1E, 0x1F}` and duration 236 ticks each.
+After offset 0x58 the data switches to floats (per-action range/hitbox
+params). This is the source for big-monster types whose `+0x640` is
+runtime-swapped (type 0x3A per §19g.3 — not tigrex / not giadrome). Not
+needed for the current SDK; revisit when a 0x3A monster is RE'd.
+
+### `mhfu_action_is_valid` rewrite
+
+Was a hand-maintained static array per species. Now walks the species
+table at runtime:
+
+```c
+if (type == 0x4B) return 1;                          // tigrex — pointers
+if (type not in {0x45, 0x46, 0x4D}) return 0;
+list_ptr = *(u32 *)(0x09BB87C0 + type*0x1D0 + 0x0C);
+walk (u16 id, u16 dur) records after 8-byte header until 0xFFFF/0.
+```
+
+Auto-updates when species data changes, removes a stale-table bug class.
