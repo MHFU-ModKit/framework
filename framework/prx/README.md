@@ -121,14 +121,11 @@ hook the per-frame per-entity tick `z_un_08865648` and its sub-calls
 (`docs/AI_SCRIPTING_ENGINE.md`):
 
 - `mhfu_on_bigmonster_action_decided(cb, priority)` — fires after vt[8]
-  picks an action_id. Sync override: `cb(ctx, engine_value) -> new_value`.
+  picks an outcome pointer from the species probability table at
+  `entity+0x1AC`. Sync override: `cb(ctx, engine_value) -> new_value`.
   Priority-chain (higher first); each handler sees the previous handler's
   return as its input. Return `engine_value` unchanged to abstain.
   JIT-immune (vt[8] swap on shared `0x08865254`).
-- `mhfu_on_bigmonster_anim_decided(cb, priority)` — fires after the
-  action→anim resolver `z_un_0885f928` returns. Same override semantics.
-  *(Wiring deferred — JAL trampoline still to land; registrations are
-  accepted but won't fire yet.)*
 - `mhfu_on_bigmonster_ai_step(cb, priority)` — observe-only, per-frame
   per-entity. *(Wiring deferred — entry detour still to land.)*
 - `mhfu_on_bigmonster_spawn(cb, priority)` — observe; fires when a big

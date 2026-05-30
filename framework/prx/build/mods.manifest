@@ -16,6 +16,7 @@ tigrex_inject
 # popo_aggression
 
 # --- experimental hook techniques (off by default; see docs) ---
+# experimental/ai_demo
 # experimental/popo_vt8_override
 # experimental/popo_vt5_freeze
 # experimental/popo_heading_hook

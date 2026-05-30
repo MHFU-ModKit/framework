@@ -41,17 +41,6 @@ static uint32_t low_pri_action(const mhfu_action_decision_ctx_t *ctx,
     return chain_value;
 }
 
-/* Anim override (chain of 1).  Stub for when the JAL trampoline lands. */
-static uint32_t demo_anim(const mhfu_anim_decision_ctx_t *ctx,
-                          uint32_t engine_anim_node_ptr)
-{
-    mhfu_log("[ai_demo] anim     entity=0x%08lx action=0x%08lx node_ptr=0x%08lx",
-             (unsigned long)ctx->entity_ptr,
-             (unsigned long)ctx->action_id,
-             (unsigned long)engine_anim_node_ptr);
-    return engine_anim_node_ptr;
-}
-
 static void demo_spawn(const mhfu_bigmonster_spawn_ctx_t *ctx)
 {
     mhfu_log("[ai_demo] SPAWN  slot=%d entity=0x%08lx type=0x%02x hp=%u",
@@ -81,7 +70,6 @@ static int ai_demo_init(void)
 {
     mhfu_on_bigmonster_action_decided(high_pri_action, /* priority */ 100);
     mhfu_on_bigmonster_action_decided(low_pri_action,  /* priority */ 0);
-    mhfu_on_bigmonster_anim_decided  (demo_anim,       /* priority */ 0);
     mhfu_on_bigmonster_ai_step       (demo_step,       /* priority */ 0);
     mhfu_on_bigmonster_spawn         (demo_spawn,      /* priority */ 0);
     mhfu_on_bigmonster_death         (demo_death,      /* priority */ 0);
@@ -93,7 +81,6 @@ static void ai_demo_shutdown(void)
 {
     mhfu_off_bigmonster_action_decided(high_pri_action);
     mhfu_off_bigmonster_action_decided(low_pri_action);
-    mhfu_off_bigmonster_anim_decided  (demo_anim);
     mhfu_off_bigmonster_ai_step       (demo_step);
     mhfu_off_bigmonster_spawn         (demo_spawn);
     mhfu_off_bigmonster_death         (demo_death);

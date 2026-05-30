@@ -87,15 +87,12 @@ static const species_vt_t g_species_vts[] = {
 /* --- chain storage --------------------------------------------------- */
 
 typedef struct { mhfu_action_override_cb_t cb; int priority; } action_entry_t;
-typedef struct { mhfu_anim_override_cb_t   cb; int priority; } anim_entry_t;
 typedef struct { mhfu_ai_step_cb_t         cb; int priority; } step_entry_t;
 typedef struct { mhfu_bigmonster_spawn_cb_t cb; int priority; } bmspawn_entry_t;
 typedef struct { mhfu_bigmonster_death_cb_t cb; int priority; } bmdeath_entry_t;
 
 static action_entry_t  g_action_chain[MAX_HANDLERS];
 static int             g_action_n = 0;
-static anim_entry_t    g_anim_chain[MAX_HANDLERS];
-static int             g_anim_n = 0;
 static step_entry_t    g_step_chain[MAX_HANDLERS];
 static int             g_step_n = 0;
 static bmspawn_entry_t g_bmspawn_chain[MAX_HANDLERS];
@@ -108,7 +105,6 @@ static uint16_t        g_last_hp[MHFU_ENTITY_REGISTRY_SLOTS];
 static uint8_t         g_was_big[MHFU_ENTITY_REGISTRY_SLOTS];
 
 static int            g_action_hook_installed = 0;
-static int            g_anim_hook_installed   = 0;
 static int            g_step_hook_installed   = 0;
 
 /* Cave-allocated stubs (set on first install). */
@@ -296,23 +292,6 @@ static int install_step_hook(void)
     return 0;
 }
 
-/* --- anim_decided (deferred wiring) ---------------------------------- */
-
-/* The hook would trampoline over the JAL @ 0x0885F9C8 -> z_un_0885f928.
- * The wrapper would call the original, fire the override chain, and
- * write the result back to $v0 before flow continues into MOVE a1, v0
- * at 0x0885F9D0. This requires a custom wrapper that exposes $v0 to the
- * helper (the existing mhfu_install_call_wrapper helper signature only
- * sees $a0). Deferred to a follow-up: see internal.h notes. */
-static int install_anim_hook(void)
-{
-    if (g_anim_hook_installed) return 0;
-    mhfu_log("[ai] anim_decided wiring not implemented yet — registered handlers "
-             "will not fire until JAL trampoline lands");
-    g_anim_hook_installed = 1;   /* mark to avoid retry-spam */
-    return 0;
-}
-
 /* --- public registration --------------------------------------------- */
 
 extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_action_decided(
@@ -321,15 +300,6 @@ extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_action_decided(
     if (!cb) return MHFU_HOOK_BADARG;
     if (install_action_hook() != 0) return MHFU_HOOK_CONFLICT;
     CHAIN_INSERT(g_action_chain, g_action_n, MAX_HANDLERS, cb, priority);
-    return MHFU_HOOK_OK;
-}
-
-extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_anim_decided(
-    mhfu_anim_override_cb_t cb, int priority)
-{
-    if (!cb) return MHFU_HOOK_BADARG;
-    install_anim_hook();
-    CHAIN_INSERT(g_anim_chain, g_anim_n, MAX_HANDLERS, cb, priority);
     return MHFU_HOOK_OK;
 }
 
@@ -347,13 +317,6 @@ extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_action_decided(
 {
     if (!cb) return MHFU_HOOK_BADARG;
     CHAIN_REMOVE(g_action_chain, g_action_n, cb);
-}
-
-extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_anim_decided(
-    mhfu_anim_override_cb_t cb)
-{
-    if (!cb) return MHFU_HOOK_BADARG;
-    CHAIN_REMOVE(g_anim_chain, g_anim_n, cb);
 }
 
 extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_ai_step(

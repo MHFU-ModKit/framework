@@ -391,8 +391,9 @@ cells.
 ## Section 32d (2026-05-30) — Per-frame tick + override hook points
 
 Driving the modding-framework override-event design (Q-set on
-`on_bigmonster_action_decided` + `_anim_decided`). Re-RE'd the full
-per-entity AI tick chain end-to-end.
+`on_bigmonster_action_decided`). Re-RE'd the full per-entity AI tick
+chain end-to-end. (See §32g for why the originally-proposed
+`anim_decided` event was dropped.)
 
 ### Per-entity AI tick `z_un_08865648` (real caller of walker)
 
@@ -476,26 +477,59 @@ Slot 0's root-motion delta is mirrored to `entity+0x40/0x44/0x48`
 
 | Event | Hook site | Type | Layer |
 |-------|-----------|------|-------|
-| `on_bigmonster_action_decided` | vt[8] = `0x08865254` swap (Section 22 pattern) | sync override, $v0 mutable | high-level action |
-| `on_bigmonster_anim_decided`   | JAL at `0x0885F9CC` → `z_un_0885f928` return | sync override, $v0 mutable | specific anim graph node |
+| `on_bigmonster_action_decided` | vt[8] = `0x08865254` swap (Section 22 pattern) | sync override, $v0 mutable | behavioral pick |
 | `on_bigmonster_ai_step`        | enter `z_un_08865648` (per-frame per-entity) | observe-only | tick |
 
-All three hooks are EBOOT-resident. Section 26 JIT bypass (install at
-TITLE/MENU before first quest tick) applies to `0x08865648` /
-`0x0885F9CC` patches. vt[8] swap is JIT-immune (data lookup).
+The two hooks are EBOOT-resident. Section 26 JIT bypass (install at
+TITLE/MENU before first quest tick) applies to `0x08865648`. vt[8] swap
+is JIT-immune (data lookup).
 
 ### Mod-side concept maps
 
-- `action_id` = high-level behavior selector (lunge / circle / roar /
-  charge). Picked by vt[8] from species probability table at
-  `entity+0x1AC`. Format from CLAUDE.md §19e.2 = list of
-  `(u16 action_id, u16 duration_ticks)` pairs.
-- `anim_node_ptr` = the specific anim graph node `z_un_0885f928`
-  resolves an action_id to. The node holds anim asset references
-  + blend params.
+- `outcome_ptr` (returned by vt[8]) = pointer into the per-species
+  probability table at `entity+0x1AC`. Pointing at the chosen "action"
+  record — a behavioral outcome with associated anim asset references
+  embedded.
+- `slot_state_ptr` (returned by `z_un_0885f928`) = the per-slot
+  state-container node found by walking the action_list tree against
+  the slot index. Where state lives, not what to play.
 
-So **action_decided** lets mod replace WHAT the monster does;
-**anim_decided** lets mod replace HOW that action's anim is realised.
+So **action_decided** lets mod replace WHAT the monster does. (We
+considered an `anim_decided` hook on `z_un_0885f928` — see §32g below
+for why it was dropped.)
+
+## Section 32g (2026-05-30) — anim_decided collapses to action_decided
+
+The framework initially proposed two override layers
+(`action_decided` + `anim_decided`) on the theory that `z_un_0885f928`
+transformed vt[8]'s output. RE'ing both functions live disproved that:
+
+**vt[8] = `z_un_08865254` (34 insns)** returns the picked outcome:
+- `0x3E8` sentinel ("no species table at +0x1AC")
+- `0` ("no entry matched")
+- else **`prob_table_base + offset` — a pointer INTO the species
+  probability table** at `entity+0x1AC`. Smoke confirmed live values
+  like `0x094270f8`, `0x094D69F4`, `0x09503F38` — overlay-range
+  pointers into the species table data.
+
+**z_un_0885f928 (30 insns)** is NOT a transform of vt[8]'s output. It
+takes `(a0=action_list, a1=root_node_ptr (= action_list_ptr), a2=slot_idx)`
+and walks the action_list tree searching for a node whose `+0x114` u16
+== `slot_idx`. Returns that **slot's state-container node** (or 0).
+Independent of vt[8].
+
+Both values then flow into the applier `z_un_0885f848` separately:
+- `a1` = slot_state_ptr (from z_un_0885f928)
+- `a2` = outcome_ptr     (from vt[8])
+
+So action_decided alone captures all behavioral override surface. The
+former `anim_decided` would have hooked a structural state-container
+lookup, which mods don't typically want.
+
+Decision: **removed `mhfu_on_bigmonster_anim_decided` from the SDK**.
+If a future need for hooking the slot-state lookup arises, it can be
+re-added as `on_bigmonster_slot_state_resolved` (different event with
+different semantics — not the same as the engine's anim resolve).
 
 ## Open follow-ups
 
