@@ -325,19 +325,82 @@ from a PRX, we can trigger custom scripted scenes by demo_id.
 `re_event_trace.py` is the keeper — future "drive + observe" tasks
 should reuse it rather than write new ad-hoc snippets.
 
+## Unification (Section 32b, 2026-05-30 continued)
+
+The slot-installer hunt produced a **major reframe** of the
+interpretation above. A code-BP at `z_un_088637C4` entry captured
+`a0 = 0x090BD5B0 = giadrome + 0x80`, NOT the giadrome entity itself.
+Re-mapping all offsets against `entity+0x80` as the base:
+
+| Driver-arg offset | Equivalent entity offset | Existing CLAUDE.md role |
+|---|---|---|
+| `a0 + 0x110` | `entity + 0x190` | **action-list ptr** (read by applier `z_un_08863e70`, CLAUDE.md §19) |
+| `a0 + 0x122` | `entity + 0x1A2` | **Action count (loop bound)** (already documented) |
+| `a0 + 0x14C` deref | within action descriptor | descriptor-walk field |
+
+So `z_un_088637C4` is **the per-frame action-list walker** of the
+existing generic AI engine — *not a new system*. The "scripting
+slots" I described above are the **action-descriptor slots** already
+documented at `entity+0x1A0..+0x1FF` in CLAUDE.md `agent_memory_map.md`,
+with stride `0x40` and count capped by `+0x1A2`.
+
+Caller function = `z_un_08865044` (EBOOT). 0x6F0 bytes into that
+function is the JALR to z_un_088637C4. The caller does big VFPU /
+transform / quaternion work (it's a render-matrix pipeline), so this
+is the SKELETON UPDATE call site — it invokes the action-list walker
+to advance the entity's running animation each frame.
+
+The "cutscene driver" I was hunting is just **the action-list walker
+running on a custom action list installed at `entity+0x190`** during
+the scripted intro.
+
+### Where the installer lives
+
+CLAUDE.md §19 traces the normal-AI install path:
+
+  dispatcher `0x09AC5400` (overlay) reads `entity+0x324` seed →
+  vt[8] = `0x08865254` (probability lookup over `entity+0x1AC`
+  species table) → returns 32-bit anim ID → `z_un_08863e70`
+  (applier) applies it via `z_un_0885f9a0`.
+
+For the **cutscene**, the dispatcher path must be bypassed: something
+writes `entity+0x190` directly with a custom action-list ptr (and
+`entity+0x1A2` count). Candidate installer locations:
+- A cutscene-specific overlay function that mirrors the dispatcher's
+  output side but consumes a hardcoded action list (from quest data).
+- The Evdemo `func_eboot_088D0824` trigger function (EU equivalent
+  still unknown, but Section 32b shows its action would land here).
+
+### Refined injection-point story for mods
+
+To run a custom scripted animation on any monster:
+
+1. Allocate a custom action-descriptor block in RAM (format = pairs
+   of `(u16 action_id, u16 duration_ticks)` per CLAUDE.md §19e.2,
+   plus the action data the picker indexes into).
+2. Write its ptr into `entity+0x190` (= the action-list ptr).
+3. Write the action count into `entity+0x1A2` (u16).
+4. The engine's per-frame walker `z_un_088637C4` will tick through
+   it for free.
+
+This is the same surface used by the cutscene system — proven by
+the giadrome intro live RE. Modders writing per-monster behaviour
+just need to populate the action-descriptor block + flip those two
+cells.
+
 ## Open follow-ups (next session)
 
-1. **Pin the slot installer** — mem-BP `entity+0x122` AND `entity+0x110`
-   during cutscene START (not mid-cutscene). Capture writer PC. That
-   PC + its args = the API for activating scripted slots.
-2. **Slot data format** — re-RE `z_un_088637C4`'s sub-callees
-   (`z_un_0885fb54`, `z_un_0885ff5c`, `z_un_08862fe0`) to fully
-   decode each slot field.
-3. **Pin EU Evdemo singleton** — static scan for a 0xA0-byte
-   structure pattern in `0x09A40000..0x09A60000`. Verify by trying
-   `func_eboot_088D0824(ev, 0, 0)` for benign demo_id.
-4. **Verify normal AI usage** — sample `entity+0x122` for popo while
-   in normal aggression. If non-zero at any moment, the slot system
-   IS used for combat AI, not just cutscenes.
-5. **Map `state byte = 3`** at `entity+0x334` — observe when else it
-   appears; correlate with anim ID.
+1. **Find the explicit installer call** that writes `entity+0x190`
+   during cutscene init. Once we have its PC + arg signature we can
+   call it directly from a PRX. Candidate: scan for `SW $rT,
+   0x190($rS)` in EBOOT (= `0x110($rS)` if $rS = entity+0x80).
+2. **Verify normal AI usage** — sample `entity+0x1A2` for popo
+   during normal aggression. If non-zero, action-list walker is
+   the same mechanism for combat AI (very likely, given §19).
+3. **Slot field format** — re-RE the action-descriptor sub-records
+   pointed at by the `+0x14C` deref. CLAUDE.md §19e.1 has partial
+   info; reconcile with what `z_un_088637C4` reads.
+4. **EU Evdemo singleton** — still deferred (3 approaches failed
+   Section 32b). $gp-relative scan next time.
+5. **Map `state byte = 3`** at `entity+0x334` — observe when else
+   it appears; correlate with action ID.
