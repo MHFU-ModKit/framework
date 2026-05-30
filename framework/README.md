@@ -105,7 +105,7 @@ single `mhfu_framework.prx`. See `prx/README.md` for hook arbitration
 | 7 | Section-traversal + spawn events (POLL trigger) | ✅ done (Section 17.4) |
 | 8 | First runtime mod: popo_growth | ✅ visually verified in-game (Section 17.4) |
 | 9 | Quest monster-injection mod (Tigrex into Giadrome) | ✅ verified in-game (Section 31) |
-| 10 | **Framework refactor → C++ core + hookmgr + descriptor mods** | ✅ builds (2026-05-29); in-PPSSPP runtime re-verify pending |
+| 10 | **Framework refactor → C++ core + hookmgr + descriptor mods + typed SDK** | ✅ builds + in-PPSSPP runtime re-verified (2026-05-30; Tigrex injection on snow Giadrome quest) |
 | 11 | Region detection (NA/JP) + approach-B drop-in loader | 🟥 stubbed / spike pending |
 | 12 | Documentation | ✅ done |
 

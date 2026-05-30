@@ -366,11 +366,16 @@ to `build/mods.manifest`; the Makefile turns each manifest line into a
 
 Builds green (Docker pspdev); default manifest = `diag` + `tigrex_inject`
 (parity with the historical live behavior); mod-table collects exactly the
-manifest's descriptors; exports intact; no global ctors. **Not yet
-re-verified in-game** — the structural port preserves the live mechanism
-byte-for-byte (same trampoline layout, same tigrex stub + JAL-site patch
-via `mhfu_patch_word`) but PPSSPP runtime re-confirmation is the open item.
-Pre-refactor source is in git at commit `0f634cc`.
+manifest's descriptors; exports intact; no global ctors. Pre-refactor source
+is in git at commit `0f634cc`.
+
+**In-PPSSPP runtime verified 2026-05-30** (cold boot on the snow Giadrome
+quest): typed API + `mhfu_quest_replace_monster(GIADROME, TIGREX)` from
+`MHFU_EVENT_QUEST_TARGETS_BUILDING` retags the parsed buffer, the engine
+loads the Tigrex model + spawns at Giadrome's native coords, and the
+Tigrex roams sections 6/7/8 normally — visually found in section 6
+(area_index=100). The mod's tame thread keeps him calm + size 0.5×.
+See memory `snow-map-section6-and-draw-interp`.
 
 ### Approach B spike (not done)
 
