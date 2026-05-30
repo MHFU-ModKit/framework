@@ -17,6 +17,11 @@ typedef enum {
     MON_GIADROME = 0x4D,
 } mhfu_monster_id_t;
 
+/* Return a stable upper-case name for a monster type byte
+ * (entity+0x1E8 / quest record emId). Unknown types get "0xNN".
+ * Pointer is to static storage; do not free. */
+const char *mhfu_monster_name(unsigned int monster_type);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

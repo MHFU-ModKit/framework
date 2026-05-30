@@ -128,4 +128,69 @@ int mhfu_action_is_valid(uint8_t monster_type, uint32_t action_id);
 } /* extern "C" */
 #endif
 
+
+/* tigrex VT8_INPUT macros — observed live (regenerate with tools/dump_tigrex_inputs.py) */
+/* vt8_input values for Tigrex are STABLE across runs (keyed by species
+ * probability table). The ENGINE_ID pointer vt[8] returns for each is NOT
+ * stable — it depends on per-run RAM allocation. Use these macros to MATCH
+ * on the input in an action_decided callback; for OVERRIDE, cache the ptr
+ * the engine returns for the input you want and re-return it later. */
+/* 50 action inputs + 4 probe inputs */
+#define TIGREX_VT8_INPUT_0x0001    0x0001u  /* observed -> 0x094270F8 */
+#define TIGREX_VT8_INPUT_0x00C9    0x00C9u  /* observed -> 0x094D69F4 */
+#define TIGREX_VT8_INPUT_0x0191    0x0191u  /* observed -> 0x09503F38 */
+#define TIGREX_VT8_INPUT_0x03E9    0x03E9u  /* observed -> 0x094270F8 */
+#define TIGREX_VT8_INPUT_0x03EB    0x03EBu  /* observed -> 0x09429E54 */
+#define TIGREX_VT8_INPUT_0x03ED    0x03EDu  /* observed -> 0x0942F268 */
+#define TIGREX_VT8_INPUT_0x03EE    0x03EEu  /* observed -> 0x094310C0 */
+#define TIGREX_VT8_INPUT_0x03F3    0x03F3u  /* observed -> 0x0943C254 */
+#define TIGREX_VT8_INPUT_0x03F6    0x03F6u  /* observed -> 0x09443220 */
+#define TIGREX_VT8_INPUT_0x03F7    0x03F7u  /* observed -> 0x0944466C */
+#define TIGREX_VT8_INPUT_0x03FA    0x03FAu  /* observed -> 0x09448E58 */
+#define TIGREX_VT8_INPUT_0x03FB    0x03FBu  /* observed -> 0x0944E044 */
+#define TIGREX_VT8_INPUT_0x03FF    0x03FFu  /* observed -> 0x094591E0 */
+#define TIGREX_VT8_INPUT_0x0406    0x0406u  /* observed -> 0x0945B05C */
+#define TIGREX_VT8_INPUT_0x0407    0x0407u  /* observed -> 0x0945C570 */
+#define TIGREX_VT8_INPUT_0x0408    0x0408u  /* observed -> 0x0945DADC */
+#define TIGREX_VT8_INPUT_0x0438    0x0438u  /* observed -> 0x094C4C04 */
+#define TIGREX_VT8_INPUT_0x0442    0x0442u  /* observed -> 0x094CC668 */
+#define TIGREX_VT8_INPUT_0x04B1    0x04B1u  /* observed -> 0x094D69F4 */
+#define TIGREX_VT8_INPUT_0x04B3    0x04B3u  /* observed -> 0x094D7628 */
+#define TIGREX_VT8_INPUT_0x04B5    0x04B5u  /* observed -> 0x094D85D4 */
+#define TIGREX_VT8_INPUT_0x04B6    0x04B6u  /* observed -> 0x094D8DB8 */
+#define TIGREX_VT8_INPUT_0x04BB    0x04BBu  /* observed -> 0x094DBAF8 */
+#define TIGREX_VT8_INPUT_0x04BE    0x04BEu  /* observed -> 0x094DD524 */
+#define TIGREX_VT8_INPUT_0x04BF    0x04BFu  /* observed -> 0x094DD8F4 */
+#define TIGREX_VT8_INPUT_0x04C2    0x04C2u  /* observed -> 0x094DE724 */
+#define TIGREX_VT8_INPUT_0x04C3    0x04C3u  /* observed -> 0x094DF088 */
+#define TIGREX_VT8_INPUT_0x04C7    0x04C7u  /* observed -> 0x094E1EE0 */
+#define TIGREX_VT8_INPUT_0x04C8    0x04C8u  /* observed -> 0x094E22B8 */
+#define TIGREX_VT8_INPUT_0x04C9    0x04C9u  /* observed -> 0x094E2DF8 */
+#define TIGREX_VT8_INPUT_0x04CE    0x04CEu  /* observed -> 0x094E3670 */
+#define TIGREX_VT8_INPUT_0x04CF    0x04CFu  /* observed -> 0x094E3A60 */
+#define TIGREX_VT8_INPUT_0x04D0    0x04D0u  /* observed -> 0x094E3F18 */
+#define TIGREX_VT8_INPUT_0x0500    0x0500u  /* observed -> 0x094FE758 */
+#define TIGREX_VT8_INPUT_0x050A    0x050Au  /* observed -> 0x09500760 */
+#define TIGREX_VT8_INPUT_0x0579    0x0579u  /* observed -> 0x09503F38 */
+#define TIGREX_VT8_INPUT_0x057B    0x057Bu  /* observed -> 0x095046B4 */
+#define TIGREX_VT8_INPUT_0x057D    0x057Du  /* observed -> 0x09505258 */
+#define TIGREX_VT8_INPUT_0x057E    0x057Eu  /* observed -> 0x09505674 */
+#define TIGREX_VT8_INPUT_0x0583    0x0583u  /* observed -> 0x09507374 */
+#define TIGREX_VT8_INPUT_0x0586    0x0586u  /* observed -> 0x095087DC */
+#define TIGREX_VT8_INPUT_0x0587    0x0587u  /* observed -> 0x09508A0C */
+#define TIGREX_VT8_INPUT_0x058A    0x058Au  /* observed -> 0x09509254 */
+#define TIGREX_VT8_INPUT_0x058B    0x058Bu  /* observed -> 0x0950985C */
+#define TIGREX_VT8_INPUT_0x058F    0x058Fu  /* observed -> 0x0950AF7C */
+#define TIGREX_VT8_INPUT_0x0596    0x0596u  /* observed -> 0x0950B1EC */
+#define TIGREX_VT8_INPUT_0x0597    0x0597u  /* observed -> 0x0950B45C */
+#define TIGREX_VT8_INPUT_0x0598    0x0598u  /* observed -> 0x0950B734 */
+#define TIGREX_VT8_INPUT_0x05C8    0x05C8u  /* observed -> 0x0951A778 */
+#define TIGREX_VT8_INPUT_0x05D2    0x05D2u  /* observed -> 0x0951BF8C */
+
+/* Probe inputs (vt[8] returns 0 — used by engine to test if slot exists) */
+#define TIGREX_VT8_PROBE_0x0000    0x0000u
+#define TIGREX_VT8_PROBE_0x00C8    0x00C8u
+#define TIGREX_VT8_PROBE_0x0190    0x0190u
+#define TIGREX_VT8_PROBE_0x0258    0x0258u
+
 #endif /* MHFU_AI_ACTIONS_H */

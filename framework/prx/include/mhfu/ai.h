@@ -86,7 +86,19 @@ typedef void (*mhfu_bigmonster_death_cb_t)(const mhfu_bigmonster_death_ctx_t *ct
 /* Override handlers: receive the engine's current decision (already
  * threaded through any higher-priority mods in the chain) plus context;
  * return the value to forward.  Return `engine_value` unchanged to
- * abstain. */
+ * abstain.
+ *
+ * IMPORTANT — the meaning of `engine_action_id` differs by species class:
+ *   * Small-monster-shape (POPO, ANTEKA, GIADROME): a u16 action ID,
+ *     zero-extended into u32. Return a value from the matching
+ *     `<SPECIES>_ACTION_*` macros in `ai_actions.h`.
+ *   * True-big-monster-shape (TIGREX): a POINTER into the per-entity
+ *     probability table at entity+0x1AC. Pointer values vary per run, so
+ *     mods must CACHE a ptr they see for a given `ctx->vt8_input` and
+ *     re-return that ptr later. Use `TIGREX_VT8_INPUT_*` macros to match
+ *     on the (stable) input value; never return a small numeric literal
+ *     as a "tigrex action ID" — it will be dereferenced as a pointer.
+ */
 typedef uint32_t (*mhfu_action_override_cb_t)(
     const mhfu_action_decision_ctx_t *ctx, uint32_t engine_action_id);
 

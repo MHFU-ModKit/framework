@@ -34,6 +34,7 @@ PSP_EXPORT_FUNC_HASH(mhfu_on_bigmonster_spawn)
 PSP_EXPORT_FUNC_HASH(mhfu_on_bigmonster_death)
 PSP_EXPORT_FUNC_HASH(mhfu_off_bigmonster_spawn)
 PSP_EXPORT_FUNC_HASH(mhfu_off_bigmonster_death)
+PSP_EXPORT_FUNC_HASH(mhfu_monster_name)
 PSP_EXPORT_END
 
 PSP_END_EXPORTS
