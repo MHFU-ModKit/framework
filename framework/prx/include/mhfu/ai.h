@@ -68,6 +68,25 @@ typedef struct {
     uint8_t  _pad[3];
 } mhfu_ai_step_ctx_t;
 
+/* Spawn / death observe events.  Big-monster filtered. */
+typedef struct {
+    uint32_t entity_ptr;
+    int      slot;          /* entity-registry slot 1..20 */
+    uint8_t  monster_type;
+    uint8_t  _pad[3];
+    uint16_t initial_hp;
+} mhfu_bigmonster_spawn_ctx_t;
+
+typedef struct {
+    uint32_t entity_ptr;
+    int      slot;
+    uint8_t  monster_type;
+    uint8_t  _pad[3];
+} mhfu_bigmonster_death_ctx_t;
+
+typedef void (*mhfu_bigmonster_spawn_cb_t)(const mhfu_bigmonster_spawn_ctx_t *ctx);
+typedef void (*mhfu_bigmonster_death_cb_t)(const mhfu_bigmonster_death_ctx_t *ctx);
+
 /* --- handler signatures ---------------------------------------------- */
 
 /* Override handlers: receive the engine's current decision (already
@@ -92,9 +111,16 @@ mhfu_hook_rc_t mhfu_on_bigmonster_anim_decided(
 mhfu_hook_rc_t mhfu_on_bigmonster_ai_step(
     mhfu_ai_step_cb_t cb, int priority);
 
+mhfu_hook_rc_t mhfu_on_bigmonster_spawn(
+    mhfu_bigmonster_spawn_cb_t cb, int priority);
+mhfu_hook_rc_t mhfu_on_bigmonster_death(
+    mhfu_bigmonster_death_cb_t cb, int priority);
+
 mhfu_hook_rc_t mhfu_off_bigmonster_action_decided(mhfu_action_override_cb_t cb);
 mhfu_hook_rc_t mhfu_off_bigmonster_anim_decided (mhfu_anim_override_cb_t  cb);
 mhfu_hook_rc_t mhfu_off_bigmonster_ai_step      (mhfu_ai_step_cb_t        cb);
+mhfu_hook_rc_t mhfu_off_bigmonster_spawn        (mhfu_bigmonster_spawn_cb_t cb);
+mhfu_hook_rc_t mhfu_off_bigmonster_death        (mhfu_bigmonster_death_cb_t cb);
 
 /* --- helpers --------------------------------------------------------- */
 

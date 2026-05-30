@@ -134,14 +134,19 @@ static uint32_t g_last_entity_ptrs[MHFU_ENTITY_REGISTRY_SLOTS];
 
 static void dispatch_monster_spawned(int slot, uint32_t ent)
 {
+    uint8_t  type = mhfu_entity_type(ent);
+    uint16_t hp   = mhfu_entity_hp(ent);
+    /* always inform ai.cpp — it filters big-monster + maintains HP tracker */
+    mhfu_ai_on_monster_spawn(slot, ent, type, hp);
+
     if (mhfu_registry_count(MHFU_EVENT_MONSTER_SPAWNED) == 0) return;
     mhfu_monster_spawn_ctx_t c;
     c.event_id     = MHFU_EVENT_MONSTER_SPAWNED;
     c.slot         = slot;
     c.entity_ptr   = ent;
-    c.monster_type = mhfu_entity_type(ent);
+    c.monster_type = type;
     c.entity_id    = *(volatile uint8_t *)(ent + MHFU_ENT_ENTITY_ID);
-    c.hp           = mhfu_entity_hp(ent);
+    c.hp           = hp;
     c.size_scale   = mhfu_entity_size(ent);
     mhfu_registry_fire(MHFU_EVENT_MONSTER_SPAWNED, &c);
 }
@@ -158,11 +163,13 @@ extern "C" int mhfu_monster_spawn_poll_thread(SceSize args, void *argp)
                 if (prev != 0) g_last_entity_ptrs[slot] = 0;
                 continue;
             }
-            if (cur == prev) continue;
-            if (cur < 0x08000000u || cur > 0x0A000000u) continue;
-            g_last_entity_ptrs[slot] = cur;
-            dispatch_monster_spawned(slot, cur);
+            if (cur != prev && cur >= 0x08000000u && cur <= 0x0A000000u) {
+                g_last_entity_ptrs[slot] = cur;
+                dispatch_monster_spawned(slot, cur);
+            }
         }
+        /* death detection for big monsters lives in ai.cpp's tracker */
+        mhfu_ai_poll_death();
     }
     return 0;
 }

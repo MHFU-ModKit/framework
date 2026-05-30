@@ -89,13 +89,23 @@ static const species_vt_t g_species_vts[] = {
 typedef struct { mhfu_action_override_cb_t cb; int priority; } action_entry_t;
 typedef struct { mhfu_anim_override_cb_t   cb; int priority; } anim_entry_t;
 typedef struct { mhfu_ai_step_cb_t         cb; int priority; } step_entry_t;
+typedef struct { mhfu_bigmonster_spawn_cb_t cb; int priority; } bmspawn_entry_t;
+typedef struct { mhfu_bigmonster_death_cb_t cb; int priority; } bmdeath_entry_t;
 
-static action_entry_t g_action_chain[MAX_HANDLERS];
-static int            g_action_n = 0;
-static anim_entry_t   g_anim_chain[MAX_HANDLERS];
-static int            g_anim_n = 0;
-static step_entry_t   g_step_chain[MAX_HANDLERS];
-static int            g_step_n = 0;
+static action_entry_t  g_action_chain[MAX_HANDLERS];
+static int             g_action_n = 0;
+static anim_entry_t    g_anim_chain[MAX_HANDLERS];
+static int             g_anim_n = 0;
+static step_entry_t    g_step_chain[MAX_HANDLERS];
+static int             g_step_n = 0;
+static bmspawn_entry_t g_bmspawn_chain[MAX_HANDLERS];
+static int             g_bmspawn_n = 0;
+static bmdeath_entry_t g_bmdeath_chain[MAX_HANDLERS];
+static int             g_bmdeath_n = 0;
+
+/* HP transition tracker (used for death edge). Indexed by registry slot. */
+static uint16_t        g_last_hp[MHFU_ENTITY_REGISTRY_SLOTS];
+static uint8_t         g_was_big[MHFU_ENTITY_REGISTRY_SLOTS];
 
 static int            g_action_hook_installed = 0;
 static int            g_anim_hook_installed   = 0;
@@ -351,4 +361,79 @@ extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_ai_step(
 {
     if (!cb) return MHFU_HOOK_BADARG;
     CHAIN_REMOVE(g_step_chain, g_step_n, cb);
+}
+
+/* --- spawn / death observe ------------------------------------------ */
+
+extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_spawn(
+    mhfu_bigmonster_spawn_cb_t cb, int priority)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    CHAIN_INSERT(g_bmspawn_chain, g_bmspawn_n, MAX_HANDLERS, cb, priority);
+    return MHFU_HOOK_OK;
+}
+
+extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_death(
+    mhfu_bigmonster_death_cb_t cb, int priority)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    CHAIN_INSERT(g_bmdeath_chain, g_bmdeath_n, MAX_HANDLERS, cb, priority);
+    return MHFU_HOOK_OK;
+}
+
+extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_spawn(mhfu_bigmonster_spawn_cb_t cb)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    CHAIN_REMOVE(g_bmspawn_chain, g_bmspawn_n, cb);
+}
+
+extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_death(mhfu_bigmonster_death_cb_t cb)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    CHAIN_REMOVE(g_bmdeath_chain, g_bmdeath_n, cb);
+}
+
+/* Called by registry.cpp on the existing monster_spawned event when a
+ * new entity ptr appears in a registry slot. We filter big-monster and
+ * fan out our chain.  Also seeds the HP tracker. */
+extern "C" void mhfu_ai_on_monster_spawn(int slot, uint32_t entity, uint8_t type,
+                                         uint16_t hp)
+{
+    if (slot <= 0 || slot >= MHFU_ENTITY_REGISTRY_SLOTS) return;
+    int is_big = mhfu_entity_is_big_monster(entity);
+    g_was_big[slot] = (uint8_t)is_big;
+    g_last_hp[slot] = hp;
+    if (!is_big) return;
+    if (g_bmspawn_n == 0) return;
+    mhfu_bigmonster_spawn_ctx_t c;
+    c.entity_ptr   = entity;
+    c.slot         = slot;
+    c.monster_type = type;
+    c._pad[0] = c._pad[1] = c._pad[2] = 0;
+    c.initial_hp   = hp;
+    for (int i = 0; i < g_bmspawn_n; i++) g_bmspawn_chain[i].cb(&c);
+}
+
+/* Run from the monster-spawn poll thread (alongside the slot-ptr walk):
+ * for each big-monster slot, watch HP > 0 -> 0 edge. */
+extern "C" void mhfu_ai_poll_death(void)
+{
+    if (g_bmdeath_n == 0) return;
+    for (int slot = 1; slot < MHFU_ENTITY_REGISTRY_SLOTS; slot++) {
+        if (!g_was_big[slot]) continue;
+        uint32_t e = mhfu_entity_at(slot);
+        if (!e) { g_was_big[slot] = 0; continue; }
+        uint16_t hp = mhfu_entity_hp(e);
+        uint16_t prev = g_last_hp[slot];
+        g_last_hp[slot] = hp;
+        if (prev > 0 && hp == 0) {
+            mhfu_bigmonster_death_ctx_t c;
+            c.entity_ptr   = e;
+            c.slot         = slot;
+            c.monster_type = mhfu_entity_type(e);
+            c._pad[0] = c._pad[1] = c._pad[2] = 0;
+            for (int i = 0; i < g_bmdeath_n; i++) g_bmdeath_chain[i].cb(&c);
+            g_was_big[slot] = 0;     /* one-shot — avoid re-firing on respawn */
+        }
+    }
 }

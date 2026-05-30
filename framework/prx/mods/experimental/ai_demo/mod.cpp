@@ -52,6 +52,20 @@ static uint32_t demo_anim(const mhfu_anim_decision_ctx_t *ctx,
     return engine_anim_node_ptr;
 }
 
+static void demo_spawn(const mhfu_bigmonster_spawn_ctx_t *ctx)
+{
+    mhfu_log("[ai_demo] SPAWN  slot=%d entity=0x%08lx type=0x%02x hp=%u",
+             ctx->slot, (unsigned long)ctx->entity_ptr,
+             (unsigned)ctx->monster_type, (unsigned)ctx->initial_hp);
+}
+
+static void demo_death(const mhfu_bigmonster_death_ctx_t *ctx)
+{
+    mhfu_log("[ai_demo] DEATH  slot=%d entity=0x%08lx type=0x%02x",
+             ctx->slot, (unsigned long)ctx->entity_ptr,
+             (unsigned)ctx->monster_type);
+}
+
 /* Observe-only AI step.  Fires every frame for each big monster. */
 static void demo_step(const mhfu_ai_step_ctx_t *ctx)
 {
@@ -69,6 +83,8 @@ static int ai_demo_init(void)
     mhfu_on_bigmonster_action_decided(low_pri_action,  /* priority */ 0);
     mhfu_on_bigmonster_anim_decided  (demo_anim,       /* priority */ 0);
     mhfu_on_bigmonster_ai_step       (demo_step,       /* priority */ 0);
+    mhfu_on_bigmonster_spawn         (demo_spawn,      /* priority */ 0);
+    mhfu_on_bigmonster_death         (demo_death,      /* priority */ 0);
     mhfu_log("[ai_demo] registered");
     return 0;
 }
@@ -79,6 +95,8 @@ static void ai_demo_shutdown(void)
     mhfu_off_bigmonster_action_decided(low_pri_action);
     mhfu_off_bigmonster_anim_decided  (demo_anim);
     mhfu_off_bigmonster_ai_step       (demo_step);
+    mhfu_off_bigmonster_spawn         (demo_spawn);
+    mhfu_off_bigmonster_death         (demo_death);
 }
 
 MHFU_MOD(.id = MOD_ID, .version = "0.1-experimental",

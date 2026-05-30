@@ -56,6 +56,10 @@ void mhfu_hookmgr_init(void);
 void mhfu_mods_init_all(void);
 void mhfu_mods_shutdown_all(void);
 
+/* --- AI events (ai.cpp) --- */
+void mhfu_ai_on_monster_spawn(int slot, uint32_t entity, uint8_t type, uint16_t hp);
+void mhfu_ai_poll_death(void);
+
 /* --- quest domain (quest.cpp) --- */
 /* Installs the buildTargets wrapper IFF a mod subscribed to
  * MHFU_EVENT_QUEST_TARGETS_BUILDING. Call after mhfu_mods_init_all(). */
