@@ -673,3 +673,86 @@ walk (u16 id, u16 dur) records after 8-byte header until 0xFFFF/0.
 ```
 
 Auto-updates when species data changes, removes a stale-table bug class.
+
+# Section 32i — picker-vs-tick disambiguation + tigrex ptr cache (2026-05-30)
+
+## Two hooks, two purposes
+
+A common confusion: "isn't the picker the better hook than the per-frame
+tick?" — yes, and we ALREADY hook the picker. There are two distinct
+events with very different roles:
+
+| Event | Hook target | Purpose |
+|-------|-------------|---------|
+| `action_decided` | **`vt[8] = 0x08865254`** (the picker) | OVERRIDE — return value flows through `0885f9a0` → `0885f848` |
+| `ai_step` | entry of `z_un_08865648` (per-frame tick) | OBSERVE-ONLY — fires before the slot loop runs vt[8] internally |
+
+The per-frame tick `z_un_08865648` is the FUNCTION inside which vt[8] gets
+called per-slot. Hooking its entry gives observability ("a big monster is
+about to tick"), but trying to override an action there would race with
+the engine's own vt[8] call later in the same function.
+
+`action_decided` is the right surface for "force a different action":
+intercepts vt[8]'s return immediately before `0885f9a0` consumes it.
+
+## Tigrex ptr resolution — passive cache
+
+Tigrex's vt[8] returns a per-run pointer into entity+0x1AC's nested
+sub-tables, not a stable u16 ID. To let mods address tigrex actions
+symbolically:
+
+* `tools/dump_tigrex_inputs.py` parses framework.log and emits
+  `TIGREX_VT8_INPUT_0x????` macros for each observed vt8_input value
+  (50 action inputs + 4 probe inputs from 1860 logged calls).
+* The framework's `action_decided` dispatcher unconditionally snoops every
+  `(vt8_input, engine_id)` pair into a per-species cache (96 entries each).
+  Snooping happens even with zero subscribers, so the cache populates
+  itself as soon as the framework boots into a quest.
+* `mhfu_action_ptr_for(type, input)` returns the cached ptr — 0 if the
+  engine hasn't picked that input yet this run.
+
+Mod pattern:
+
+```c
+static uint32_t pin_to_charge(const mhfu_action_decision_ctx_t *c,
+                              uint32_t engine_value)
+{
+    if (c->monster_type == MON_TIGREX) {
+        uint32_t p = mhfu_action_ptr_for(MON_TIGREX, TIGREX_VT8_INPUT_0x04B1);
+        if (p) return p;
+    }
+    return engine_value;
+}
+```
+
+Limitation: actions the engine never picks naturally (e.g. rare enrage
+poses) never enter the cache, so they can't be pinned. Eager resolution
+(call vt[8] directly to populate the cache) is deferred because vt[8] is
+a 95-insn compound function with VFPU writes and a small RNG path — calling
+it speculatively would perturb engine state. See "What full RE costs" below.
+
+## What full ptr-resolver RE costs
+
+If a future mod needs eager resolution (force an action the engine has
+never picked) the work is:
+
+1. Disasm vt[8] @ `0x08865254` — full ~95 insns. ~1-2h.
+2. Trace data flow against the live `entity+0x1AC` structure (decoded as
+   `(u32 weight, u32 value)` pairs + `0xFFFFFFFF` sentinels in §32h, but
+   the value→ptr mapping needs more work). ~1-2h.
+3. Identify the input→output computation: is it `table_base + offset` or
+   weighted-random across a bucket or nested `lookup(input).sub_table[idx]`?
+   ~1-2h.
+4. Replicate as pure C `mhfu_action_ptr_for_eager(entity, input)` that
+   mirrors the lookup without VFPU / RNG. ~1h.
+5. Validate against `tools/out/tigrex_inputs/observed.txt` (54 known
+   pairs). ~30min.
+
+Total: ~4-8h focused work. Open questions that may grow scope:
+* Does vt[8] depend on entity state beyond `+0x1AC` (heading, stress,
+  player distance)? If yes, the resolver needs the same state as input.
+* Does the RNG path make different calls return different ptrs for the
+  same input? Then "the resolved ptr" isn't a function — would need to
+  expose the bucket of candidates.
+
+For now: passive cache is good enough for the vast majority of mods.
