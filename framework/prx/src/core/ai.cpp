@@ -19,11 +19,43 @@
 #include <string.h>
 
 #include "mhfu/ai.h"
+#include "mhfu/ai_actions.h"
 #include "mhfu/mips.h"
 #include "mhfu/log.h"
 #include "mhfu/entity.h"
 #include "mhfu/hooks.h"
 #include "internal.h"
+
+/* Action-validity tables (popo + anteka), generated alongside ai_actions.h.
+ * Big monsters have no static table — accept all IDs for them. */
+static const uint16_t POPO_VALID[] = {
+    0x0060, 0x0061, 0x0064, 0x0070, 0x0071, 0x0073, 0x0074, 0x0076,
+    0x009C, 0x009D, 0x009E, 0x009F, 0x00A0,
+};
+#define POPO_VALID_N (int)(sizeof(POPO_VALID)/sizeof(POPO_VALID[0]))
+
+static const uint16_t ANTEKA_VALID[] = {
+    0x0043, 0x0044, 0x0045, 0x0047, 0x0048, 0x0049, 0x004B, 0x0457,
+    0x0071, 0x0072, 0x008C, 0x008D, 0x008E, 0x008F, 0x0091, 0x0094,
+    0x0095, 0x0096, 0x00A6, 0x00A7, 0x00C9, 0x00CA, 0x00CB, 0x00D2,
+    0x00D3, 0x00D4, 0x04C1, 0x00DE, 0x00DF, 0x00E2, 0x00E4, 0x00E7,
+    0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00EF, 0x00F0, 0x00F5, 0x00F6,
+};
+#define ANTEKA_VALID_N (int)(sizeof(ANTEKA_VALID)/sizeof(ANTEKA_VALID[0]))
+
+extern "C" int mhfu_action_is_valid(uint8_t monster_type, uint32_t action_id)
+{
+    const uint16_t *t = 0; int n = 0;
+    switch (monster_type) {
+        case 0x46: t = POPO_VALID;   n = POPO_VALID_N;   break;
+        case 0x45: t = ANTEKA_VALID; n = ANTEKA_VALID_N; break;
+        case 0x4B: case 0x4D: return 1;   /* big monster — no static table; accept */
+        default: return 0;
+    }
+    uint16_t id16 = (uint16_t)(action_id & 0xFFFF);
+    for (int i = 0; i < n; i++) if (t[i] == id16) return 1;
+    return 0;
+}
 
 #define MAX_HANDLERS 8
 

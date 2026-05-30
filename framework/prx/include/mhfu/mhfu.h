@@ -20,6 +20,7 @@
 #include "quest.h"
 #include "hooks.h"
 #include "ai.h"
+#include "ai_actions.h"
 #include "mod.h"
 #include "log.h"
 #include "addresses.h"
