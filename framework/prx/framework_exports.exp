@@ -23,6 +23,14 @@ PSP_EXPORT_FUNC_HASH(mhfu_write_u8)
 PSP_EXPORT_FUNC_HASH(mhfu_write_u16)
 PSP_EXPORT_FUNC_HASH(mhfu_write_u32)
 PSP_EXPORT_FUNC_HASH(mhfu_log)
+PSP_EXPORT_FUNC_HASH(mhfu_on_bigmonster_action_decided)
+PSP_EXPORT_FUNC_HASH(mhfu_on_bigmonster_anim_decided)
+PSP_EXPORT_FUNC_HASH(mhfu_on_bigmonster_ai_step)
+PSP_EXPORT_FUNC_HASH(mhfu_off_bigmonster_action_decided)
+PSP_EXPORT_FUNC_HASH(mhfu_off_bigmonster_anim_decided)
+PSP_EXPORT_FUNC_HASH(mhfu_off_bigmonster_ai_step)
+PSP_EXPORT_FUNC_HASH(mhfu_entity_from_action_list)
+PSP_EXPORT_FUNC_HASH(mhfu_entity_is_big_monster)
 PSP_EXPORT_END
 
 PSP_END_EXPORTS

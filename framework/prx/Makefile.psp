@@ -16,6 +16,7 @@ CORE_OBJS = \
   src/core/hooks.o \
   src/core/install.o \
   src/core/quest.o \
+  src/core/ai.o \
   src/core/modtable.o \
   src/core/bootstrap.o
 

@@ -388,19 +388,129 @@ the giadrome intro live RE. Modders writing per-monster behaviour
 just need to populate the action-descriptor block + flip those two
 cells.
 
-## Open follow-ups (next session)
+## Section 32d (2026-05-30) — Per-frame tick + override hook points
+
+Driving the modding-framework override-event design (Q-set on
+`on_bigmonster_action_decided` + `_anim_decided`). Re-RE'd the full
+per-entity AI tick chain end-to-end.
+
+### Per-entity AI tick `z_un_08865648` (real caller of walker)
+
+Found by walking back from captured `ra=0x08865734` after a code-BP
+at the walker entry. Six function prologues between `0x08865250` and
+`0x08865800`; the one immediately before `ra` (= `0x08865648`) is
+the real per-frame per-entity tick:
+
+```
+z_un_08865648(entity):       ; called per-frame for every entity
+  v0 = z_un_08865c88(entity, 0x20000)
+  if v0 != 0:    skip transform_builder + root-motion (paused?)
+  else:
+      z_un_088652dc(entity)                          ; transform_builder (Section 25)
+      z_un_08863b70(entity+0x80, &locbuf, entity+0x10)   ; root-motion delta from anim
+      entity+0x200 += locbuf  (VFPU VADD.T)          ; world-pos integrate
+  for slot in 0..entity+0x1A2:
+      if entity+(slot*0x40)+0xBE != 0:    continue   ; slot's direction byte already set
+      if (entity+0x1A8+slot) u8 == 0:     continue   ; per-slot trigger flag off
+      v0 = entity->vt[8](entity, entity+0x1B8+slot*2)   ; PROBE — non-zero = install
+      if v0 == 0:                          continue
+      v0 = entity->vt[8](entity, entity+0x1B8+slot*2)   ; PICK — returns u32 action_id
+      z_un_0885f9a0(entity+0x190, v0, slot, 1)            ; INSTALL action_id into slot
+  z_un_088637c4(entity+0x80)                          ; walker tick — advance slot timers/flags
+```
+
+### Two-layer ACTION → ANIM resolve
+
+`z_un_0885f9a0` (installer, just 27 insns) does NOT write a slot
+cell directly — it chains through an action→anim resolve:
+
+```
+z_un_0885f9a0(a0=action_list_ptr, a1=action_id, a2=slot, a3=1):
+  anim_node_ptr = z_un_0885f928(action_list_ptr, action_id)
+                  ; ACTION → ANIM resolve — walks the species anim graph by u16 ID
+                  ; (per CLAUDE.md §19c.5: MSB-set IDs are no-op markers)
+  if anim_node_ptr == 0: return    ; no anim found, slot left alone
+  z_un_0885f848(action_list_ptr, anim_node_ptr, action_id, slot, t0=1)
+                  ; APPLY — installs anim_node_ptr into slot[slot]+0x38, sets timers
+```
+
+### Cross-species vtable confirmation (live)
+
+```
+popo       vt @ 0x089BC560  vt[8] = 0x08865254
+anteka     vt @ 0x089BC074  vt[8] = 0x08865254
+tigrex     vt @ 0x089BB69C  vt[8] = 0x08865254
+giadrome   vt @ 0x089BC950  vt[8] = 0x08865254     <-- live, vt ptr read from slot 1
+```
+
+All 4 species share vt[8]. **One hook covers every monster.** Cements
+the generic-AI-engine claim from Section 19.
+
+### Walker `z_un_088637C4` field map (refined)
+
+Per-slot (stride 0x40, base entity+0x80, slot count at entity+0x1A2):
+
+| Offset | Type | Role |
+|--------|------|------|
+| `+0x10` | f32  | anim time accumulator (advances by `f12` per call) |
+| `+0x14` | f32  | anim time delta (ramp) |
+| `+0x18` | f32  | anim phase target (post-blend time) |
+| `+0x1C` | f32  | anim length / max time |
+| `+0x24` | f32  | secondary ramp |
+| `+0x30` | u32  | timer countdown (loop iter limit) |
+| `+0x34` | f32  | secondary time accumulator |
+| `+0x38` | u32  | anim_node_ptr (set by installer) |
+| `+0x3C` | u16  | flags (bit0 = phase-1 done) |
+| `+0x3D-0x3E` | s8 | direction byte (BE check at tick entry) |
+| `+0x3F` | u8   | active flag (cleared at slot start) |
+
+Parallel arrays on the entity:
+- `entity+0x1A8 + slot` u8 — per-slot trigger flag (skip slot if 0).
+- `entity+0x1B0 + slot*2` u16 — per-slot phase value 0..100 (normalised f).
+- `entity+0x1B8 + slot*2` u16 — per-slot input passed to vt[8] (`$a1`).
+
+Slot 0's root-motion delta is mirrored to `entity+0x40/0x44/0x48`
+(the transform translation row).
+
+### Override hook map for framework events
+
+| Event | Hook site | Type | Layer |
+|-------|-----------|------|-------|
+| `on_bigmonster_action_decided` | vt[8] = `0x08865254` swap (Section 22 pattern) | sync override, $v0 mutable | high-level action |
+| `on_bigmonster_anim_decided`   | JAL at `0x0885F9CC` → `z_un_0885f928` return | sync override, $v0 mutable | specific anim graph node |
+| `on_bigmonster_ai_step`        | enter `z_un_08865648` (per-frame per-entity) | observe-only | tick |
+
+All three hooks are EBOOT-resident. Section 26 JIT bypass (install at
+TITLE/MENU before first quest tick) applies to `0x08865648` /
+`0x0885F9CC` patches. vt[8] swap is JIT-immune (data lookup).
+
+### Mod-side concept maps
+
+- `action_id` = high-level behavior selector (lunge / circle / roar /
+  charge). Picked by vt[8] from species probability table at
+  `entity+0x1AC`. Format from CLAUDE.md §19e.2 = list of
+  `(u16 action_id, u16 duration_ticks)` pairs.
+- `anim_node_ptr` = the specific anim graph node `z_un_0885f928`
+  resolves an action_id to. The node holds anim asset references
+  + blend params.
+
+So **action_decided** lets mod replace WHAT the monster does;
+**anim_decided** lets mod replace HOW that action's anim is realised.
+
+## Open follow-ups
 
 1. **Find the explicit installer call** that writes `entity+0x190`
    during cutscene init. Once we have its PC + arg signature we can
-   call it directly from a PRX. Candidate: scan for `SW $rT,
-   0x190($rS)` in EBOOT (= `0x110($rS)` if $rS = entity+0x80).
+   call it directly from a PRX.
 2. **Verify normal AI usage** — sample `entity+0x1A2` for popo
    during normal aggression. If non-zero, action-list walker is
-   the same mechanism for combat AI (very likely, given §19).
+   the same mechanism for combat AI.
 3. **Slot field format** — re-RE the action-descriptor sub-records
    pointed at by the `+0x14C` deref. CLAUDE.md §19e.1 has partial
-   info; reconcile with what `z_un_088637C4` reads.
+   info; reconcile with what `z_un_088637C4` reads (now mapped above).
 4. **EU Evdemo singleton** — still deferred (3 approaches failed
    Section 32b). $gp-relative scan next time.
 5. **Map `state byte = 3`** at `entity+0x334` — observe when else
    it appears; correlate with action ID.
+6. **Disasm `z_un_0885f928`** (action→anim resolver) — confirm it has
+   no third pick layer and document its anim-graph traversal.

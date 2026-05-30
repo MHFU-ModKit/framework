@@ -114,6 +114,29 @@ mechanics; bleeding-edge RE still uses the raw escape hatch.
   original bytes themselves. Build stubs with `mhfu/mips.h`; after writing
   a stub buffer call `mhfu_flush_caches()` so the CPU runs it as code.
 
+### AI override events (Section 32d)
+
+Three new events let a mod intercept the generic monster AI engine. They
+hook the per-frame per-entity tick `z_un_08865648` and its sub-calls
+(`docs/AI_SCRIPTING_ENGINE.md`):
+
+- `mhfu_on_bigmonster_action_decided(cb, priority)` — fires after vt[8]
+  picks an action_id. Sync override: `cb(ctx, engine_value) -> new_value`.
+  Priority-chain (higher first); each handler sees the previous handler's
+  return as its input. Return `engine_value` unchanged to abstain.
+  JIT-immune (vt[8] swap on shared `0x08865254`).
+- `mhfu_on_bigmonster_anim_decided(cb, priority)` — fires after the
+  action→anim resolver `z_un_0885f928` returns. Same override semantics.
+  *(Wiring deferred — JAL trampoline still to land; registrations are
+  accepted but won't fire yet.)*
+- `mhfu_on_bigmonster_ai_step(cb, priority)` — observe-only, per-frame
+  per-entity. *(Wiring deferred — entry detour still to land.)*
+
+Big-monster filtering uses an allowlist on `entity+0x1E8` (Tigrex 0x4B,
+Giadrome 0x4D). Will switch to `quest.targets[2]` enumeration once
+exposed via `quest.h`. See `mods/experimental/ai_demo/mod.cpp` for the
+reference shape.
+
 ### Beating the PPSSPP JIT
 
 For a code patch on a function PPSSPP may have already JIT-translated,
