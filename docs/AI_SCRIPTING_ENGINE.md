@@ -756,3 +756,188 @@ Total: ~4-8h focused work. Open questions that may grow scope:
   expose the bucket of candidates.
 
 For now: passive cache is good enough for the vast majority of mods.
+
+---
+
+# Section 32j — Big-monster slot loop body + body-part theory + freeze-gate (2026-05-31)
+
+Building on the action_decided framework from §32d-32i. While building the
+`tigrex_spin` mod (replace Giadrome quest's monster with Tigrex, lock
+into TIGREX_ANGRY_SPIN after first natural pick, release on HP drop) we
+disasm'd the per-tick slot loop body and identified the engine-side
+state cells that gate AI tick advancement.
+
+## Slot loop body — EBOOT `z_un_08865648` (0x088656A0..0x08865730)
+
+Per-tick driver. Body:
+
+```mips
+0x088656A0  lhu  $v0, 0x1a2($s2)   ; slot count = entity+0x1A2 (u16)
+0x088656A4  beqz $v0, end
+0x088656A8  move $s1, $zero         ; s1 = slot = 0
+0x088656AC  move $s0, $s2           ; s0 = entity (input cursor base)
+
+LOOP @ 0x088656B0:
+0x088656B0  sll  $v0, $s1, 6        ; v0 = slot * 0x40
+0x088656B4  addu $v0, $s2, $v0
+0x088656B8  lb   $v0, 0xbe($v0)     ; SKIP FLAG @ entity + slot*0x40 + 0xBE
+0x088656BC  bnel $v0, $zero, tail   ; if non-zero, slot is busy → skip
+
+0x088656C4  addu $v0, $s2, $s1
+0x088656C8  lbu  $v0, 0x1a8($v0)    ; ENABLE BYTE @ entity + slot + 0x1A8
+0x088656CC  beqz $v0, tail          ; if zero, slot disabled → skip
+
+0x088656D4  lw   $t9, ($s2)         ; vtable
+0x088656D8  lhu  $a1, 0x1b8($s0)    ; INPUT @ entity + slot*2 + 0x1B8 (u16)
+0x088656DC  lw   $t9, 0x20($t9)     ; vt[8]
+0x088656E0  jalr $t9                 ; CALL 1 — gate
+0x088656E4  move $a0, $s2            ;   delay
+0x088656E8  beqz $v0, tail          ; gate returned 0 → skip slot
+
+0x088656F0..0x088656FC               ; CALL 2 — same args, descriptor result
+0x08865700  move $a0, $s2
+
+0x08865704  lw   $a0, 0x190($s2)    ; entity+0x190 = anim struct ptr
+0x08865708  move $a1, $v0            ; vt[8] return = action ptr
+0x0886570C  move $a2, $s1            ; slot index
+0x08865710  jal  0x885f9a0          ; install_action(anim_struct, ptr, slot, $a3=1)
+0x08865714  addiu $a3, $zero, 1
+
+tail @ 0x08865718:
+0x08865718  lhu  $v0, 0x1a2($s2)
+0x0886571C  addiu $s1, $s1, 1        ; slot++
+0x08865720  sltu $v0, $s1, $v0
+0x08865724  bnez $v0, LOOP
+0x08865728  addiu $s0, $s0, 2        ; input cursor += 2
+
+end @ 0x0886572C:
+0x0886572C  jal  0x88637c4          ; scripting slot processor
+0x08865730  addiu $a0, $s2, 0x80
+```
+
+**Per-slot inputs**:
+* `entity + slot*0x40 + 0xBE` u8 — skip flag (busy)
+* `entity + slot + 0x1A8` u8 — enable byte
+* `entity + 0x1B8 + slot*2` u16 — input cursor for vt[8]
+
+Big-mon overlay path `0x09AC52DC` has the same structural pattern; the
+slot count is loaded from `entity+0x640` instead of `+0x1A2`. Both
+patched live via Section 26 quiet-gate; overlay body
+(0x09AC52E4..0x09AC54C0) is JIT-overwritten and can't be disasm'd from
+RAM, but symmetry to the EBOOT path is high.
+
+**vt[8] is called TWICE per slot per tick**. Both calls use identical
+input. CALL 1 is a probability gate (return 0 → engine `beqz` skips slot).
+CALL 2 returns the actual install ptr. Implications: action_decided
+post-hook (the framework event) fires twice per slot per tick.
+
+## vt[8] internals — `z_un_08865254` decoded (95 insns)
+
+Pure deterministic probability picker. No RNG read in the function.
+Input `a1` decomposed:
+
+| Slice           | Use                                |
+|-----------------|------------------------------------|
+| `a1 / 1000`     | category index                      |
+| `(a1 % 1000) / 100` | table row index ×8 stride       |
+| `a1 % 100`      | probability threshold               |
+
+Algorithm:
+1. `a2 = entity+0x1AC` (action table ptr). If null → return 1000 (default).
+2. Compute `idx = (a1 % 1000) / 100 * 8`.
+3. Load `v0 = action_table[idx]`. If `(a1 % 100) < v0` → return `action_table[idx + 4]` (success ptr).
+4. Else fallback: `v1 = action_table[443 + (a1 % 100) * 4]`. If `v1 != -1` → return `action_table + v1`. Else 0.
+
+Pure function of `(entity+0x1AC, a1)`. Same input → same output. → The
+framework's passive cache (snoop on action_decided) is safe.
+
+## Slot = body part (verified)
+
+Three slots per big monster; each slot drives one body segment. A
+coordinated full-body action requires all 3 slots playing the action's
+per-part descriptor concurrently. SPIN's natural per-slot inputs (live
+captured on Tigrex):
+
+| Slot | Input  | vt[8] returns (Tigrex em13 model)         | Likely role     |
+|------|--------|-------------------------------------------|-----------------|
+| 0    | 0x0413 | 0x0946ECFC                                | Head / front    |
+| 1    | 0x04DB | 0x094E8360                                | Body / mid      |
+| 2    | 0x05A3 | 0x0950DBC8                                | Tail / spinner  |
+
+Stride 200 between slot inputs is consistent across actions (general
+pattern observed in polling — e.g. another action's triple was
+`(1017, 1217, 1417)`). The 200 stride is the engine's per-slot offset
+into the action table.
+
+Forcing slot-2-only SPIN: tail spins indefinitely while head + body
+do unrelated picks → visual chaos. Forcing the full triple under a
+naive override defeated the per-slot natural gate (vt[8] CALL 1 → 0
+when slot idle) → install thrash → AI tick rate dropped to 0.7% normal.
+The working pattern: cache all 3 slots' natural SPIN ptrs from the
+arming-frame action_decided event (engine already iterates 0→1→2),
+then return cached ptrs only when `engine_value != 0` (preserves gate).
+
+## Per-entity state cells — freeze gate
+
+Engine accumulates "exhausted" bits during forced repeat-fire. After
+3-4 SPINs the AI tick halts entirely (per-entity frame counter
+`entity+0x092` stops advancing). The cells the engine zeroes / sets
+during exhaustion:
+
+| Offset       | Type | Role                                             |
+|--------------|------|--------------------------------------------------|
+| `+0x1A8..0x1AA` | u8×3 | per-slot enable bytes — engine zeroes after exhaustion |
+| `+0x1B8/A/C` | u16×3 | per-slot input cursors — engine zeroes after exhaustion |
+| `+0x29C`     | u32  | stress-response output mode (0 during SPIN)       |
+| `+0x32C`     | u16  | AI param scratch (0 during SPIN)                  |
+| `+0x414`     | u32  | bitfield — climbs `0xa → 0x12c` over 3 SPINs (red herring; not the freeze cause) |
+| `+0x4B8`     | u32  | ⭐ **THE freeze gate**. Baseline 0. Engine OR's bits `0x100 \| 0x10000` during forced spins. Halts AI tick when set. |
+| `+0x54E`     | u16  | natural play decrementer (1225 → 0); red herring |
+| `+0x550`     | u16  | stamina-like counter (9000 baseline); secondary gate, decays ~10 per 333ms |
+| `+0x648/4C`  | f32  | paired (450 / 1000) — likely rage cur/max         |
+
+The `tigrex_spin` v0.12 mod refreshes `+0x4B8 = 0` and re-primes input
+cursors + enable bytes + `+0x550 = 9000` on every action_decided fire.
+Once `+0x4B8` is held at 0 the engine never enters exhausted state →
+SPIN repeats indefinitely until HP drops (release on first HP delta).
+
+## Slot container layout (`entity + 0x80 + slot*0x40`, stride 0x40)
+
+All 3 slot containers have identical shape; vary only in `+0x38` (the
+installed anim ptr written by `z_un_0885F9A0`):
+
+| Container offset | Type | Notes                                         |
+|------------------|------|-----------------------------------------------|
+| `+0x10`          | f32  | per-slot timer (observed 56.0 → 332.0 evolve) |
+| `+0x14`          | f32  | per-slot scalar (1.25f default)               |
+| `+0x24`          | f32  | per-slot scalar (0.25f default)               |
+| `+0x38`          | u32  | installed action ptr — the slot's anim         |
+| `+0x3C`          | u32  | flag word (=0x1 after install)                 |
+| `+0x3F`          | u8   | running flag (0 = idle, ≠0 = playing)          |
+
+`mhfu_action_ptr_for(monster_type, vt8_input)` from §32i resolves to
+exactly the `+0x38` value the applier writes.
+
+## Methodology — reusable "find the engine's freeze gate" recipe
+
+Each step has a one-shot script in this session's `/tmp/`. Repeat for
+any entity-level wedge:
+
+1. **Capture baseline** (`/tmp/baseline.py`) — full 31KB entity dump
+   (stride 0x7A00 for Tigrex; 0x4A60 for Popo; 0x4530 for Anteka) to
+   `/tmp/<entity>_baseline.bin` BEFORE the wedge condition.
+2. **Wide static scan** (`/tmp/wide_scan.py`) — sweep the baseline for
+   paired f32 cur/max signatures, u16 counters, isolated bit flags
+   across the full stride. Surfaces stamina/HP/timer candidates.
+3. **Live diff poll** (`/tmp/live_diff.py`) — 3 Hz x 6 min logging every
+   cell change vs baseline. Lets the engine wedge naturally while
+   recording. Post-analyze for monotonic ratchets.
+4. **Unfreeze probe** (`/tmp/unfreeze.py`) — for each top suspect, one
+   shot write the baseline value; watch `entity+0x092` for advance
+   within ~1.5s. The cell that unfreezes is the gate.
+5. **Bisect** (`/tmp/find_gate.py`) — when single-cell probe is null but
+   bulk reset of all diff cells unfreezes, binary-split the diff set.
+   Found `+0x4B8` in 5 iterations from 52 candidates.
+
+The bisect step is the key new tool. It scales to any single-cell-gate
+mystery without requiring upstream RE.
