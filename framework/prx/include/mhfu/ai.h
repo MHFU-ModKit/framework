@@ -13,12 +13,59 @@
  *
  * Hook points (verified Section 32d/g, 2026-05-30):
  *
- *   on_bigmonster_action_decided
+ *   on_ai_overlay_loaded              (postfix, observe / install-window)
+ *     - Fires the moment the engine's big-monster AI overlay region
+ *       (0x09Axxxxx) has just been memcpy'd into place from DATA.BIN
+ *       (~1 MB at dest 0x09abf200). The wrapper sits on the `jal` at
+ *       EBOOT 0x0884EAA8 (call into a local memcpy-variant
+ *       0x0884ECAC) and runs POSTFIX, so when the chain fires the
+ *       bytes are already in RAM and no JIT translation has happened
+ *       yet — the right window to patch overlay code (e.g., the AI
+ *       dispatcher at 0x09AC5228) without racing PPSSPP's JIT
+ *       pre-cache (Section 26 pattern, applied one layer above the
+ *       function instead of "wait until TITLE/MENU").
+ *     - Observe-only by signature: no return value; mods read ctx and
+ *       perform their own writes against the freshly-mapped region.
+ *
+ *   on_bigmonster_slot_picked         (PRE-iteration, override-capable)
+ *     - Hook = patch on the AI slot-loop entry inside z_un_08865648
+ *       (loop top @ 0x088656B0). The loop iterates entity slots
+ *       0..action_count-1; for each it derives the slot's input @
+ *       entity+0x1B8+slot*2, calls vt[8], and applies the outcome to
+ *       that slot's container @ entity+0x110+slot*0x40.
+ *     - Runs once per iteration BEFORE the slot's skip gates +
+ *       vt[8] + applier. Mods can REDIRECT this iteration to a
+ *       different slot by returning a new slot index. Slot identity
+ *       then flows through vt[8] (input read) AND the installer
+ *       (container written), so the engine exercises its own
+ *       same-slot path — no container-shape mismatch.
+ *     - Quiet-gated install (Section 26): the patch lands at TITLE/
+ *       MENU before PPSSPP's JIT caches the function. Affects all
+ *       big-monster species sharing z_un_08865648.
+ *
+ *   on_bigmonster_action_input        (PRE-call, override-capable)
+ *     - Same vt[8] swap stub as action_decided, but the chain runs
+ *       BEFORE the engine's vt[8] body. Lets mods mutate the
+ *       `vt8_input` ($a1) the picker reads — and because the picker
+ *       reads input + per-input engine state in one pass, mutating
+ *       here keeps the engine's downstream state (slot bookkeeping,
+ *       applier descriptor walk) consistent with the chosen action.
+ *       This is the durable way to FORCE a specific action. Use it
+ *       instead of action_decided whenever you want to redirect the
+ *       picker; reserve action_decided for OBSERVE or same-context
+ *       sanitisation.
+ *     - JIT-immune (vtable lookup).
+ *
+ *   on_bigmonster_action_decided      (POST-call, override-capable)
  *     - Hook = vt[8] swap on shared 0x08865254 (all 4 species).
  *     - vt[8] is the species probability-table lookup; engine returns
  *       an OUTCOME POINTER into the per-species table at entity+0x1AC
  *       (or sentinels 0x3E8 = "no table" / 0 = "no entry").
  *     - Mod returns a replacement outcome ptr (or the same one).
+ *     - WARNING: forcing a ptr here that doesn't match the engine's
+ *       just-completed pick can desync the applier (the picker has
+ *       already written per-slot bookkeeping for the engine's choice).
+ *       Prefer `on_bigmonster_action_input` for forcing.
  *     - JIT-immune (vtable lookup).
  *
  *   on_bigmonster_ai_step
@@ -55,6 +102,39 @@ typedef struct {
     uint8_t  slot;           /* AI slot index (0..entity+0x1A2 - 1)     */
     uint16_t vt8_input;      /* a1 to vt[8] = u16 at +0x1B8 + slot*2    */
 } mhfu_action_decision_ctx_t;
+
+/* Context for on_bigmonster_action_input (PRE-call). vt8_input is the
+ * input the engine is about to pass to vt[8] (already mutated by any
+ * earlier higher-priority handler in the chain). */
+typedef struct {
+    uint32_t entity_ptr;
+    uint8_t  monster_type;
+    uint8_t  slot;
+    uint16_t vt8_input;
+} mhfu_action_input_ctx_t;
+
+/* Context for on_ai_overlay_loaded. dest is the address memcpy was
+ * called with ($a0 of the wrapped jal); src + size are the well-known
+ * constants for this load (1 MB starting at 0x09abf200 from DATA.BIN
+ * offset 0x0bb37800). Reported for callers that want to early-out on
+ * unrelated copies though the wrapper already gates dest to the AI
+ * overlay range. */
+typedef struct {
+    uint32_t dest;
+    uint32_t src;     /* may be 0 if not introspectable */
+    uint32_t size;    /* may be 0 if not introspectable */
+} mhfu_ai_overlay_ctx_t;
+
+/* Context for on_bigmonster_slot_picked (PRE-iteration). action_count
+ * is u16 at entity+0x1A2 (the AI loop's upper bound). original_slot is
+ * the slot the engine reached this iteration; the chain's return value
+ * is what the iteration will actually process. */
+typedef struct {
+    uint32_t entity_ptr;
+    uint8_t  monster_type;
+    uint8_t  original_slot;
+    uint16_t action_count;
+} mhfu_slot_picked_ctx_t;
 
 typedef struct {
     uint32_t entity_ptr;
@@ -102,11 +182,38 @@ typedef void (*mhfu_bigmonster_death_cb_t)(const mhfu_bigmonster_death_ctx_t *ct
 typedef uint32_t (*mhfu_action_override_cb_t)(
     const mhfu_action_decision_ctx_t *ctx, uint32_t engine_action_id);
 
+/* PRE-call handler: receives the current `vt8_input` (already threaded
+ * through any higher-priority pre-handler) and returns the value the
+ * engine's vt[8] will see. Return `current_input` unchanged to abstain.
+ * Only the low 16 bits are used by the engine. */
+typedef uint16_t (*mhfu_action_input_override_cb_t)(
+    const mhfu_action_input_ctx_t *ctx, uint16_t current_input);
+
+/* PRE-iteration handler: receives the slot index the loop reached;
+ * return the slot index to actually process this iteration. Return
+ * `current_slot` unchanged to abstain. Return a slot index outside
+ * 0..action_count-1 to crash the engine — only return valid slot
+ * indices. */
+typedef uint8_t (*mhfu_slot_picked_override_cb_t)(
+    const mhfu_slot_picked_ctx_t *ctx, uint8_t current_slot);
+
 typedef void (*mhfu_ai_step_cb_t)(const mhfu_ai_step_ctx_t *ctx);
+
+/* AI-overlay-loaded handler. Observe-only — no override semantics. */
+typedef void (*mhfu_ai_overlay_loaded_cb_t)(const mhfu_ai_overlay_ctx_t *ctx);
 
 /* --- registration ---------------------------------------------------- */
 
 /* Higher priority runs first.  Ties keep registration order. */
+mhfu_hook_rc_t mhfu_on_ai_overlay_loaded(
+    mhfu_ai_overlay_loaded_cb_t cb, int priority);
+mhfu_hook_rc_t mhfu_off_ai_overlay_loaded(
+    mhfu_ai_overlay_loaded_cb_t cb);
+
+mhfu_hook_rc_t mhfu_on_bigmonster_slot_picked(
+    mhfu_slot_picked_override_cb_t cb, int priority);
+mhfu_hook_rc_t mhfu_on_bigmonster_action_input(
+    mhfu_action_input_override_cb_t cb, int priority);
 mhfu_hook_rc_t mhfu_on_bigmonster_action_decided(
     mhfu_action_override_cb_t cb, int priority);
 mhfu_hook_rc_t mhfu_on_bigmonster_ai_step(
@@ -117,6 +224,8 @@ mhfu_hook_rc_t mhfu_on_bigmonster_spawn(
 mhfu_hook_rc_t mhfu_on_bigmonster_death(
     mhfu_bigmonster_death_cb_t cb, int priority);
 
+mhfu_hook_rc_t mhfu_off_bigmonster_slot_picked   (mhfu_slot_picked_override_cb_t cb);
+mhfu_hook_rc_t mhfu_off_bigmonster_action_input  (mhfu_action_input_override_cb_t cb);
 mhfu_hook_rc_t mhfu_off_bigmonster_action_decided(mhfu_action_override_cb_t cb);
 mhfu_hook_rc_t mhfu_off_bigmonster_ai_step      (mhfu_ai_step_cb_t        cb);
 mhfu_hook_rc_t mhfu_off_bigmonster_spawn        (mhfu_bigmonster_spawn_cb_t cb);

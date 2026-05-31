@@ -90,15 +90,87 @@ static const species_vt_t g_species_vts[] = {
 #define ANIM_RESOLVER_TARGET  0x0885F928u
 #define INSTALLER_FRAME_RA    0x0885F9D0u   /* MOVE a1, v0 — what we ride post-call */
 
+/* Slot-loop top inside z_un_08865648 — see RE in docs/AI_SCRIPTING_ENGINE.md.
+ * Layout:
+ *   0x088656B0  sll   $v0, $s1, 6        ; <-- patch site (2 insns)
+ *   0x088656B4  addu  $v0, $s2, $v0
+ *   0x088656B8  lb    $v0, 0xbe($v0)     ; skip-gate #1
+ *   ...                                  ; body uses $s1=slot, $s0=ent+2*slot
+ *   0x08865728  addiu $s0, $s0, 2        ; (delay slot of bnez loop tail)
+ *
+ * $s1 holds slot index, $s0 = $s2 + 2*slot is the input cursor, $s2 is
+ * the entity ptr. Our wrapper runs at loop top, calls a C dispatcher
+ * that returns the slot to actually process, rewrites $s1 + $s0, then
+ * replays the two patched insns and jumps into the body. */
+#define SLOT_LOOP_TOP         0x088656B0u
+#define SLOT_LOOP_BODY_RESUME 0x088656B8u   /* first un-displaced insn */
+
+/* AI overlay loader call site (Section 2026-05-31 RE). The actual write
+ * to overlay memory is done by memcpy from inside a per-segment loader
+ * function at 0x0884EA1C; that function is invoked by a `jal` at
+ * 0x0884E9F8 from inside its parent (0x0884E998). We wrap THAT outer
+ * jal instead of memcpy directly because memcpy is also called for many
+ * unrelated boot copies — wedging the boot timing if we wrap there.
+ * One fire per load-orchestrator call → on the order of a few dozen
+ * fires per map transition vs tens of thousands at the memcpy site.
+ *
+ * The wrapped jal's $a0 is the loader-context ptr, not the overlay dest,
+ * so the helper detects AI-overlay residency by checking the
+ * dispatcher's prologue signature at 0x09AC5228
+ * (`addiu $sp, $sp, -0x40` = 0x27BDFFC0). One-shot per session. */
+#define OVERLAY_LOADER_JAL    0x0884E9F8u
+#define OVERLAY_LOADER_TARGET 0x0884EA1Cu
+#define OVERLAY_AI_BASE       0x09ABF200u
+#define OVERLAY_AI_SIZE       0x00100000u
+#define OVERLAY_AI_END        (OVERLAY_AI_BASE + OVERLAY_AI_SIZE)
+#define OVERLAY_AI_PROBE      0x09AC5228u   /* dispatcher prologue location */
+#define OVERLAY_AI_PROBE_SIG  0x27BDFFC0u   /* addiu $sp, $sp, -0x40        */
+
+/* Overlay-side slot loop (RE'd 2026-05-31 against the live overlay).
+ * Counterpart to the EBOOT slot loop in z_un_08865648 — but this is the
+ * one that actually executes for big-monster AI ticks in combat
+ * (`entity+0x288` bit 17 gates the EBOOT path off for tigrex et al).
+ *
+ *   0x09AC52C4  move $s3, $zero          ; slot counter init
+ *   0x09AC52DC  lw   $v1, 0x640($s5)     ; <-- patch site (2 insns)
+ *   0x09AC52E0  addiu $a0, $zero, 2
+ *   ...                                  ; body uses $s3 (slot),
+ *                                        ; $s0 = entity + slot*2,
+ *                                        ; $s1 = slot * 0xC8,
+ *                                        ; $s6 = entity + slot*0x40,
+ *                                        ; $s5 = entity (constant)
+ *   0x09AC54C0  addiu $s3, $s3, 1
+ *   0x09AC54C4  addiu $s1, $s1, 0xC8
+ *   0x09AC54C8  sltu  $v1, $s3, $v1
+ *   0x09AC54CC  addiu $s0, $s0, 2
+ *   0x09AC54D0  bnez  $v1, 0x09AC52DC    ; back to body resume
+ *   0x09AC54D4  addiu $s6, $s6, 0x40     ; delay slot
+ *
+ * Our wrapper replays the two displaced insns + recomputes $s0/$s1/$s6
+ * from the (possibly redirected) slot, then resumes at 0x09AC52E4. */
+#define OVL_SLOT_LOOP_TOP         0x09AC52DCu
+#define OVL_SLOT_LOOP_BODY_RESUME 0x09AC52E4u
+#define OVL_SLOT_LOOP_DISPLACED0  0x8EA30640u   /* lw $v1, 0x640($s5)   */
+#define OVL_SLOT_LOOP_DISPLACED1  0x24040002u   /* addiu $a0, $zero, 2 */
+
 #define AI_OWNER_TAG "mhfu_ai"
 
 /* --- chain storage --------------------------------------------------- */
 
+typedef struct { mhfu_ai_overlay_loaded_cb_t cb; int priority; } overlay_entry_t;
+typedef struct { mhfu_slot_picked_override_cb_t cb; int priority; } slot_entry_t;
+typedef struct { mhfu_action_input_override_cb_t cb; int priority; } input_entry_t;
 typedef struct { mhfu_action_override_cb_t cb; int priority; } action_entry_t;
 typedef struct { mhfu_ai_step_cb_t         cb; int priority; } step_entry_t;
 typedef struct { mhfu_bigmonster_spawn_cb_t cb; int priority; } bmspawn_entry_t;
 typedef struct { mhfu_bigmonster_death_cb_t cb; int priority; } bmdeath_entry_t;
 
+static overlay_entry_t g_overlay_chain[MAX_HANDLERS];
+static int             g_overlay_n = 0;
+static slot_entry_t    g_slot_chain[MAX_HANDLERS];
+static int             g_slot_n = 0;
+static input_entry_t   g_input_chain[MAX_HANDLERS];
+static int             g_input_n = 0;
 static action_entry_t  g_action_chain[MAX_HANDLERS];
 static int             g_action_n = 0;
 static step_entry_t    g_step_chain[MAX_HANDLERS];
@@ -108,15 +180,26 @@ static int             g_bmspawn_n = 0;
 static bmdeath_entry_t g_bmdeath_chain[MAX_HANDLERS];
 static int             g_bmdeath_n = 0;
 
+/* Current slot index seen by the loop wrapper this iteration, for
+ * action_input/decided ctx.slot enrichment. Valid only between loop
+ * wrapper entry and next iteration; outside that window, treat as
+ * stale.  Updated unconditionally by the wrapper (if installed). */
+static volatile uint8_t g_current_slot = 0;
+
 /* HP transition tracker (used for death edge). Indexed by registry slot. */
 static uint16_t        g_last_hp[MHFU_ENTITY_REGISTRY_SLOTS];
 static uint8_t         g_was_big[MHFU_ENTITY_REGISTRY_SLOTS];
 
-static int            g_action_hook_installed = 0;
-static int            g_step_hook_installed   = 0;
+static int            g_action_hook_installed  = 0;
+static int            g_step_hook_installed    = 0;
+static int            g_slot_hook_installed    = 0;
+static int            g_overlay_hook_installed = 0;
 
 /* Cave-allocated stubs (set on first install). */
 static uint32_t      *g_action_stub = 0;
+static uint32_t      *g_slot_wrapper = 0;
+static uint32_t      *g_overlay_slot_wrapper = 0;
+static int            g_overlay_slot_hook_installed = 0;
 
 /* --- chain insert/remove --------------------------------------------- */
 
@@ -274,6 +357,62 @@ extern "C" int mhfu_action_cache_entry(uint8_t monster_type, int i,
     return 1;
 }
 
+/* Slot-loop wrapper dispatcher: runs at the top of every AI slot
+ * iteration. Returns the slot index the loop should actually process.
+ * Also stashes that slot in g_current_slot for ctx.slot enrichment in
+ * the action_input/action_decided chains that fire downstream. */
+extern "C" uint32_t mhfu_ai_slot_picked_dispatch_c(
+    uint32_t entity, uint32_t slot)
+{
+    uint32_t s = slot & 0xFFu;
+    /* Always stash; downstream dispatchers read it. */
+    g_current_slot = (uint8_t)s;
+    if (g_slot_n == 0) return s;
+    if (!mhfu_entity_is_big_monster(entity)) return s;
+
+    mhfu_slot_picked_ctx_t ctx;
+    ctx.entity_ptr    = entity;
+    ctx.monster_type  = mhfu_entity_type(entity);
+    ctx.original_slot = (uint8_t)s;
+    ctx.action_count  = *(volatile uint16_t *)(entity + 0x1A2u);
+
+    uint8_t v = (uint8_t)s;
+    for (int i = 0; i < g_slot_n; i++) v = g_slot_chain[i].cb(&ctx, v);
+
+    /* Clamp to declared bound to keep the loop safe from a mod
+     * returning garbage. action_count == 0 is impossible here (loop
+     * wouldn't have entered), but guard anyway. */
+    if (ctx.action_count == 0) return s;
+    if (v >= (uint8_t)ctx.action_count) v = (uint8_t)(ctx.action_count - 1);
+
+    g_current_slot = v;
+    return (uint32_t)v;
+}
+
+/* PRE-call dispatcher: runs BEFORE the engine's vt[8] body. Returns the
+ * (possibly mutated) input value to forward into vt[8]. Lower 16 bits
+ * are meaningful; upper bits are zero. */
+extern "C" uint32_t mhfu_ai_action_input_dispatch_c(
+    uint32_t entity, uint32_t vt8_input)
+{
+    uint32_t in = vt8_input & 0xFFFFu;
+    if (g_input_n == 0) return in;
+    if (!mhfu_entity_is_big_monster(entity)) return in;
+
+    mhfu_action_input_ctx_t ctx;
+    ctx.entity_ptr   = entity;
+    ctx.monster_type = mhfu_entity_type(entity);
+    ctx.slot         = g_slot_hook_installed ? g_current_slot : 0;
+    ctx.vt8_input    = (uint16_t)in;
+
+    uint16_t v = (uint16_t)in;
+    for (int i = 0; i < g_input_n; i++) {
+        v = g_input_chain[i].cb(&ctx, v);
+        ctx.vt8_input = v;
+    }
+    return (uint32_t)v & 0xFFFFu;
+}
+
 extern "C" uint32_t mhfu_ai_action_dispatch_c(
     uint32_t entity, uint32_t vt8_input, uint32_t engine_action_id)
 {
@@ -290,7 +429,7 @@ extern "C" uint32_t mhfu_ai_action_dispatch_c(
     mhfu_action_decision_ctx_t ctx;
     ctx.entity_ptr   = entity;
     ctx.monster_type = type;
-    ctx.slot         = 0;                          /* lost at vt[8] return  */
+    ctx.slot         = g_slot_hook_installed ? g_current_slot : 0;
     ctx.vt8_input    = (uint16_t)(vt8_input & 0xFFFF);
 
     uint32_t v = engine_action_id;
@@ -298,27 +437,57 @@ extern "C" uint32_t mhfu_ai_action_dispatch_c(
     return v;
 }
 
-static int build_action_stub(uint32_t *stub, uint32_t dispatch_c_addr)
+/* Stub layout (21 insns, single-basic-block per Section 22 JIT rules):
+ *
+ *   addiu sp, sp, -0x20
+ *   sw    ra, 0x18(sp)
+ *   sw    a0, 0x04(sp)                ; save entity
+ *   sw    a1, 0x08(sp)                ; save engine input
+ *   jal   pre_dispatch_c              ; (a0=entity, a1=input) -> v0=new input
+ *   nop
+ *   sw    v0, 0x08(sp)                ; persist mutated input
+ *   lw    a0, 0x04(sp)
+ *   move  a1, v0                      ; a1 = mutated input
+ *   jal   VT8_ORIGINAL                ; engine picker runs with our input
+ *   nop
+ *   lw    a0, 0x04(sp)
+ *   lw    a1, 0x08(sp)                ; mutated input (post sees same value)
+ *   move  a2, v0                      ; engine outcome ptr / id
+ *   jal   post_dispatch_c             ; (a0,a1,a2) -> v0 final
+ *   nop
+ *   lw    ra, 0x18(sp)
+ *   jr    ra
+ *   addiu sp, sp, 0x20                ; delay slot
+ *
+ * Both dispatcher C functions early-out when their chain is empty, so a
+ * mod that only subscribes to one side pays only the call/return cost
+ * for the other.
+ */
+static int build_action_stub(uint32_t *stub,
+                             uint32_t pre_dispatch_addr,
+                             uint32_t post_dispatch_addr)
 {
     int i = 0;
     stub[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);
     stub[i++] = mips_sw   (MIPS_REG_RA,  0x18, MIPS_REG_SP);
-    stub[i++] = mips_sw   (MIPS_REG_S0,  0x14, MIPS_REG_SP);
-    stub[i++] = mips_sw   (MIPS_REG_S1,  0x10, MIPS_REG_SP);
-    stub[i++] = mips_sw   (MIPS_REG_A0,  0x04, MIPS_REG_SP);   /* save args */
-    stub[i++] = mips_sw   (MIPS_REG_A1,  0x08, MIPS_REG_SP);
-    /* original vt[8] reads a0,a1; we preserved them. Call original. */
+    stub[i++] = mips_sw   (MIPS_REG_A0,  0x04, MIPS_REG_SP);   /* save entity */
+    stub[i++] = mips_sw   (MIPS_REG_A1,  0x08, MIPS_REG_SP);   /* save input  */
+    /* PRE-call: (a0=entity, a1=input) -> v0 = mutated input. */
+    stub[i++] = mips_jal(pre_dispatch_addr);
+    stub[i++] = MIPS_NOP;
+    stub[i++] = mips_sw   (MIPS_REG_V0,  0x08, MIPS_REG_SP);   /* persist new input */
+    /* Call original vt[8] with the (possibly mutated) input. */
+    stub[i++] = mips_lw   (MIPS_REG_A0,  0x04, MIPS_REG_SP);
+    stub[i++] = mips_move (MIPS_REG_A1,  MIPS_REG_V0);
     stub[i++] = mips_jal(VT8_ORIGINAL);
-    stub[i++] = MIPS_NOP;                                       /* delay slot */
-    /* v0 = engine action_id; thread it through dispatcher. */
+    stub[i++] = MIPS_NOP;
+    /* POST-call: thread v0 through the action_decided chain. */
     stub[i++] = mips_lw   (MIPS_REG_A0,  0x04, MIPS_REG_SP);   /* a0 = entity */
-    stub[i++] = mips_lw   (MIPS_REG_A1,  0x08, MIPS_REG_SP);   /* a1 = vt8_input */
+    stub[i++] = mips_lw   (MIPS_REG_A1,  0x08, MIPS_REG_SP);   /* a1 = mutated input */
     stub[i++] = mips_move (MIPS_REG_A2,  MIPS_REG_V0);          /* a2 = engine v0 */
-    stub[i++] = mips_jal(dispatch_c_addr);
-    stub[i++] = MIPS_NOP;                                       /* delay slot */
-    /* v0 already holds dispatcher return. Restore + return. */
-    stub[i++] = mips_lw   (MIPS_REG_S1,  0x10, MIPS_REG_SP);
-    stub[i++] = mips_lw   (MIPS_REG_S0,  0x14, MIPS_REG_SP);
+    stub[i++] = mips_jal(post_dispatch_addr);
+    stub[i++] = MIPS_NOP;
+    /* v0 holds final dispatcher return. Restore + return. */
     stub[i++] = mips_lw   (MIPS_REG_RA,  0x18, MIPS_REG_SP);
     stub[i++] = mips_jr(MIPS_REG_RA);
     stub[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);    /* delay slot */
@@ -329,9 +498,12 @@ static int install_action_hook(void)
 {
     if (g_action_hook_installed) return 0;
 
-    uint32_t *stub = mhfu_cave_alloc(20);
+    uint32_t *stub = mhfu_cave_alloc(24);
     if (!stub) { mhfu_log("[ai] cave exhausted for action stub"); return -1; }
-    int n = build_action_stub(stub, (uint32_t)(uintptr_t)&mhfu_ai_action_dispatch_c);
+    int n = build_action_stub(
+        stub,
+        (uint32_t)(uintptr_t)&mhfu_ai_action_input_dispatch_c,
+        (uint32_t)(uintptr_t)&mhfu_ai_action_dispatch_c);
     (void)n;
     mhfu_flush_caches();
     g_action_stub = stub;
@@ -351,6 +523,252 @@ static int install_action_hook(void)
     if (hooked == 0) return -1;
     g_action_hook_installed = 1;
     mhfu_log("[ai] action_decided installed on %d species vt[8] slots", hooked);
+    return 0;
+}
+
+/* --- ai overlay loader hook -----------------------------------------
+ *
+ * Wraps the jal at EBOOT 0x0884EAA8 (postfix). When memcpy returns, the
+ * helper sees $a0 = original dest. If dest lies in the AI overlay range
+ * (0x09abf200..0x09bbf200), we fan out the chain — mods have a clean
+ * window to patch overlay code (e.g., the dispatcher at 0x09AC5228)
+ * before any AI tick runs and PPSSPP's JIT pre-caches the bytes. */
+extern "C" void mhfu_ai_overlay_loaded_helper(uint32_t /*ctx_a0*/)
+{
+    /* Postfix on the loader's jal: $a0 is the caller's loader-context
+     * (we ignore it). Detect by signature at OVERLAY_AI_PROBE, fire
+     * once per session — on the next quest map-enter we want the
+     * subscriber to re-apply if needed, but for now one-shot is safe
+     * because cold boot is the only path that resets engine memory. */
+    static volatile int s_fired = 0;
+    if (s_fired) return;
+    uint32_t w = *(volatile uint32_t *)OVERLAY_AI_PROBE;
+    if (w != OVERLAY_AI_PROBE_SIG) return;     /* not our overlay */
+    s_fired = 1;
+
+    /* Now that the AI overlay bytes are in RAM but the engine hasn't
+     * ticked AI yet (= no JIT translation of the overlay AI code), this
+     * is the window to install the overlay-side slot-loop wrapper that
+     * mirrors the EBOOT one. No-op if no slot_picked subscribers. */
+    extern int install_overlay_slot_hook_fwd(void);  /* see install fn below */
+    install_overlay_slot_hook_fwd();
+
+    if (g_overlay_n == 0) {
+        mhfu_log("[ai] AI overlay loaded (probe@0x%08X = 0x%08X) — no subscribers",
+                 OVERLAY_AI_PROBE, (unsigned)w);
+        return;
+    }
+    mhfu_ai_overlay_ctx_t ctx;
+    ctx.dest = OVERLAY_AI_BASE;
+    ctx.src  = 0;
+    ctx.size = OVERLAY_AI_SIZE;
+    for (int i = 0; i < g_overlay_n; i++) g_overlay_chain[i].cb(&ctx);
+}
+
+static int install_overlay_hook(void)
+{
+    if (g_overlay_hook_installed) return 0;
+    mhfu_hook_rc_t r = mhfu_install_call_wrapper(
+        OVERLAY_LOADER_JAL,
+        OVERLAY_LOADER_TARGET,
+        (void (*)(uint32_t))&mhfu_ai_overlay_loaded_helper,
+        MHFU_WRAP_POSTFIX,
+        AI_OWNER_TAG);
+    if (r != MHFU_HOOK_OK) {
+        mhfu_log("[ai] overlay loader wrap failed (r=%d)", (int)r);
+        return -1;
+    }
+    g_overlay_hook_installed = 1;
+    mhfu_log("[ai] overlay loader wrap queued @ 0x%08X (postfix on jal -> 0x%08X)",
+             OVERLAY_LOADER_JAL, OVERLAY_LOADER_TARGET);
+    return 0;
+}
+
+/* --- slot-loop wrapper (top of z_un_08865648's AI slot loop) ---------
+ *
+ * Patches the first two insns of the loop top with `J wrapper; nop`.
+ * The wrapper calls our C dispatcher with (entity=$s2, slot=$s1),
+ * receives the (possibly redirected) slot in $v0, rewrites $s1 (slot)
+ * and $s0 (entity + 2*slot — the +0x1B8 input cursor) to match, then
+ * replays the two displaced insns and falls through to the body.
+ *
+ * Wrapper layout (16 insns + nop padding):
+ *   addiu sp, sp, -0x10
+ *   sw    ra, 0x0c(sp)
+ *   move  a0, s2                 ; entity
+ *   jal   dispatch_c
+ *   move  a1, s1                 ; (delay) current slot
+ *   lw    ra, 0x0c(sp)
+ *   addiu sp, sp,  0x10
+ *   andi  v0, v0, 0xff           ; clamp to u8
+ *   move  s1, v0                 ; new slot
+ *   sll   v0, s1, 1              ; v0 = slot*2
+ *   addu  s0, s2, v0             ; $s0 = entity + 2*slot
+ *   sll   v0, s1, 6              ; replay displaced #1
+ *   addu  v0, s2, v0             ; replay displaced #2
+ *   j     SLOT_LOOP_BODY_RESUME  ; into 0x088656B8
+ *   nop                          ; (delay slot of J)
+ *
+ * z_un_08865648 saved its $ra to (its own) sp+0x0c in the prologue, so
+ * trashing $ra during the inner jal is harmless: the function reloads
+ * $ra from its frame before its final jr.  We use our own 0x10-byte
+ * frame purely so the inner jal has a clean stack window. */
+static int build_slot_wrapper(uint32_t *w, uint32_t dispatch_addr)
+{
+    int i = 0;
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x10);
+    w[i++] = mips_sw   (MIPS_REG_RA,  0x0c, MIPS_REG_SP);
+    w[i++] = mips_move (MIPS_REG_A0,  MIPS_REG_S2);              /* entity */
+    w[i++] = mips_jal  (dispatch_addr);
+    w[i++] = mips_move (MIPS_REG_A1,  MIPS_REG_S1);              /* delay: slot */
+    w[i++] = mips_lw   (MIPS_REG_RA,  0x0c, MIPS_REG_SP);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP,  0x10);
+    /* andi v0, v0, 0xff */
+    w[i++] = (0x0Cu << 26) | (MIPS_REG_V0 << 21) | (MIPS_REG_V0 << 16) | 0x00FFu;
+    w[i++] = mips_move (MIPS_REG_S1,  MIPS_REG_V0);              /* $s1 = new slot */
+    /* sll v0, s1, 1  (R-type: 0, 0, rd=v0, rt=s1, sa=1, sll func=0) */
+    w[i++] = (MIPS_REG_S1 << 16) | (MIPS_REG_V0 << 11) | (1 << 6) | 0x00u;
+    /* addu s0, s2, v0  (R-type: 0, rs=s2, rt=v0, rd=s0, sa=0, addu=0x21) */
+    w[i++] = (MIPS_REG_S2 << 21) | (MIPS_REG_V0 << 16) | (MIPS_REG_S0 << 11) | 0x21u;
+    /* Replay displaced insn #1: sll v0, s1, 6 */
+    w[i++] = (MIPS_REG_S1 << 16) | (MIPS_REG_V0 << 11) | (6 << 6) | 0x00u;
+    /* Replay displaced insn #2: addu v0, s2, v0 */
+    w[i++] = (MIPS_REG_S2 << 21) | (MIPS_REG_V0 << 16) | (MIPS_REG_V0 << 11) | 0x21u;
+    w[i++] = mips_j(SLOT_LOOP_BODY_RESUME);
+    w[i++] = MIPS_NOP;                                            /* delay slot */
+    while (i < 20) w[i++] = MIPS_NOP;
+    return i;
+}
+
+/* --- overlay-side slot-loop wrapper --------------------------------------
+ *
+ * Same dispatch C function as the EBOOT wrapper (`mhfu_ai_slot_picked_dispatch_c`)
+ * so any mod registered for on_bigmonster_slot_picked sees redirects fire
+ * from both paths.  Installed lazily from mhfu_ai_overlay_loaded_helper —
+ * by then the overlay bytes are in RAM but JIT hasn't yet translated them,
+ * so we patch with a direct write + cache flush (no quiet-gate needed).
+ *
+ * Wrapper layout (18 insns; cave alloc 20):
+ *   addiu sp, sp, -0x10
+ *   sw    ra, 0x0c(sp)
+ *   move  a0, s5                       ; entity
+ *   jal   dispatch_c
+ *   move  a1, s3                       ; (delay) current slot
+ *   move  s3, v0                       ; new slot
+ *   lw    ra, 0x0c(sp)
+ *   addiu sp, sp,  0x10
+ *   ori   t0, zero, 0xC8
+ *   mult  s3, t0                       ; HI:LO = slot * 0xC8
+ *   mflo  s1                           ; s1 = slot * 0xC8
+ *   sll   t0, s3, 1                    ; t0 = slot * 2
+ *   addu  s0, s5, t0                   ; s0 = entity + slot*2
+ *   sll   t0, s3, 6                    ; t0 = slot * 0x40
+ *   addu  s6, s5, t0                   ; s6 = entity + slot*0x40
+ *   lw    v1, 0x640(s5)                ; replayed insn #1
+ *   j     OVL_SLOT_LOOP_BODY_RESUME
+ *   addiu a0, zero, 2                  ; replayed insn #2 (J's delay slot)
+ */
+static int build_overlay_slot_wrapper(uint32_t *w, uint32_t dispatch_addr)
+{
+    int i = 0;
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x10);
+    w[i++] = mips_sw   (MIPS_REG_RA, 0x0c, MIPS_REG_SP);
+    w[i++] = mips_move (MIPS_REG_A0, MIPS_REG_S5);
+    w[i++] = mips_jal  (dispatch_addr);
+    w[i++] = mips_move (MIPS_REG_A1, MIPS_REG_S3);                /* delay */
+    w[i++] = mips_move (MIPS_REG_S3, MIPS_REG_V0);
+    w[i++] = mips_lw   (MIPS_REG_RA, 0x0c, MIPS_REG_SP);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP,  0x10);
+    /* ori t0, zero, 0xC8 */
+    w[i++] = (0x0Du << 26) | (MIPS_REG_ZERO << 21) | (MIPS_REG_T0 << 16) | 0x00C8u;
+    /* mult s3, t0 */
+    w[i++] = (MIPS_REG_S3 << 21) | (MIPS_REG_T0 << 16) | 0x18u;
+    /* mflo s1 */
+    w[i++] = (MIPS_REG_S1 << 11) | 0x12u;
+    /* sll t0, s3, 1 */
+    w[i++] = (MIPS_REG_S3 << 16) | (MIPS_REG_T0 << 11) | (1 << 6);
+    /* addu s0, s5, t0 */
+    w[i++] = (MIPS_REG_S5 << 21) | (MIPS_REG_T0 << 16) | (MIPS_REG_S0 << 11) | 0x21u;
+    /* sll t0, s3, 6 */
+    w[i++] = (MIPS_REG_S3 << 16) | (MIPS_REG_T0 << 11) | (6 << 6);
+    /* addu s6, s5, t0 */
+    w[i++] = (MIPS_REG_S5 << 21) | (MIPS_REG_T0 << 16) | (MIPS_REG_S6 << 11) | 0x21u;
+    /* replay #1: lw v1, 0x640(s5) */
+    w[i++] = mips_lw(MIPS_REG_V1, 0x640, MIPS_REG_S5);
+    w[i++] = mips_j(OVL_SLOT_LOOP_BODY_RESUME);
+    /* replay #2 (J delay slot): addiu a0, zero, 2 */
+    w[i++] = mips_addiu(MIPS_REG_A0, MIPS_REG_ZERO, 2);
+    while (i < 20) w[i++] = MIPS_NOP;
+    return i;
+}
+
+/* External alias so the helper above can forward-call without a header. */
+extern "C" int install_overlay_slot_hook_fwd(void);
+
+static int install_overlay_slot_hook(void)
+{
+    if (g_overlay_slot_hook_installed) return 0;
+    /* Skip if nobody subscribed — saves cave words for unused capability. */
+    if (g_slot_n == 0) return 0;
+
+    uint32_t *w = mhfu_cave_alloc(20);
+    if (!w) { mhfu_log("[ai] cave exhausted for ovl slot wrapper"); return -1; }
+    build_overlay_slot_wrapper(w,
+        (uint32_t)(uintptr_t)&mhfu_ai_slot_picked_dispatch_c);
+    mhfu_flush_caches();
+    g_overlay_slot_wrapper = w;
+
+    uint32_t cur0 = *(volatile uint32_t *)OVL_SLOT_LOOP_TOP;
+    uint32_t cur1 = *(volatile uint32_t *)(OVL_SLOT_LOOP_TOP + 4);
+    if (cur0 != OVL_SLOT_LOOP_DISPLACED0 || cur1 != OVL_SLOT_LOOP_DISPLACED1) {
+        mhfu_log("[ai] ovl slot loop unexpected: [0x%08X]=0x%08lx [0x%08X]=0x%08lx",
+                 OVL_SLOT_LOOP_TOP, (unsigned long)cur0,
+                 OVL_SLOT_LOOP_TOP + 4, (unsigned long)cur1);
+        return -1;
+    }
+    *(volatile uint32_t *)OVL_SLOT_LOOP_TOP       = mips_j((uint32_t)(uintptr_t)w);
+    *(volatile uint32_t *)(OVL_SLOT_LOOP_TOP + 4) = MIPS_NOP;
+    mhfu_flush_caches();
+
+    g_overlay_slot_hook_installed = 1;
+    mhfu_log("[ai] ovl slot loop wrapped @ 0x%08X (wrapper 0x%08X, resumes 0x%08X)",
+             OVL_SLOT_LOOP_TOP, (unsigned)(uintptr_t)w, OVL_SLOT_LOOP_BODY_RESUME);
+    return 0;
+}
+
+extern "C" int install_overlay_slot_hook_fwd(void) { return install_overlay_slot_hook(); }
+
+static int install_slot_hook(void)
+{
+    if (g_slot_hook_installed) return 0;
+
+    uint32_t *w = mhfu_cave_alloc(20);
+    if (!w) { mhfu_log("[ai] cave exhausted for slot wrapper"); return -1; }
+    build_slot_wrapper(w, (uint32_t)(uintptr_t)&mhfu_ai_slot_picked_dispatch_c);
+    mhfu_flush_caches();
+    g_slot_wrapper = w;
+
+    /* Displaced insns:
+     *   0x088656B0  sll  $v0, $s1, 6   (encoded as 0x00111180)
+     *   0x088656B4  addu $v0, $s2, $v0 (encoded as 0x02421021)
+     * Replace with: J wrapper ; NOP */
+    uint32_t orig0 = (MIPS_REG_S1 << 16) | (MIPS_REG_V0 << 11) | (6 << 6) | 0x00u;
+    uint32_t orig1 = (MIPS_REG_S2 << 21) | (MIPS_REG_V0 << 16) | (MIPS_REG_V0 << 11) | 0x21u;
+    uint32_t new0  = mips_j((uint32_t)(uintptr_t)w);
+    uint32_t new1  = MIPS_NOP;
+
+    mhfu_hook_rc_t r0 = mhfu_patch_word_when_quiet(
+        SLOT_LOOP_TOP + 0x00, orig0, new0, AI_OWNER_TAG);
+    mhfu_hook_rc_t r1 = mhfu_patch_word_when_quiet(
+        SLOT_LOOP_TOP + 0x04, orig1, new1, AI_OWNER_TAG);
+    if (r0 != MHFU_HOOK_OK || r1 != MHFU_HOOK_OK) {
+        mhfu_log("[ai] slot loop queue failed (r0=%d r1=%d)", (int)r0, (int)r1);
+        return -1;
+    }
+
+    g_slot_hook_installed = 1;
+    mhfu_log("[ai] slot_picked patch queued @ 0x%08X (wrapper 0x%08X)",
+             SLOT_LOOP_TOP, (unsigned)(uintptr_t)w);
     return 0;
 }
 
@@ -430,6 +848,40 @@ static int install_step_hook(void)
 
 /* --- public registration --------------------------------------------- */
 
+extern "C" mhfu_hook_rc_t mhfu_on_ai_overlay_loaded(
+    mhfu_ai_overlay_loaded_cb_t cb, int priority)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    if (install_overlay_hook() != 0) return MHFU_HOOK_CONFLICT;
+    CHAIN_INSERT(g_overlay_chain, g_overlay_n, MAX_HANDLERS, cb, priority);
+    return MHFU_HOOK_OK;
+}
+
+extern "C" mhfu_hook_rc_t mhfu_off_ai_overlay_loaded(
+    mhfu_ai_overlay_loaded_cb_t cb)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    CHAIN_REMOVE(g_overlay_chain, g_overlay_n, cb);
+}
+
+extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_slot_picked(
+    mhfu_slot_picked_override_cb_t cb, int priority)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    if (install_slot_hook() != 0) return MHFU_HOOK_CONFLICT;
+    CHAIN_INSERT(g_slot_chain, g_slot_n, MAX_HANDLERS, cb, priority);
+    return MHFU_HOOK_OK;
+}
+
+extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_action_input(
+    mhfu_action_input_override_cb_t cb, int priority)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    if (install_action_hook() != 0) return MHFU_HOOK_CONFLICT;
+    CHAIN_INSERT(g_input_chain, g_input_n, MAX_HANDLERS, cb, priority);
+    return MHFU_HOOK_OK;
+}
+
 extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_action_decided(
     mhfu_action_override_cb_t cb, int priority)
 {
@@ -446,6 +898,20 @@ extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_ai_step(
     if (install_step_hook() != 0) return MHFU_HOOK_CONFLICT;
     CHAIN_INSERT(g_step_chain, g_step_n, MAX_HANDLERS, cb, priority);
     return MHFU_HOOK_OK;
+}
+
+extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_slot_picked(
+    mhfu_slot_picked_override_cb_t cb)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    CHAIN_REMOVE(g_slot_chain, g_slot_n, cb);
+}
+
+extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_action_input(
+    mhfu_action_input_override_cb_t cb)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    CHAIN_REMOVE(g_input_chain, g_input_n, cb);
 }
 
 extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_action_decided(

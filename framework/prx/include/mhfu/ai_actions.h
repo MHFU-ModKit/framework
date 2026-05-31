@@ -193,4 +193,26 @@ int mhfu_action_is_valid(uint8_t monster_type, uint32_t action_id);
 #define TIGREX_VT8_PROBE_0x0190    0x0190u
 #define TIGREX_VT8_PROBE_0x0258    0x0258u
 
+/* Friendly-name aliases — hand-curated mapping (see
+ * tools/dump_tigrex_inputs.py:TIGREX_INPUT_LABELS). Emitted
+ * unconditionally so mods can match on these even when the raw
+ * VT8_INPUT macro for the input wasn't snooped this run. */
+#define TIGREX_ANGRY_BITE_FORWARD       0x05A1u  /* not observed this run */
+#define TIGREX_ANGRY_BRIEFHALT          0x057Au  /* not observed this run */
+#define TIGREX_ANGRY_CHARGE             0x0589u  /* not observed this run */
+#define TIGREX_ANGRY_CHARGE_STOP        0x0581u  /* not observed this run */
+#define TIGREX_ANGRY_CHARGE_TURN        0x0584u  /* not observed this run */
+#define TIGREX_ANGRY_JUMP_FORWARD       0x05A7u  /* not observed this run */
+#define TIGREX_ANGRY_JUMP_LAND          0x05A8u  /* not observed this run */
+#define TIGREX_ANGRY_SPIN               0x05A3u  /* not observed this run */
+#define TIGREX_ANGRY_THROWROCKS         0x05A5u  /* not observed this run */
+#define TIGREX_ANGRY_TURN_LEFT          0x0580u  /* not observed this run */
+#define TIGREX_ANGRY_TURN_RIGHT         0x057Fu  /* not observed this run */
+#define TIGREX_ENTERMAP_FALLDOWN        0x0583u
+#define TIGREX_ENTERMAP_FALLDOWN_LAND   0x058Bu
+#define TIGREX_IDLE_STAND               0x0598u
+#define TIGREX_IDLE_SUSPICIOUS          0x05C8u
+#define TIGREX_IDLE_TURN_LEFT           0x057Eu
+#define TIGREX_IDLE_WALKSTRAIGHT        0x057Bu
+
 #endif /* MHFU_AI_ACTIONS_H */
