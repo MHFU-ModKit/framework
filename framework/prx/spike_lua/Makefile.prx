@@ -1,0 +1,16 @@
+# Phase-0 spike part B — PRX link test under the framework's light-C++ regime.
+# Crucially: NO -lstdc++. If this links, Lua needs no C++ runtime.
+TARGET = lua_prx_test
+OBJS = prx_link_test.o
+
+CFLAGS   = -O2 -G0 -Wall -fno-strict-aliasing
+CXXFLAGS = $(CFLAGS) -std=gnu++17 -fno-exceptions -fno-rtti -fno-threadsafe-statics
+ASFLAGS  = $(CFLAGS)
+
+BUILD_PRX = 1
+
+# Same libs the framework uses, plus lua + libm. Deliberately NO -lstdc++.
+LIBS = -llua -lm -lpspdebug -lpspdisplay -lpspge -lpspctrl -lpspsdk -lc -lpspuser
+
+PSPSDK = $(shell psp-config --pspsdk-path)
+include $(PSPSDK)/lib/build.mak

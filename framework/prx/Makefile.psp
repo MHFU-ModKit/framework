@@ -41,7 +41,10 @@ ASFLAGS  = $(CFLAGS)
 BUILD_PRX   = 1
 PRX_EXPORTS = framework_exports.exp
 
-LIBS = -lpspdebug -lpspdisplay -lpspge -lpspctrl -lpspsdk -lc -lpspuser
+# SDK stub libs first (psp-fixup-imports needs them ordered); -llua -lm are
+# plain static archives (no import stubs) pulled by mods/lua_host, so they go
+# last, after the objects that reference them.
+LIBS = -lpspdebug -lpspdisplay -lpspge -lpspctrl -lpspsdk -lc -lpspuser -llua -lm
 
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak

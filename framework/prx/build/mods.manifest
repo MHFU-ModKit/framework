@@ -3,9 +3,11 @@
 # One mod per line, path relative to mods/. Lines starting with # are
 # disabled. The Makefile turns each entry into mods/<entry>/mod.o.
 
-tigrex_spin
+lua_host
 
 # --- disabled --------------------------------------------------------------
+# tigrex_spin   # injects Tigrex into the quest -> crashes on section-1 entry
+#               # (no big-monster spawn tile there). Keep OFF for popo tests.
 # diag
 # tigrex_inject
 # ai_publish

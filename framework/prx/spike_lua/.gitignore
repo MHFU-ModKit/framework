@@ -1,0 +1,7 @@
+# Phase-0 spike build artifacts — sources only in git.
+*.o
+*.elf
+*.prx
+!Makefile.prx
+*.SFO
+*.PBP
