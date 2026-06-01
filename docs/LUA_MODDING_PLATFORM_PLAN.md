@@ -384,12 +384,23 @@ spawned. Findings while chasing it:
 * Lua-panic was ruled out as the trigger: a `lua_atpanic` handler that parks the
   poll thread instead of `abort()`-ing was added, and the crash still happened —
   so it is not the Lua VM aborting.
-* **Hypothesis (unverified):** the 2 Hz poll thread reading game RAM *during the
-  volatile section-1 load window* (registry walk and/or fixed reads on a frame
-  where pointers/areas are mid-init) tips the engine into the exit. The
-  framework's own `mhfu_spawn_poll` walks the registry too, but historically
-  worked in section 1 (popo_growth), so the delta is the Lua VM thread + its
-  read cadence/timing.
+* **PRIME hypothesis (unverified — try FIRST next session): poll-thread stack
+  overflow.** The crash fires *exactly* when `area` flips to 99 — i.e. the
+  instant popos spawn and `mhfu_tick` runs its **heavy branch** (`string.format`
+  per popo + `table.concat`). The lua_host poll thread is created with only an
+  **8 KB stack** (`sceKernelCreateThread(..., 0x2000, ...)` in `lua_host_init`).
+  Lua `lua_pcall` + `string.format` + the C bindings on an 8 KB PSP thread stack
+  is a classic overflow → corruption → clean exit. The log shows the *previous*
+  tick (`popos=0`) because the crashing tick dies mid-format before it can log.
+  **Fix to try:** bump the create-thread stack to `0x10000` (64 KB) — one-liner —
+  and re-run the cold-boot walker. (Note: the `scr==17` read-gate already applied
+  does NOT cover this — in section 1 `scr==17` AND popos present, so the heavy
+  branch still runs; the stack is the suspect, not the gate.)
+* Secondary hypothesis: the 2 Hz poll thread reading game RAM *during the
+  section-1 load window* tips the engine into the exit. The framework's own
+  `mhfu_spawn_poll` walks the registry too but historically worked in section 1
+  (popo_growth), so the delta is the Lua VM thread (stack/timing). Less likely
+  than the stack overflow given the crash timing lines up with first popo spawn.
 * **Mitigation applied (untested against the crash):** the demo `mhfu_tick` now
   **gates ALL reads behind `scr==17`** (a stable in-area frame) and only reads
   the single fixed screen-state byte otherwise — so the poll thread touches no
