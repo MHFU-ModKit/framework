@@ -30,7 +30,12 @@ extern "C" {
  * forward coalescing). ~12 KB live for a typical mod (Phase 0 measured),
  * so 256 KB is generous headroom for many script mods + GC churn.
  */
-#define LUA_SLAB_BYTES (512 * 1024)
+/* Lua needs ~15 KB live for the demo (Phase 0/1 measured). Keep the slab
+ * SMALL: MHFU leaves only ~1 MB free at runtime and each section-1 load
+ * pulls its own model/anim PAC — reserving a big slab starves that load and
+ * the game bails with sceKernelExitGame on section entry. 64 KB = 4x headroom
+ * while returning the rest to the game. */
+#define LUA_SLAB_BYTES (64 * 1024)
 
 typedef struct blk_hdr { unsigned size; unsigned free; } blk_hdr; /* 8 bytes */
 
@@ -332,6 +337,9 @@ static int worker(SceSize args, void *argp)
 
 static int lua_host_init(void)
 {
+    mhfu_log("[lua_host] free mem before slab: max=%u total=%u",
+             (unsigned)sceKernelMaxFreeMemSize(),
+             (unsigned)sceKernelTotalFreeMemSize());
     /* reserve a dedicated slab so Lua never fights the game's allocator */
     g_slab_uid = sceKernelAllocPartitionMemory(
         2 /* PSP_MEMORY_PARTITION_USER */, "mhfu_lua_slab",
@@ -340,6 +348,10 @@ static int lua_host_init(void)
         mhfu_log("[lua_host] AllocPartitionMemory FAILED rc=0x%08X", g_slab_uid);
         return -1;
     }
+    mhfu_log("[lua_host] free mem after %uKB slab: max=%u total=%u",
+             (unsigned)(LUA_SLAB_BYTES / 1024),
+             (unsigned)sceKernelMaxFreeMemSize(),
+             (unsigned)sceKernelTotalFreeMemSize());
     void *base = sceKernelGetBlockHeadAddr(g_slab_uid);
     /* 8-byte align */
     unsigned a = ((unsigned)base + 7u) & ~7u;
@@ -347,9 +359,12 @@ static int lua_host_init(void)
 
     if (lua_host_setup() != 0) return -1;
 
+    /* 64 KB stack: the demo's heavy branch (string.format per popo +
+     * table.concat through lua_pcall) overflows a small PSP thread stack the
+     * instant popos spawn — prime suspect for the section-1-entry crash. */
     SceUID th = sceKernelCreateThread("mhfu_lua_host",
                                       (SceKernelThreadEntry)worker,
-                                      0x18, 0x2000, 0, 0);
+                                      0x18, 0x10000, 0, 0);
     if (th < 0) { mhfu_log("[lua_host] CreateThread FAILED"); return -1; }
     sceKernelStartThread(th, 0, 0);
     mhfu_log("[lua_host] init OK, poll thread started");

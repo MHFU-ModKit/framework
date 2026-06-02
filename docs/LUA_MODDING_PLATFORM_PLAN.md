@@ -201,11 +201,12 @@ end)
 - See `## Phase 0 RESULTS` below. All three unknowns retired with live numbers.
 - Spike source kept under `framework/prx/spike_lua/` (reproducible).
 
-**Phase 1 — Static host, embedded script. ◑ MOSTLY DONE 2026-06-01.**
+**Phase 1 — Static host, embedded script. ✅ DONE 2026-06-02. PASS.**
 - `mods/lua_host/mod.cpp` shipped; a sandboxed Lua mod runs in
-  `mhfu_framework.prx` and reads live game memory (PROVEN). **Open:** reading
-  Popo HP *in section 1* is blocked by a `sceKernelExitGame` crash on section-1
-  entry whenever the PRX is loaded. See `## Phase 1 RESULTS` below.
+  `mhfu_framework.prx` and reads live game memory — **including Popo HP in snow
+  section 1** (verified: 2 popos, `hp=102`). The section-1-entry crash was a
+  memory-budget bug (512 KB slab > free contiguous RAM); fixed by a 64 KB slab.
+  See `## Phase 1 RESULTS` below.
 
 **Phase 2 — Events + AI override binding. ~1–2 days.**
 - Bind `mhfu.on(...)` for the 5 fan-out events (ctx→table). Bind the AI override
@@ -321,7 +322,43 @@ docker run --rm -v "$(pwd)":/work -w /work pspdev/pspdev:latest make -f Makefile
 # run EBOOT.PBP on PPSSPP → writes ms0:/lua_spike.log (memstick root)
 ```
 
-## Phase 1 RESULTS (2026-06-01) — live-read PROVEN; popo-HP-in-section-1 OPEN
+## Phase 1 RESULTS — PASS
+
+**RESOLVED 2026-06-02 — Popo HP read live in section 1.** The Lua mod logged:
+```
+[lua_mod] tick=179 scr=17 area=99 popos=2 | #1@090C28E0 hp=102 sz=0.80  #2@090C7340 hp=102 sz=1.10
+```
+All Phase-1 goals met: sandboxed Lua mod runs in the PRX, reads live game memory,
+walks the entity registry, reads each Popo's HP in snow section 1.
+
+**Root cause of the section-1-entry crash = MEMORY EXHAUSTION (not stack, not
+reads, not a Lua panic).** The free-mem log told the story:
+```
+[lua_host] free mem before slab: max=490496 total=709120   (~479 KB contiguous,
+                                                             ~692 KB total free)
+[lua_host] free mem after 64KB slab: max=424704 total=643328
+```
+With MHFU running, only **~479 KB *contiguous*** free exists. The original
+**512 KB** `sceKernelAllocPartitionMemory` slab either failed or left too little
+for the snow section-1 interior asset load (each section swaps in its own
+model/anim PAC), so the game's resource loader bailed with `sceKernelExitGame`
+exactly at the 98→99 transition (one frame rendered, then exit). Basecamp was
+already resident so it survived. **Fix: 64 KB slab** (Lua needs ~15 KB live;
+4× headroom) — returns ~448 KB to the game; section 1 now loads and the mod runs.
+
+Bisection that nailed it (each a separate cold-boot run):
+1. plugin **disabled** → section 1 fine ⇒ it's our framework, not the game/quest.
+2. **core-only** PRX (noop mod) → section 1 fine ⇒ not the framework core.
+3. **lua_host, 512 KB slab** → crash ⇒ lua_host.
+4. **lua_host, 64 KB slab** → section 1 fine + Popo HP logged ⇒ memory budget.
+
+Lesson for the platform: **keep the Lua slab small** (the Phase-0 "512 KB fits
+dozens of mods" was true for Lua's heap need but ignored that MHFU leaves <512 KB
+*contiguous* at runtime and section loads need it). Size the slab to measured
+live use + margin; consider freeing/relocating it, or allocating lazily, if
+future mods need more.
+
+### (original Phase-1 build notes — 2026-06-01)
 
 Shipped `framework/prx/mods/lua_host/mod.cpp` — a descriptor mod that embeds a
 sandboxed Lua 5.4 VM in `mhfu_framework.prx` and runs an embedded Lua "script

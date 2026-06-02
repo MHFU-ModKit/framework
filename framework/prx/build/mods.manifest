@@ -6,6 +6,10 @@
 lua_host
 
 # --- disabled --------------------------------------------------------------
+# noop          # core-only bisect build (kept for future isolation)
+# tigrex_spin   # injects Tigrex -> crashes section-1 entry; keep OFF for popo
+
+# --- disabled --------------------------------------------------------------
 # tigrex_spin   # injects Tigrex into the quest -> crashes on section-1 entry
 #               # (no big-monster spawn tile there). Keep OFF for popo tests.
 # diag
