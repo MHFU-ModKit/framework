@@ -3,15 +3,14 @@
 # One mod per line, path relative to mods/. Lines starting with # are
 # disabled. The Makefile turns each entry into mods/<entry>/mod.o.
 
+# --- Lua platform ----------------------------------------------------------
+# lua_host runs scripts/tigrex_spin.lua (action_input force path). Keep the C
+# tigrex_spin OFF — both claim the vt[8] chain (CONFLICT).
 lua_host
 
 # --- disabled --------------------------------------------------------------
+# tigrex_spin   # C baseline; crashes on spin via action_decided ptr-force
 # noop          # core-only bisect build (kept for future isolation)
-# tigrex_spin   # injects Tigrex -> crashes section-1 entry; keep OFF for popo
-
-# --- disabled --------------------------------------------------------------
-# tigrex_spin   # injects Tigrex into the quest -> crashes on section-1 entry
-#               # (no big-monster spawn tile there). Keep OFF for popo tests.
 # diag
 # tigrex_inject
 # ai_publish

@@ -161,6 +161,25 @@ typedef struct {
 typedef void (*mhfu_bigmonster_spawn_cb_t)(const mhfu_bigmonster_spawn_ctx_t *ctx);
 typedef void (*mhfu_bigmonster_death_cb_t)(const mhfu_bigmonster_death_ctx_t *ctx);
 
+/* Context for on_bigmonster_action — the COHERENT action-selection seam.
+ * Hook = entry detour on the big-monster action EXECUTOR (overlay
+ * 0x09AC5228). `action_id` is the index the engine is about to execute
+ * (literally the executor's $a1 argument). The executor fans this ONE id
+ * to every body-part slot itself (per-slot input = action_id + 0x3E8 +
+ * slot*0xC8) and runs the engine's own vt[8] resolver + applier, so
+ * overriding it here is DESYNC-FREE — unlike the per-slot
+ * on_bigmonster_action_input (which only fires for one slot and crashes
+ * the body if the slots disagree). This is the right surface for forcing
+ * a big-monster action. `action_id` relates to the documented vt8_input
+ * as: action_id = vt8_input(slot2) - 0x578 = vt8_input(slot0) - 0x3E8.
+ * The executor is GENERIC (shared by several entities) — always check
+ * monster_type. */
+typedef struct {
+    uint32_t entity_ptr;
+    uint8_t  monster_type;
+    uint16_t action_id;
+} mhfu_action_sel_ctx_t;
+
 /* --- handler signatures ---------------------------------------------- */
 
 /* Override handlers: receive the engine's current decision (already
@@ -199,6 +218,14 @@ typedef uint8_t (*mhfu_slot_picked_override_cb_t)(
 
 typedef void (*mhfu_ai_step_cb_t)(const mhfu_ai_step_ctx_t *ctx);
 
+/* Override handler for on_bigmonster_action. Receives the action id the
+ * engine is about to execute (already threaded through higher-priority
+ * handlers) and returns the id to actually run. Return `action_id`
+ * unchanged to abstain. The engine fans the returned id to all body
+ * slots, so any single valid action id is coherent (no desync). */
+typedef uint32_t (*mhfu_action_sel_override_cb_t)(
+    const mhfu_action_sel_ctx_t *ctx, uint32_t action_id);
+
 /* AI-overlay-loaded handler. Observe-only — no override semantics. */
 typedef void (*mhfu_ai_overlay_loaded_cb_t)(const mhfu_ai_overlay_ctx_t *ctx);
 
@@ -218,6 +245,12 @@ mhfu_hook_rc_t mhfu_on_bigmonster_action_decided(
     mhfu_action_override_cb_t cb, int priority);
 mhfu_hook_rc_t mhfu_on_bigmonster_ai_step(
     mhfu_ai_step_cb_t cb, int priority);
+
+/* The coherent action-force seam (entry of executor 0x09AC5228). */
+mhfu_hook_rc_t mhfu_on_bigmonster_action(
+    mhfu_action_sel_override_cb_t cb, int priority);
+mhfu_hook_rc_t mhfu_off_bigmonster_action(
+    mhfu_action_sel_override_cb_t cb);
 
 mhfu_hook_rc_t mhfu_on_bigmonster_spawn(
     mhfu_bigmonster_spawn_cb_t cb, int priority);
