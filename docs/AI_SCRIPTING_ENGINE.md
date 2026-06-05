@@ -1054,3 +1054,113 @@ EU CWCheat "Auto-Paint Bosses" `_L 0x008B3A6A 0x000000FF` → real `0x090B3A6A`,
 u8 `0xFF`, re-written ≥2 Hz (`mhfu.write_u8(0x090B3A6A,0xFF)` in `mhfu_tick`).
 Marker shows the logical position even when the monster is render-unbound
 (`entity+0x008==0`).
+
+---
+
+# AI override-event API detail (migrated from CLAUDE.md, 2026-06-05)
+
+**AI override-event API (Section 32d–32i, 2026-05-30; action-force seam
+2026-06-03, all verified live).** The framework exposes priority-chain
+sync-override events on the generic monster-AI engine — `mhfu/ai.h`.
+
+* **★ Action force (COHERENT OVERRIDE — use this to force big-mon actions)**
+  — `mhfu_on_bigmonster_action(cb, priority)` (Lua `mhfu.on_bigmonster_action`).
+  Entry-detour on the big-mon action **EXECUTOR** `0x09AC5228` =
+  `f(entity, a1 = action_id, …)`. `cb(ctx{entity,type,action_id}, a1) -> a1`.
+  The executor fans the returned id to **all 3 body-part slots itself**
+  (per-slot input = `a1 + 0x3E8 + slot*0xC8`) through the engine's own vt[8]
+  resolver + applier → **coherent, no desync, no crash**, and aggro/music/
+  stamina side-systems keep running. `a1 = vt8_input(slot2) - 0x578`
+  (= slot0_input − 0x3E8); e.g. Tigrex ANGRY_SPIN `a1=0x2B`, IDLE_STAND
+  `a1=0x20`. **VERIFIED 2026-06-03: visible Tigrex locked into continuous
+  ANGRY_SPIN, no crash, no freeze.** Three gotchas, all handled by the
+  reference mod `mods/lua_host/scripts/tigrex_spin.lua`:
+  1. **Re-patch survives roams.** It's overlay code (JIT-fragile). Installed
+     from the overlay-loaded helper, which now RE-FIRES (one-shot dropped) →
+     re-applies the patch in the JIT-cold window after a section roam
+     re-memcpy's the overlay. Plus a `map_section_entered` re-patch fallback.
+  2. **`read_u32(0x09AC5228) == 0x68XX` marker ≠ dead hook** — it's PPSSPP's
+     JIT translation of OUR `J`; execution still routes through the wrapper.
+  3. **Freeze gate `entity+0x4B8`** — forced repeat-fire makes the engine OR
+     in `0x10000|0x100` and halt the AI tick (frozen, aggro persists). Zero
+     `+0x4B8` each fire AND from a worker-thread net (the halted AI tick
+     can't run the per-fire clear, so the worker revives it live).
+* **Picker / per-slot resolver (OBSERVE; SUPERSEDED for forcing)** —
+  `mhfu_on_bigmonster_action_decided(cb, priority)`: vt[8] swap on shared
+  `0x08865254`, JIT-immune. `cb(ctx, engine_value) -> new_value`. For
+  small-mon-shape (POPO/ANTEKA/GIADROME) it returns a flat u16 action id and
+  still works to force; for **true-big-mon (TIGREX) it fires PER-SLOT** and
+  forcing through it desyncs the body → **crash** — use `on_bigmonster_action`
+  instead. `on_bigmonster_action_input` (vt[8] input mutate, same caveat:
+  only one slot calls back → desync) is likewise superseded for forcing.
+  Keep these for telemetry / small-mon.
+* **Per-frame tick (OBSERVE)** — `mhfu_on_bigmonster_ai_step(cb, priority)`:
+  entry detour on `z_un_08865648`. NOT for action override (engine already
+  uses vt[8] inside this function); for telemetry, distance checks, etc.
+  Quiet-gated at TITLE/MENU (Section 26 JIT bypass). Verified live: word
+  @0x08865648 = `J 0x09D87F50` (`0x0A761FD4`), word @0x0886564C = NOP.
+* **Lifecycle** — `mhfu_on_bigmonster_spawn` / `_death` (observe, 5 Hz poll).
+* **Dropped**: `anim_decided` — RE showed `z_un_0885f928` does a slot-index
+  tree lookup returning the per-slot state-container, not a transform of
+  vt[8]'s output (docs/AI_SCRIPTING_ENGINE.md §32g).
+
+**Two AI classes** (`docs/AI_SCRIPTING_ENGINE.md` §32h):
+| Class | Species | vt[8] returns | Override pattern |
+|-------|---------|---------------|------------------|
+| small-mon-shape | POPO, ANTEKA, **GIADROME** | u16 action ID (zero-ext u32) | return `<SPECIES>_ACTION_*` macro value |
+| true-big-mon | TIGREX | POINTER into entity+0x1AC sub-table | return ptr from cache; see below |
+
+Quest UI lumps tigrex+giadrome as "big monster" (counted as targets); the
+internal AI tier differs. Tigrex needs richer per-action data (anim group,
+hitbox geom, range floats), so engine uses descriptor pointers instead of
+flat IDs. **The per-slot `vt[8] returns` distinction above matters for the
+SUPERSEDED action_decided path; the recommended `on_bigmonster_action` seam
+sidesteps it entirely — you return one flat `a1` action id for either class
+and the executor handles the fan-out + (for tigrex) the ptr resolution.**
+
+**Action descriptor table** (the engine's per-species move "database", RE'd
+2026-06-03): base ptr at `entity+0x640` (`0x09D5A580`; type-0x3A remap table
+`0x09BD38F0` swapped in when `entity+0x638` bit 0 set). 8-byte rows indexed by
+`a1`: `+0` action-id byte, `+1` slot/body-part kind, `+3` remap index, `+4`
+param (→`+0x32C`), `+6` param (→`+0x334` mode). **Binary only — NO
+human-readable move names exist in the game.** The `<SPECIES>_ACTION_*` /
+`TIGREX_VT8_INPUT_*` names in `ai_actions.h` + the `LABEL` table are
+hand-authored by observing forced actions in-game. Dump the table + force-cycle
+`a1` via `on_bigmonster_action` to enumerate + name a species' full moveset.
+
+**Auto-paint map cheat (find a roaming monster):** EU CWCheat "Auto-Paint
+Bosses" `_L 0x008B3A6A 0x000000FF` → real addr `0x090B3A6A`, write u8 `0xFF`
+continuously (≥2 Hz). Applied live from Lua via `mhfu.write_u8(0x090B3A6A,
+0xFF)` in `mhfu_tick`. Shows big monsters on the in-game map like a paintball.
+Marker shows the LOGICAL position even when the monster is not being drawn
+(e.g. a swap-spawned Tigrex culled by the `+0x29A` section-mismatch gate, or one
+genuinely in another section).
+
+**Species action enums** (`mhfu/ai_actions.h`, regenerated from tigrex_s6):
+* `POPO_ACTION_0x????` — 13. `ANTEKA_ACTION_0x????` — 40.
+* `GIADROME_ACTION_0x????` — 34. `TIGREX_VT8_INPUT_0x????` — 50 (+4 probe).
+* Tigrex's `+0x0C` species data is **hitzone**, not an action list, so it
+  gets `TIGREX_VT8_INPUT_*` (stable u16 inputs) instead of action IDs;
+  the ptr the engine resolves to is per-run.
+* `mhfu_action_is_valid(type, id)` runtime-walks the species table.
+
+**Tigrex ptr-resolution helper** (Section 32i, passive cache):
+```c
+uint32_t mhfu_action_ptr_for(uint8_t monster_type, uint16_t vt8_input);
+```
+Framework snoops every `(input, ptr)` pair from `action_decided` callbacks
+into a 96-entry-per-species cache (even with zero subscribers). Mods call
+the lookup with a `TIGREX_VT8_INPUT_*` macro and get the engine's last
+resolved ptr — or 0 if the engine hasn't picked that action yet this run
+(cache warmup). Eager resolver (calling vt[8] directly) deferred because
+vt[8] has VFPU + small-RNG side effects; passive cache covers ~99% of
+practical mod work.
+
+**Other SDK helpers**:
+* `mhfu_monster_name(type)` (`mhfu/ids.h`) — `"POPO"` / `"ANTEKA"` /
+  `"TIGREX"` / `"GIADROME"`, or `"0xNN"` fallback. For logging.
+* `mhfu_action_cache_size(type)` + `mhfu_action_cache_entry(type, i, …)`
+  for cache introspection.
+
+Reference mod: `framework/prx/mods/experimental/ai_demo/mod.cpp`.
+
