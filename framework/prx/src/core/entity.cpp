@@ -106,6 +106,36 @@ void mhfu_entity_set_engaged(uint32_t ent, int engaged)
     if (in_ram(ent)) mhfu_write_f32(ent + MHFU_ENT_ENGAGE_FLAG, engaged ? 1.0f : 0.0f);
 }
 
+uint16_t mhfu_entity_section(uint32_t ent)
+{
+    return in_ram(ent) ? *(volatile uint16_t *)(ent + MHFU_ENT_SECTION) : 0;
+}
+void mhfu_entity_set_section(uint32_t ent, uint16_t section)
+{
+    if (in_ram(ent)) *(volatile uint16_t *)(ent + MHFU_ENT_SECTION) = section;
+}
+
+void mhfu_entity_make_visible(uint32_t ent, uint16_t section)
+{
+    if (!in_ram(ent)) return;
+    if (*(volatile uint16_t *)(ent + MHFU_ENT_SECTION) != section)
+        *(volatile uint16_t *)(ent + MHFU_ENT_SECTION) = section;
+    uint32_t fl = mhfu_read_u32(ent + MHFU_ENT_FLAGS638);
+    if ((fl & 0x8000u) == 0) mhfu_write_u32(ent + MHFU_ENT_FLAGS638, fl | 0x8000u);
+}
+
+void mhfu_entity_force_aggro(uint32_t ent, mhfu_vec3_t target)
+{
+    if (!in_ram(ent)) return;
+    mhfu_vec3_t p = mhfu_entity_pos(ent);
+    mhfu_write_f32(ent + MHFU_ENT_PURSUIT + 0, target.x - p.x);
+    mhfu_write_f32(ent + MHFU_ENT_PURSUIT + 4, target.y - p.y);
+    mhfu_write_f32(ent + MHFU_ENT_PURSUIT + 8, target.z - p.z);
+    mhfu_write_f32(ent + MHFU_ENT_ENGAGE_FLAG, 1.0f);
+    *(volatile uint8_t *)(ent + MHFU_ENT_AI_STATE)   = 2;
+    *(volatile uint8_t *)(ent + MHFU_ENT_TARGET_ACQ) = 1;
+}
+
 void mhfu_entity_calm(uint32_t ent)
 {
     if (!in_ram(ent)) return;

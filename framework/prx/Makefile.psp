@@ -9,6 +9,7 @@ CORE_OBJS = \
   src/core/region.o \
   src/core/memory.o \
   src/core/entity.o \
+  src/core/world.o \
   src/core/monster.o \
   src/core/registry.o \
   src/core/trampoline.o \

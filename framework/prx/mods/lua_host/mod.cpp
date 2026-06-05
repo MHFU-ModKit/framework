@@ -35,11 +35,14 @@
 #include <pspthreadman.h>
 #include <pspsysmem.h>
 #include <pspiofilemgr.h>
+#include <pspctrl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "mhfu/mhfu.h"
+#include "mhfu/mips.h"
 
 extern "C" {
 #include "lua.h"
@@ -56,6 +59,9 @@ extern "C" {
  * when that directory is empty/absent (so the PRX is never bricked). When any
  * .lua is present on the memstick the embedded copy is NOT used. */
 #include "scripts/tigrex_spin.lua.h"
+/* Ergonomic OO layer (mhfu.world / mhfu.entity / mhfu.mem) — run before any
+ * user mod so scripts can use handles instead of raw addresses. */
+#include "scripts/_prelude.lua.h"
 
 #define LUA_MODS_DIR "ms0:/PSP/PLUGINS/mhfu_framework/mods"
 static char g_filebuf[48 * 1024];   /* per-file read scratch (BSS, reused) */
@@ -233,6 +239,10 @@ static int lb_write_u8 (lua_State *L){ mhfu_write_u8 ((uint32_t)luaL_checkintege
 static int lb_write_u16(lua_State *L){ mhfu_write_u16((uint32_t)luaL_checkinteger(L,1), (uint16_t)luaL_checkinteger(L,2)); return 0; }
 static int lb_write_u32(lua_State *L){ mhfu_write_u32((uint32_t)luaL_checkinteger(L,1), (uint32_t)luaL_checkinteger(L,2)); return 0; }
 
+/* Native float access — replaces the hand-rolled IEEE-754 packing in Lua. */
+static int lb_read_f32 (lua_State *L){ lua_pushnumber(L, mhfu_read_f32((uint32_t)luaL_checkinteger(L,1))); return 1; }
+static int lb_write_f32(lua_State *L){ mhfu_write_f32((uint32_t)luaL_checkinteger(L,1), (float)luaL_checknumber(L,2)); return 0; }
+
 static int lb_screen_state(lua_State *L){ lua_pushinteger(L, mhfu_get_screen_state()); return 1; }
 static int lb_area_index (lua_State *L){ lua_pushinteger(L, mhfu_get_area_index());  return 1; }
 static int lb_quest_timer(lua_State *L){ lua_pushinteger(L, (lua_Integer)mhfu_get_quest_timer()); return 1; }
@@ -243,6 +253,340 @@ static int lb_entity_hp  (lua_State *L){ lua_pushinteger(L, mhfu_entity_hp  ((ui
 static int lb_entity_size(lua_State *L){ lua_pushnumber (L, mhfu_entity_size((uint32_t)luaL_checkinteger(L,1))); return 1; }
 static int lb_entity_set_size(lua_State *L){ mhfu_entity_set_size((uint32_t)luaL_checkinteger(L,1), (float)luaL_checknumber(L,2)); return 0; }
 static int lb_entity_alive(lua_State *L){ lua_pushboolean(L, mhfu_entity_is_alive((uint32_t)luaL_checkinteger(L,1))); return 1; }
+
+/* Typed entity accessors (Tier 1 — wrap the C SDK in include/mhfu/entity.h). */
+static int lb_entity_pos(lua_State *L)
+{
+    mhfu_vec3_t p = mhfu_entity_pos((uint32_t)luaL_checkinteger(L,1));
+    lua_pushnumber(L, p.x); lua_pushnumber(L, p.y); lua_pushnumber(L, p.z);
+    return 3;
+}
+static int lb_entity_set_pos(lua_State *L)
+{
+    mhfu_vec3_t p = { (float)luaL_checknumber(L,2), (float)luaL_checknumber(L,3),
+                      (float)luaL_checknumber(L,4) };
+    mhfu_entity_set_pos((uint32_t)luaL_checkinteger(L,1), p);
+    return 0;
+}
+static int lb_entity_yaw(lua_State *L){ lua_pushinteger(L, mhfu_entity_yaw((uint32_t)luaL_checkinteger(L,1))); return 1; }
+static int lb_entity_set_yaw(lua_State *L){ mhfu_entity_set_yaw((uint32_t)luaL_checkinteger(L,1), (uint16_t)luaL_checkinteger(L,2)); return 0; }
+static int lb_entity_ai_state(lua_State *L){ lua_pushinteger(L, mhfu_entity_ai_state((uint32_t)luaL_checkinteger(L,1))); return 1; }
+static int lb_entity_set_ai_state(lua_State *L){ mhfu_entity_set_ai_state((uint32_t)luaL_checkinteger(L,1), (uint8_t)luaL_checkinteger(L,2)); return 0; }
+static int lb_entity_engaged(lua_State *L){ lua_pushboolean(L, mhfu_entity_engaged((uint32_t)luaL_checkinteger(L,1))); return 1; }
+static int lb_entity_set_engaged(lua_State *L){ mhfu_entity_set_engaged((uint32_t)luaL_checkinteger(L,1), lua_toboolean(L,2)); return 0; }
+static int lb_entity_calm(lua_State *L){ mhfu_entity_calm((uint32_t)luaL_checkinteger(L,1)); return 0; }
+static int lb_entity_section(lua_State *L){ lua_pushinteger(L, mhfu_entity_section((uint32_t)luaL_checkinteger(L,1))); return 1; }
+static int lb_entity_set_section(lua_State *L){ mhfu_entity_set_section((uint32_t)luaL_checkinteger(L,1), (uint16_t)luaL_checkinteger(L,2)); return 0; }
+
+/* Tier 2 — high-level intents lifted out of mods. */
+static int lb_entity_make_visible(lua_State *L)
+{
+    mhfu_entity_make_visible((uint32_t)luaL_checkinteger(L,1), (uint16_t)luaL_checkinteger(L,2));
+    return 0;
+}
+static int lb_entity_force_aggro(lua_State *L)
+{
+    mhfu_vec3_t t = { (float)luaL_checknumber(L,2), (float)luaL_checknumber(L,3),
+                      (float)luaL_checknumber(L,4) };
+    mhfu_entity_force_aggro((uint32_t)luaL_checkinteger(L,1), t);
+    return 0;
+}
+static int lb_player_pos(lua_State *L)
+{
+    mhfu_vec3_t p = mhfu_player_pos();
+    lua_pushnumber(L, p.x); lua_pushnumber(L, p.y); lua_pushnumber(L, p.z);
+    return 3;
+}
+static int lb_player_hp(lua_State *L){ lua_pushinteger(L, (lua_Integer)mhfu_get_player_hp()); return 1; }
+static int lb_paint_map(lua_State *L){ (void)L; mhfu_paint_map(); return 0; }
+
+/* mhfu.buttons() -> buttons:u32, lx:0..255, ly:0..255
+ * Reads the live controller. PSP_CTRL_* masks are exposed on the mhfu table.
+ * Analog stick centred ~128; d-pad / face buttons are bits in `buttons`. */
+static int lb_buttons(lua_State *L)
+{
+    SceCtrlData pad;
+    sceCtrlPeekBufferPositive(&pad, 1);
+    lua_pushinteger(L, (lua_Integer)pad.Buttons);
+    lua_pushinteger(L, (lua_Integer)pad.Lx);
+    lua_pushinteger(L, (lua_Integer)pad.Ly);
+    return 3;
+}
+
+/* ===========================================================================
+ * Freecam / cam-tick override engine  (orbit-input override)
+ *
+ * The EBOOT camera-update fn 0x08886B68 is an orbit-camera builder:
+ *   eye = pivot(s4+0x50 = 0x09998ED0) + R(euler angles) * offset
+ * RE'd live (re_cam*.py). The pivot is copied from the followed object each
+ * frame; the 3 euler-angle floats are derived into stack temps sp+0x17C/180/
+ * 184 (radians) and consumed at 0x088878D4 to build R. We cold-install
+ * (TITLE/MENU quiet-gate, Section 26) a MID-FUNCTION detour at 0x088878BC —
+ * AFTER pivot+angles are set, BEFORE they are consumed — that calls
+ * cam_orbit_c(cam_sp). When freecam is active it overwrites pivot + the angle
+ * temps with our values, so the engine builds the whole view (eye + matrix +
+ * GE upload) from OUR orbit state. Feeding continuous angles also removes the
+ * vertical pitch snap. Toggle: double-tap SELECT (detected here per-frame).
+ *
+ * NOTE: the view-matrix look-at target is read separately from s3+0x200 (the
+ * player) later in the fn, so with injection #1 alone the camera flies but
+ * still points at the player; injection #2 (look-at redirect) is the next step.
+ * ========================================================================= */
+/* framework-internal code-cave bump allocator (defined in src/core/cave.cpp;
+ * same PRX, resolves at link — not part of the public SDK header set). */
+extern "C" uint32_t *mhfu_cave_alloc(int n_insns);
+
+/* ORBIT fly-cam (restored known-good). The engine builds eye = pivot(s4+0x50) +
+ * R(euler angles)*offset and looks AT the focus. We override the orbit INPUTS
+ * mid-fn so the engine flies its whole pipeline from OUR pivot+angles:
+ *   - injection #1 @ 0x088878BC: overwrite pivot x/z (s4+0x50/58) + angle temps
+ *     (sp+0x17C/180/184) + the double-tap SELECT toggle.
+ *   - injection #3 @ 0x088879A0: rewrite the just-computed eye_y (engine ties it
+ *     to player.Y) to OUR height, so vertical fly is camera-only. Gated → normal
+ *     play 100% stock.
+ * Look direction stays engine default (focus ≈ player). True free-LOOK via the
+ * target cell 0x09998D50 is the next RE step. Toggle: double-tap SELECT. */
+#define CAM_INJECT         0x088878BCu  /* addiu v1,sp,0x180 (orbit detour)   */
+#define CAM_INJECT_RESUME  0x088878C4u
+#define CAM_PIVOT          0x09998ED0u  /* s4+0x50 pivot (eye x/z anchor)     */
+#define CAM_ANG_OFF        0x17C        /* angle temps sp+0x17C/180/184 (rad) */
+#define CAM_INJECT3        0x088879A0u  /* swc1 f1,0x44(s4) (eye_y store)     */
+#define CAM_INJECT3_RESUME 0x088879A8u
+#define CAM_EYE            0x09998EC0u  /* eye vec3 (s4+0x40)                 */
+#define CAM_OFF            0x09998E10u  /* offset = eye - target             */
+#define CAM_TARGET         0x09998D50u  /* look-at point (view dir source)   */
+#define ENC_SWC1_F1_S4_44  0xE6810044u
+#define ENC_LWC1_F1_S4_58  0xC6810058u
+#define ENC_SWC1_F0_SP_1C  0xE7A0001Cu
+#define ENC_LWC1_F0_SP_1C  0xC7A0001Cu
+/* injection #4: view-direction builder 0x08815D84 reads target @0x09998D50 to
+ * compute the look vector. Entry-detour to set target = eye + aim (free-look). */
+#define CAM_INJECT4        0x08815D84u  /* addiu sp,sp,-0x70 (fn entry)       */
+#define CAM_INJECT4_RESUME 0x08815D8Cu  /* sw s0,0x8(sp)    (resume)         */
+
+static volatile int   g_fc_active   = 0;
+static volatile int   g_fc_snap_off = 0;   /* (future) remove snap when freecam off */
+static volatile int   g_fc_village  = 0;   /* (future) unlock village camera         */
+static volatile int   g_fc_freeze   = 1;   /* (future) player input lock             */
+static volatile int   g_fc_inited   = 0;
+static volatile int   g_fc_yaw_slot   = 1;
+static volatile int   g_fc_pitch_slot = 2;
+static float    g_fc_pivot[3] = {0,0,0};   /* camera focus x/z (eye anchor)           */
+static float    g_fc_height    = 0.0f;     /* camera focus Y (eye_y anchor)           */
+static float    g_fc_ang_seed[3] = {0,0,0};/* frozen orbit angles (no eye-orbit)      */
+static float    g_fc_yaw       = 0.0f;     /* AIM yaw   (free-look)                    */
+static float    g_fc_pitch     = 0.0f;     /* AIM pitch (free-look)                    */
+static float    g_fc_move_spd  = 25.0f;
+static float    g_fc_rot_spd   = 0.035f;
+static float    g_fc_look_dist = 300.0f;   /* (reserved for free-look)               */
+static int      g_fc_prev_sel  = 0;
+static int      g_fc_tap_age   = 99999;
+static uint32_t *g_cam_w1 = 0;
+static uint32_t *g_cam_w3 = 0;
+static uint32_t *g_cam_w4 = 0;
+
+/* injection #4: set the look-at target = eye + forward(aim)*dist so the view
+ * points where we aim (free-look), independent of the flown position. */
+extern "C" void cam_target_c(void)
+{
+    if (!g_fc_active) return;
+    float *eye = (float *)CAM_EYE;
+    float *tgt = (float *)CAM_TARGET;
+    float cp=cosf(g_fc_pitch), sp=sinf(g_fc_pitch);
+    float cy=cosf(g_fc_yaw),   sy=sinf(g_fc_yaw);
+    float d=g_fc_look_dist;
+    tgt[0]=eye[0]+cp*sy*d; tgt[1]=eye[1]+sp*d; tgt[2]=eye[2]+cp*cy*d;
+}
+
+/* injection #3: eye_y = OUR height + rotated.y (camera-only vertical; gated). */
+extern "C" void cam_eyey_c(uint32_t s4base, uint32_t player)
+{
+    if (!g_fc_active) return;
+    float *eye_y = (float *)(s4base + 0x44);
+    float py = *(float *)(player + 0x204);
+    *eye_y = g_fc_height + (*eye_y - py);
+}
+
+/* injection #1: pivot x/z + euler-angle override + double-tap toggle. */
+extern "C" void cam_orbit_c(uint32_t cam_sp, uint32_t player)
+{
+    float *ang  = (float *)(cam_sp + CAM_ANG_OFF);
+    float *piv  = (float *)CAM_PIVOT;
+    float *ppos = (float *)(player + 0x200);
+
+    SceCtrlData pad; sceCtrlPeekBufferPositive(&pad, 1);
+    unsigned b = pad.Buttons;
+    int sel = (b & PSP_CTRL_SELECT) ? 1 : 0;
+    if (g_fc_tap_age < 1000000) g_fc_tap_age++;
+    if (sel && !g_fc_prev_sel) {
+        if (g_fc_tap_age < 20) { g_fc_active = !g_fc_active; g_fc_inited = 0; g_fc_tap_age = 1000000; }
+        else g_fc_tap_age = 0;
+    }
+    g_fc_prev_sel = sel;
+    if (!g_fc_active) return;
+
+    if (!g_fc_inited) {
+        g_fc_pivot[0]=piv[0]; g_fc_pivot[2]=piv[2];
+        g_fc_height = ppos[1];
+        g_fc_ang_seed[0]=ang[0]; g_fc_ang_seed[1]=ang[1]; g_fc_ang_seed[2]=ang[2];
+        float ox=*(float*)CAM_OFF, oy=*(float*)(CAM_OFF+4), oz=*(float*)(CAM_OFF+8);
+        g_fc_yaw   = atan2f(-ox, -oz);              /* aim = current view dir */
+        g_fc_pitch = atan2f(-oy, sqrtf(ox*ox+oz*oz));
+        g_fc_inited = 1;
+    }
+    /* d-pad = AIM (free-look), independent of position */
+    if (b & PSP_CTRL_LEFT)  g_fc_yaw   -= g_fc_rot_spd;
+    if (b & PSP_CTRL_RIGHT) g_fc_yaw   += g_fc_rot_spd;
+    if (b & PSP_CTRL_UP)    g_fc_pitch += g_fc_rot_spd;
+    if (b & PSP_CTRL_DOWN)  g_fc_pitch -= g_fc_rot_spd;
+    if (g_fc_pitch >  1.4f) g_fc_pitch =  1.4f;
+    if (g_fc_pitch < -1.4f) g_fc_pitch = -1.4f;
+
+    /* fly: stick moves the focus in the aim's horizontal plane, R/L = world Y */
+    float cy=cosf(g_fc_yaw), sy=sinf(g_fc_yaw);
+    float mv=((int)pad.Ly - 128)/128.0f;
+    float st=((int)pad.Lx - 128)/128.0f;
+    if (mv>-0.12f && mv<0.12f) mv=0;
+    if (st>-0.12f && st<0.12f) st=0;
+    g_fc_pivot[0]+=(sy*mv + cy*st)*g_fc_move_spd;
+    g_fc_pivot[2]+=(cy*mv - sy*st)*g_fc_move_spd;
+    if (b & PSP_CTRL_RTRIGGER) g_fc_height+=g_fc_move_spd;
+    if (b & PSP_CTRL_LTRIGGER) g_fc_height-=g_fc_move_spd;
+
+    /* fly the eye (pivot x/z); FREEZE orbit angles so the eye doesn't orbit when
+     * we aim. Look direction is applied at injection #4 (target = eye + aim). */
+    piv[0]=g_fc_pivot[0]; piv[2]=g_fc_pivot[2];
+    ang[0]=g_fc_ang_seed[0]; ang[1]=g_fc_ang_seed[1]; ang[2]=g_fc_ang_seed[2];
+}
+
+/* injection #1 stub (replay addiu v1,sp,0x180 ; addiu v0,sp,0x17C). */
+static int build_cam_w1(uint32_t *w)
+{
+    int i=0;
+    w[i++] = mips_move (MIPS_REG_T0, MIPS_REG_SP);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, (int16_t)-0x20);
+    w[i++] = mips_sw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_T0, 0x14, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A1, 0x10, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A0, 0x0C, MIPS_REG_SP);
+    w[i++] = mips_move (MIPS_REG_A0, MIPS_REG_T0);
+    w[i++] = mips_move (MIPS_REG_A1, MIPS_REG_S3);
+    w[i++] = mips_jal  ((uint32_t)(uintptr_t)&cam_orbit_c);
+    w[i++] = MIPS_NOP;
+    w[i++] = mips_lw   (MIPS_REG_A0, 0x0C, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_A1, 0x10, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_T0, 0x14, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);
+    w[i++] = mips_addiu(MIPS_REG_V1, MIPS_REG_SP, 0x180);
+    w[i++] = mips_j    (CAM_INJECT_RESUME);
+    w[i++] = mips_addiu(MIPS_REG_V0, MIPS_REG_SP, 0x17C);
+    while (i < 20) w[i++] = MIPS_NOP;
+    return i;
+}
+
+/* injection #3 stub (eye_y). */
+static int build_cam_w3(uint32_t *w)
+{
+    int i=0;
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, (int16_t)-0x20);
+    w[i++] = mips_sw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A0, 0x10, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A1, 0x14, MIPS_REG_SP);
+    w[i++] = ENC_SWC1_F0_SP_1C;
+    w[i++] = ENC_SWC1_F1_S4_44;
+    w[i++] = mips_move (MIPS_REG_A0, MIPS_REG_S4);
+    w[i++] = mips_move (MIPS_REG_A1, MIPS_REG_S3);
+    w[i++] = mips_jal  ((uint32_t)(uintptr_t)&cam_eyey_c);
+    w[i++] = MIPS_NOP;
+    w[i++] = ENC_LWC1_F0_SP_1C;
+    w[i++] = mips_lw   (MIPS_REG_A0, 0x10, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_A1, 0x14, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);
+    w[i++] = ENC_LWC1_F1_S4_58;
+    w[i++] = mips_j    (CAM_INJECT3_RESUME);
+    w[i++] = MIPS_NOP;
+    while (i < 20) w[i++] = MIPS_NOP;
+    return i;
+}
+
+/* injection #4 stub: prefix entry-detour on the view-direction builder. Call
+ * cam_target_c (sets target=eye+aim), then replay the displaced prologue. */
+static int build_cam_w4(uint32_t *w)
+{
+    int i=0;
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, (int16_t)-0x20);
+    w[i++] = mips_sw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A0, 0x10, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A1, 0x14, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A2, 0x0C, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A3, 0x08, MIPS_REG_SP);
+    w[i++] = mips_jal  ((uint32_t)(uintptr_t)&cam_target_c);
+    w[i++] = MIPS_NOP;
+    w[i++] = mips_lw   (MIPS_REG_A0, 0x10, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_A1, 0x14, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_A2, 0x0C, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_A3, 0x08, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, (int16_t)-0x70);  /* replay disp #0 */
+    w[i++] = mips_sw   (MIPS_REG_RA, 0x0C, MIPS_REG_SP);            /* replay disp #1 */
+    w[i++] = mips_j    (CAM_INJECT4_RESUME);
+    w[i++] = MIPS_NOP;
+    while (i < 20) w[i++] = MIPS_NOP;
+    return i;
+}
+
+static int freecam_install(void)
+{
+    if (g_cam_w1) return 0;
+    uint32_t *w1 = mhfu_cave_alloc(20);
+    if (!w1) { mhfu_log("[freecam] cave exhausted (1)"); return -1; }
+    build_cam_w1(w1); mhfu_flush_caches(); g_cam_w1 = w1;
+    uint32_t o0 = mips_addiu(MIPS_REG_V1, MIPS_REG_SP, 0x180);
+    uint32_t o1 = mips_addiu(MIPS_REG_V0, MIPS_REG_SP, 0x17C);
+    mhfu_hook_rc_t r0 = mhfu_patch_word_when_quiet(CAM_INJECT+0, o0, mips_j((uint32_t)(uintptr_t)w1), "freecam");
+    mhfu_hook_rc_t r1 = mhfu_patch_word_when_quiet(CAM_INJECT+4, o1, MIPS_NOP, "freecam");
+
+    uint32_t *w3 = mhfu_cave_alloc(20);
+    if (!w3) { mhfu_log("[freecam] cave exhausted (3)"); return -1; }
+    build_cam_w3(w3); mhfu_flush_caches(); g_cam_w3 = w3;
+    mhfu_hook_rc_t r4 = mhfu_patch_word_when_quiet(CAM_INJECT3+0, ENC_SWC1_F1_S4_44, mips_j((uint32_t)(uintptr_t)w3), "freecam");
+    mhfu_hook_rc_t r5 = mhfu_patch_word_when_quiet(CAM_INJECT3+4, ENC_LWC1_F1_S4_58, MIPS_NOP, "freecam");
+
+    uint32_t *w4 = mhfu_cave_alloc(20);
+    if (!w4) { mhfu_log("[freecam] cave exhausted (4)"); return -1; }
+    build_cam_w4(w4); mhfu_flush_caches(); g_cam_w4 = w4;
+    uint32_t t0w = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, (int16_t)-0x70);
+    uint32_t t1w = mips_sw(MIPS_REG_RA, 0x0C, MIPS_REG_SP);
+    mhfu_hook_rc_t r6 = mhfu_patch_word_when_quiet(CAM_INJECT4+0, t0w, mips_j((uint32_t)(uintptr_t)w4), "freecam");
+    mhfu_hook_rc_t r7 = mhfu_patch_word_when_quiet(CAM_INJECT4+4, t1w, MIPS_NOP, "freecam");
+
+    mhfu_log("[freecam] queued: orbit@0x%08X(%d,%d) eyeY@0x%08X(%d,%d) lookdir@0x%08X(%d,%d)",
+             CAM_INJECT,(int)r0,(int)r1, CAM_INJECT3,(int)r4,(int)r5, CAM_INJECT4,(int)r6,(int)r7);
+    return (r0==MHFU_HOOK_OK&&r1==MHFU_HOOK_OK&&r4==MHFU_HOOK_OK&&r5==MHFU_HOOK_OK
+            &&r6==MHFU_HOOK_OK&&r7==MHFU_HOOK_OK) ? 0 : -1;
+}
+
+/* --- Lua bindings for the cam engine --- */
+static int lb_freecam(lua_State *L){ g_fc_active = lua_toboolean(L,1); g_fc_inited = 0; return 0; }
+static int lb_freecam_active(lua_State *L){ lua_pushboolean(L, g_fc_active); return 1; }
+static int lb_cam_snap_disable(lua_State *L){ g_fc_snap_off = lua_toboolean(L,1); return 0; }
+static int lb_cam_freeze_player(lua_State *L){ g_fc_freeze = lua_toboolean(L,1); return 0; }
+static int lb_cam_village_unlock(lua_State *L){ g_fc_village = lua_toboolean(L,1); return 0; }
+static int lb_cam_config(lua_State *L){
+    if (!lua_isnoneornil(L,1)) g_fc_move_spd  = (float)luaL_checknumber(L,1);
+    if (!lua_isnoneornil(L,2)) g_fc_rot_spd   = (float)luaL_checknumber(L,2);
+    if (!lua_isnoneornil(L,3)) g_fc_look_dist = (float)luaL_checknumber(L,3);
+    return 0;
+}
+static int lb_cam_eye(lua_State *L){
+    lua_pushnumber(L, *(volatile float*)CAM_EYE);
+    lua_pushnumber(L, *(volatile float*)(CAM_EYE+4));
+    lua_pushnumber(L, *(volatile float*)(CAM_EYE+8));
+    return 3;
+}
 
 /* mhfu.entities_of_type(type) -> { ptr, ptr, ... } */
 static int lb_entities_of_type(lua_State *L)
@@ -648,16 +992,42 @@ static const luaL_Reg k_mhfu_api[] = {
     { "write_u8",         lb_write_u8 },
     { "write_u16",        lb_write_u16 },
     { "write_u32",        lb_write_u32 },
+    { "read_f32",         lb_read_f32 },
+    { "write_f32",        lb_write_f32 },
     { "mem_valid",        lb_mem_valid },
     { "get_screen_state", lb_screen_state },
     { "get_area_index",   lb_area_index },
     { "get_quest_timer",  lb_quest_timer },
+    { "get_player_hp",    lb_player_hp },
+    { "player_pos",       lb_player_pos },
+    { "paint_map",        lb_paint_map },
+    { "buttons",          lb_buttons },
+    { "freecam",          lb_freecam },
+    { "freecam_active",   lb_freecam_active },
+    { "cam_snap_disable", lb_cam_snap_disable },
+    { "cam_freeze_player", lb_cam_freeze_player },
+    { "cam_village_unlock", lb_cam_village_unlock },
+    { "cam_config",       lb_cam_config },
+    { "cam_eye",          lb_cam_eye },
     { "entity_at",        lb_entity_at },
     { "entity_type",      lb_entity_type },
     { "entity_hp",        lb_entity_hp },
     { "entity_size",      lb_entity_size },
     { "entity_set_size",  lb_entity_set_size },
     { "entity_alive",     lb_entity_alive },
+    { "entity_pos",       lb_entity_pos },
+    { "entity_set_pos",   lb_entity_set_pos },
+    { "entity_yaw",       lb_entity_yaw },
+    { "entity_set_yaw",   lb_entity_set_yaw },
+    { "entity_ai_state",  lb_entity_ai_state },
+    { "entity_set_ai_state", lb_entity_set_ai_state },
+    { "entity_engaged",   lb_entity_engaged },
+    { "entity_set_engaged", lb_entity_set_engaged },
+    { "entity_calm",      lb_entity_calm },
+    { "entity_section",   lb_entity_section },
+    { "entity_set_section", lb_entity_set_section },
+    { "entity_make_visible", lb_entity_make_visible },
+    { "entity_force_aggro", lb_entity_force_aggro },
     { "entities_of_type", lb_entities_of_type },
     { "quest_has",            lb_quest_has },
     { "quest_replace_monster", lb_quest_replace_monster },
@@ -682,6 +1052,19 @@ static void register_mhfu_api(lua_State *L)
     lua_pushinteger(L, 0x46); lua_setfield(L, -2, "MON_POPO");
     lua_pushinteger(L, 0x4B); lua_setfield(L, -2, "MON_TIGREX");
     lua_pushinteger(L, 0x4D); lua_setfield(L, -2, "MON_GIADROME");
+    /* PSP_CTRL_* button masks (for mhfu.buttons()) */
+    lua_pushinteger(L, PSP_CTRL_SELECT);   lua_setfield(L, -2, "CTRL_SELECT");
+    lua_pushinteger(L, PSP_CTRL_START);    lua_setfield(L, -2, "CTRL_START");
+    lua_pushinteger(L, PSP_CTRL_UP);       lua_setfield(L, -2, "CTRL_UP");
+    lua_pushinteger(L, PSP_CTRL_RIGHT);    lua_setfield(L, -2, "CTRL_RIGHT");
+    lua_pushinteger(L, PSP_CTRL_DOWN);     lua_setfield(L, -2, "CTRL_DOWN");
+    lua_pushinteger(L, PSP_CTRL_LEFT);     lua_setfield(L, -2, "CTRL_LEFT");
+    lua_pushinteger(L, PSP_CTRL_LTRIGGER); lua_setfield(L, -2, "CTRL_L");
+    lua_pushinteger(L, PSP_CTRL_RTRIGGER); lua_setfield(L, -2, "CTRL_R");
+    lua_pushinteger(L, PSP_CTRL_TRIANGLE); lua_setfield(L, -2, "CTRL_TRIANGLE");
+    lua_pushinteger(L, PSP_CTRL_CIRCLE);   lua_setfield(L, -2, "CTRL_CIRCLE");
+    lua_pushinteger(L, PSP_CTRL_CROSS);    lua_setfield(L, -2, "CTRL_CROSS");
+    lua_pushinteger(L, PSP_CTRL_SQUARE);   lua_setfield(L, -2, "CTRL_SQUARE");
     lua_setglobal(L, "mhfu");
 }
 
@@ -703,6 +1086,7 @@ static int ends_with_lua(const char *s)
 {
     int n = (int)strlen(s);
     if (n < 5) return 0;                 /* need at least "x.lua" */
+    if (s[0] == '_') return 0;           /* '_'-prefixed = private partial (e.g. _prelude) */
     return s[n-4] == '.'
         && (s[n-3]|0x20) == 'l'
         && (s[n-2]|0x20) == 'u'
@@ -895,6 +1279,17 @@ static int lua_host_setup(void)
     remove_unsafe_globals(g_L);
     register_mhfu_api(g_L);
 
+    /* Tier 3: build the OO sugar (mhfu.world / mhfu.entity / mhfu.mem) on top
+     * of the flat C bindings, before any user mod runs. Non-fatal on error —
+     * the flat API still works without it. */
+    if (luaL_loadstring(g_L, k_lua__prelude) == LUA_OK
+        && lua_pcall(g_L, 0, 0, 0) == LUA_OK) {
+        /* ok */
+    } else {
+        mhfu_log("[lua_host] prelude FAILED: %s", lua_tostring(g_L, -1));
+        lua_pop(g_L, 1);
+    }
+
     /* Phase 3: load mods from memstick .lua files. Fall back to the embedded
      * tigrex_spin only if the mods dir is empty/absent (never brick the PRX). */
     int loaded = load_lua_dir(g_L);
@@ -973,6 +1368,10 @@ static int lua_host_init(void)
     slab_init((void *)a, LUA_SLAB_BYTES);
 
     if (lua_host_setup() != 0) return -1;
+
+    /* Queue the cam-tick postfix detour (applied at TITLE/MENU by the
+     * framework's deferred quiet-poll — Section 26 JIT-cold window). */
+    freecam_install();
 
     /* Only now allow the event trampolines to enter the VM. The setup above
      * may have already installed framework hooks (spawn poll thread); g_ready

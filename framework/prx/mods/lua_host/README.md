@@ -20,6 +20,58 @@ platform — see `docs/LUA_MODDING_PLATFORM_PLAN.md`.
 - A 2 Hz poll thread calls the embedded script's `mhfu_tick()` via `lua_pcall`.
 - Demo script: logs each Popo's HP while in a stable in-area frame (`scr==17`).
 
+## Lua API reference
+
+The flat `mhfu.*` C bindings are wrapped by an **OO sugar layer**
+(`scripts/_prelude.lua`, run before any user mod) so scripts never carry raw
+addresses, struct offsets, or float-packing math. Prefer the OO API; the flat
+bindings stay available for escape-hatch work.
+
+### `mhfu.world` — global state
+
+| Call | Returns |
+|------|---------|
+| `mhfu.world.player()` | a **Player** handle |
+| `mhfu.world.first(type)` | first live **Entity** of `type`, or `nil` |
+| `mhfu.world.entities(type)` | array of **Entity** handles |
+| `mhfu.world.area()` | area_index (map section) |
+| `mhfu.world.screen_state()` | screen-state byte (17 = in area) |
+| `mhfu.world.in_area()` | `true` when `screen_state == 17` |
+| `mhfu.world.quest_timer()` | quest timer (frames @ 30 Hz, decrements) |
+| `mhfu.world.paint_map()` | paintball all big monsters on the minimap (call ≥2 Hz) |
+
+### Entity handles (`mhfu.entity.wrap(ptr)` / `mhfu.world.first/entities`)
+
+`:valid()` `:type()` `:hp()` `:size()` `:set_size(v)` · `:pos()`→x,y,z
+`:set_pos(x,y,z|vec)` · `:yaw()` `:set_yaw(v)` · `:ai_state()` `:set_ai_state(v)`
+· `:engaged()` `:set_engaged(b)` · `:section()` `:set_section(v)` · `:calm()`
+
+High-level intents (RE recipes lifted into the framework):
+- `:make_visible([section])` — fix the swap/relocate render gate (`+0x29A`/`+0x638`); defaults to the player's area.
+- `:force_aggro(target)` — write the full engine engage signature toward `target` (Player/Entity/`{x,y,z}`).
+- `:teleport_near(target, offset)` — move to `offset` units past `target`, then `make_visible`.
+- `:dist_to(target)` — XZ-plane distance.
+
+Setters return the handle, so calls chain: `tig:set_size(0.3):make_visible()`.
+
+### Player handle
+
+`:pos()`→x,y,z · `:hp()` · `:area()` · `:screen_state()` · `:dist_to(ent)`
+
+### `mhfu.mem` — raw access (escape hatch)
+
+`read_u8/u16/u32`, `write_u8/u16/u32`, `read_f32`, `write_f32`, `valid(addr)`.
+(Also still present flat as `mhfu.read_u32` etc.)
+
+### Events (unchanged)
+
+`on_quest_targets_building`, `on_bigmonster_spawn/death`, `on_bigmonster_action`,
+`on_bigmonster_action_decided/_input`, `on_bigmonster_slot_picked`,
+`on_ai_overlay_loaded`. Callback ctx still carries a raw `entity` ptr — wrap it
+with `mhfu.entity.wrap(ctx.entity)` for the OO API.
+
+Reference port using the whole surface: `scripts/tigrex_hunt.lua`.
+
 ## Status
 
 - ✅ Verified live: the Lua mod runs and reads **live, changing** game memory

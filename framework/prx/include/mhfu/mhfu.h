@@ -16,6 +16,7 @@
 #include "ids.h"
 #include "memory.h"
 #include "entity.h"
+#include "world.h"
 #include "monster.h"
 #include "quest.h"
 #include "hooks.h"

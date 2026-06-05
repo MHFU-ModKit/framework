@@ -28,8 +28,12 @@ extern "C" {
 #define MHFU_ENT_MONSTER_TYPE 0x1E8 /* u8  — 0x46 Popo, 0x45 Anteka, 0x4B Tigrex */
 #define MHFU_ENT_POSITION    0x200  /* vec3 world pos */
 #define MHFU_ENT_HP          0x2E4  /* u16 */
-#define MHFU_ENT_AI_STATE    0x334  /* u8  */
+#define MHFU_ENT_SECTION     0x29A  /* u16 — map section (visibility gate A)   */
+#define MHFU_ENT_TARGET_ACQ  0x2A4  /* u8  — target-acquired                   */
+#define MHFU_ENT_AI_STATE    0x334  /* u8  — 2 = engaged                       */
+#define MHFU_ENT_PURSUIT     0x05D0 /* vec3 — pursuit/target vec (w/ engage)   */
 #define MHFU_ENT_ENGAGE_FLAG 0x05DC /* f32 — 1.0 = engaged */
+#define MHFU_ENT_FLAGS638    0x638  /* u32 — bit 0x8000 = visibility gate B    */
 
 typedef struct { float x, y, z; } mhfu_vec3_t;
 
@@ -56,6 +60,22 @@ uint8_t     mhfu_entity_ai_state(uint32_t ent);         /* +0x334 */
 void        mhfu_entity_set_ai_state(uint32_t ent, uint8_t s);
 int         mhfu_entity_engaged(uint32_t ent);          /* +0x05DC f32 >= 0.5 */
 void        mhfu_entity_set_engaged(uint32_t ent, int engaged);
+
+uint16_t    mhfu_entity_section(uint32_t ent);          /* +0x29A */
+void        mhfu_entity_set_section(uint32_t ent, uint16_t section);
+
+/* Make a (swapped/relocated) monster render in `section`: set the section
+ * tracker +0x29A and OR the +0x638 visibility bit, so the per-frame gate
+ * 0x09AC4960 stops culling it. Pass the player's current area_index as
+ * `section` (memory tigrex-section1 / giadrome-tigrex-render-bug). */
+void        mhfu_entity_make_visible(uint32_t ent, uint16_t section);
+
+/* Force an entity to engage `target` (world pos): write the pursuit vec
+ * (target - pos) at +0x5D0, engage flag +0x5DC = 1.0, ai_state +0x334 = 2,
+ * and target-acquired +0x2A4 = 1 — together, the way the engine's own
+ * per-frame sv.q writes them (Section 33g). Use to force aggro where the
+ * engine's target resolver returns null (e.g. basecamp). */
+void        mhfu_entity_force_aggro(uint32_t ent, mhfu_vec3_t target);
 
 /* Clear an entity's aggression: zero the engage flag + the per-entity
  * detection ranges so it won't re-acquire the player. Pair with
