@@ -369,6 +369,7 @@ static volatile int   g_fc_snap_off = 0;   /* (future) remove snap when freecam 
 static volatile int   g_fc_village  = 0;   /* (future) unlock village camera         */
 static volatile int   g_fc_freeze   = 1;   /* (future) player input lock             */
 static volatile int   g_fc_inited   = 0;
+static volatile int   g_fc_ang_cap  = 0;   /* quest orbit-angle seed captured        */
 static volatile int   g_fc_yaw_slot   = 1;
 static volatile int   g_fc_pitch_slot = 2;
 static float    g_fc_pivot[3] = {0,0,0};   /* camera focus x/z (eye anchor)           */
@@ -385,15 +386,74 @@ static uint32_t *g_cam_w1 = 0;
 static uint32_t *g_cam_w3 = 0;
 static uint32_t *g_cam_w4 = 0;
 
-/* injection #4: set the look-at target = eye + forward(aim)*dist so the view
- * points where we aim (free-look), independent of the flown position. */
+/* injection #4 — the UNIVERSAL freecam driver. The view-direction builder
+ * 0x08815D84 runs in BOTH the quest and the village (unlike the quest-only orbit
+ * cam 0x08886B68), so the toggle + input + camera control live here:
+ *   - double-tap SELECT toggle (works everywhere)
+ *   - read pad: fly g_fc_pivot/height + aim g_fc_yaw/pitch
+ *   - write the eye cell (drives the VILLAGE camera, whose eye is otherwise
+ *     fixed/never written — verified it sticks) and the target cell = eye + aim
+ *     (the look-at this fn is about to read -> free-look everywhere).
+ * In the QUEST the eye/pivot position also flows through inj#1/#3 (the orbit
+ * pipeline); the eye-cell write here is consistent with it. */
 extern "C" void cam_target_c(void)
 {
+    SceCtrlData pad; sceCtrlPeekBufferPositive(&pad, 1);
+    unsigned b = pad.Buttons;
+    int sel = (b & PSP_CTRL_SELECT) ? 1 : 0;
+    if (g_fc_tap_age < 1000000) g_fc_tap_age++;
+    if (sel && !g_fc_prev_sel) {
+        if (g_fc_tap_age < 20) { g_fc_active = !g_fc_active; g_fc_inited = 0; g_fc_ang_cap = 0; g_fc_tap_age = 1000000; }
+        else g_fc_tap_age = 0;
+    }
+    g_fc_prev_sel = sel;
     if (!g_fc_active) return;
+
     float *eye = (float *)CAM_EYE;
     float *tgt = (float *)CAM_TARGET;
+    float ox=*(float*)CAM_OFF, oy=*(float*)(CAM_OFF+4), oz=*(float*)(CAM_OFF+8);
+    int village = (ox==0.0f && oy==0.0f && oz==0.0f);   /* quest uses the offset cell */
+
+    if (!g_fc_inited) {
+        /* seed position: village flies the eye cell; quest flies the orbit pivot */
+        float *src = village ? eye : (float *)CAM_PIVOT;
+        g_fc_pivot[0]=src[0]; g_fc_pivot[2]=src[2];
+        g_fc_height = eye[1];
+        if (village) {
+            float dx=tgt[0]-eye[0], dy=tgt[1]-eye[1], dz=tgt[2]-eye[2];
+            g_fc_yaw   = atan2f(dx, dz);
+            g_fc_pitch = atan2f(dy, sqrtf(dx*dx+dz*dz));
+        } else {
+            g_fc_yaw   = atan2f(-ox, -oz);
+            g_fc_pitch = atan2f(-oy, sqrtf(ox*ox+oz*oz));
+        }
+        g_fc_inited = 1;
+    }
+
+    if (b & PSP_CTRL_LEFT)  g_fc_yaw   -= g_fc_rot_spd;
+    if (b & PSP_CTRL_RIGHT) g_fc_yaw   += g_fc_rot_spd;
+    if (b & PSP_CTRL_UP)    g_fc_pitch += g_fc_rot_spd;
+    if (b & PSP_CTRL_DOWN)  g_fc_pitch -= g_fc_rot_spd;
+    if (g_fc_pitch >  1.4f) g_fc_pitch =  1.4f;
+    if (g_fc_pitch < -1.4f) g_fc_pitch = -1.4f;
+
     float cp=cosf(g_fc_pitch), sp=sinf(g_fc_pitch);
     float cy=cosf(g_fc_yaw),   sy=sinf(g_fc_yaw);
+    float mv=((int)pad.Ly - 128)/128.0f;
+    float st=((int)pad.Lx - 128)/128.0f;
+    if (mv>-0.12f && mv<0.12f) mv=0;
+    if (st>-0.12f && st<0.12f) st=0;
+    g_fc_pivot[0]+=(sy*mv + cy*st)*g_fc_move_spd;
+    g_fc_pivot[2]+=(cy*mv - sy*st)*g_fc_move_spd;
+    if (b & PSP_CTRL_RTRIGGER) g_fc_height+=g_fc_move_spd;
+    if (b & PSP_CTRL_LTRIGGER) g_fc_height-=g_fc_move_spd;
+
+    /* VILLAGE: nothing else writes the eye cell -> fly it directly. QUEST: the
+     * orbit pipeline (inj#1/#3) owns the eye position; don't fight it. */
+    if (village) { eye[0]=g_fc_pivot[0]; eye[1]=g_fc_height; eye[2]=g_fc_pivot[2]; }
+
+    /* look-at = current eye + aim (read the live eye cell so it matches the
+     * render eye in both modes) */
     float d=g_fc_look_dist;
     tgt[0]=eye[0]+cp*sy*d; tgt[1]=eye[1]+sp*d; tgt[2]=eye[2]+cp*cy*d;
 }
@@ -407,54 +467,20 @@ extern "C" void cam_eyey_c(uint32_t s4base, uint32_t player)
     *eye_y = g_fc_height + (*eye_y - py);
 }
 
-/* injection #1: pivot x/z + euler-angle override + double-tap toggle. */
+/* injection #1 (QUEST only — 0x08886B68 doesn't run in the village): apply the
+ * fly position to the orbit pivot (x/z; eye_y via inj#3) so the quest's eye
+ * pipeline lands at our position, and FREEZE the orbit angles so d-pad (= aim,
+ * handled in inj#4) doesn't also orbit the eye. Input/toggle live in inj#4. */
 extern "C" void cam_orbit_c(uint32_t cam_sp, uint32_t player)
 {
-    float *ang  = (float *)(cam_sp + CAM_ANG_OFF);
-    float *piv  = (float *)CAM_PIVOT;
-    float *ppos = (float *)(player + 0x200);
-
-    SceCtrlData pad; sceCtrlPeekBufferPositive(&pad, 1);
-    unsigned b = pad.Buttons;
-    int sel = (b & PSP_CTRL_SELECT) ? 1 : 0;
-    if (g_fc_tap_age < 1000000) g_fc_tap_age++;
-    if (sel && !g_fc_prev_sel) {
-        if (g_fc_tap_age < 20) { g_fc_active = !g_fc_active; g_fc_inited = 0; g_fc_tap_age = 1000000; }
-        else g_fc_tap_age = 0;
-    }
-    g_fc_prev_sel = sel;
+    (void)player;
     if (!g_fc_active) return;
-
-    if (!g_fc_inited) {
-        g_fc_pivot[0]=piv[0]; g_fc_pivot[2]=piv[2];
-        g_fc_height = ppos[1];
+    float *ang = (float *)(cam_sp + CAM_ANG_OFF);
+    float *piv = (float *)CAM_PIVOT;
+    if (!g_fc_ang_cap) {                 /* capture orbit-angle seed once */
         g_fc_ang_seed[0]=ang[0]; g_fc_ang_seed[1]=ang[1]; g_fc_ang_seed[2]=ang[2];
-        float ox=*(float*)CAM_OFF, oy=*(float*)(CAM_OFF+4), oz=*(float*)(CAM_OFF+8);
-        g_fc_yaw   = atan2f(-ox, -oz);              /* aim = current view dir */
-        g_fc_pitch = atan2f(-oy, sqrtf(ox*ox+oz*oz));
-        g_fc_inited = 1;
+        g_fc_ang_cap = 1;
     }
-    /* d-pad = AIM (free-look), independent of position */
-    if (b & PSP_CTRL_LEFT)  g_fc_yaw   -= g_fc_rot_spd;
-    if (b & PSP_CTRL_RIGHT) g_fc_yaw   += g_fc_rot_spd;
-    if (b & PSP_CTRL_UP)    g_fc_pitch += g_fc_rot_spd;
-    if (b & PSP_CTRL_DOWN)  g_fc_pitch -= g_fc_rot_spd;
-    if (g_fc_pitch >  1.4f) g_fc_pitch =  1.4f;
-    if (g_fc_pitch < -1.4f) g_fc_pitch = -1.4f;
-
-    /* fly: stick moves the focus in the aim's horizontal plane, R/L = world Y */
-    float cy=cosf(g_fc_yaw), sy=sinf(g_fc_yaw);
-    float mv=((int)pad.Ly - 128)/128.0f;
-    float st=((int)pad.Lx - 128)/128.0f;
-    if (mv>-0.12f && mv<0.12f) mv=0;
-    if (st>-0.12f && st<0.12f) st=0;
-    g_fc_pivot[0]+=(sy*mv + cy*st)*g_fc_move_spd;
-    g_fc_pivot[2]+=(cy*mv - sy*st)*g_fc_move_spd;
-    if (b & PSP_CTRL_RTRIGGER) g_fc_height+=g_fc_move_spd;
-    if (b & PSP_CTRL_LTRIGGER) g_fc_height-=g_fc_move_spd;
-
-    /* fly the eye (pivot x/z); FREEZE orbit angles so the eye doesn't orbit when
-     * we aim. Look direction is applied at injection #4 (target = eye + aim). */
     piv[0]=g_fc_pivot[0]; piv[2]=g_fc_pivot[2];
     ang[0]=g_fc_ang_seed[0]; ang[1]=g_fc_ang_seed[1]; ang[2]=g_fc_ang_seed[2];
 }
