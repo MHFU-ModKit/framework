@@ -8,6 +8,10 @@
 # tigrex_spin OFF — both claim the vt[8] chain (CONFLICT).
 lua_host
 
+# --- HUD ---------------------------------------------------------------------
+# monster_nameplates: projected name+HP labels over monsters; double-tap SELECT.
+monster_nameplates
+
 # --- disabled --------------------------------------------------------------
 # tigrex_spin   # C baseline; crashes on spin via action_decided ptr-force
 # noop          # core-only bisect build (kept for future isolation)

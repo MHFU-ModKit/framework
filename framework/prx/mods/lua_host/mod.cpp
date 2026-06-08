@@ -1397,7 +1397,10 @@ static int lua_host_init(void)
 
     /* Queue the cam-tick postfix detour (applied at TITLE/MENU by the
      * framework's deferred quiet-poll — Section 26 JIT-cold window). */
-    freecam_install();
+    /* DISABLED 2026-06-08: freecam also toggles on double-tap SELECT, which
+     * collides with monster_nameplates. Re-enable this call to restore freecam
+     * (and pick a non-SELECT toggle for one of them). */
+    /* freecam_install(); */
 
     /* Only now allow the event trampolines to enter the VM. The setup above
      * may have already installed framework hooks (spawn poll thread); g_ready
