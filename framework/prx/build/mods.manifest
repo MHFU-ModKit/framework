@@ -3,10 +3,18 @@
 # One mod per line, path relative to mods/. Lines starting with # are
 # disabled. The Makefile turns each entry into mods/<entry>/mod.o.
 
+# --- Big monsters ----------------------------------------------------------
+# bigmon_dup: duplicate the quest's Tigrex as a 2nd same-family instance.
+# Section 48: buildTargets builds group0 count=2 OK (verified), but only def[0]
+# becomes an entity — cap is the SINGLE big-mon manager (0x08B0C7C0: 1 manager =
+# 1 monster; setup registers fixed resources, no group loop). Investigating the
+# entity-creation seam. (A host CoreAudio crash earlier was unrelated.)
+bigmon_dup
+
 # --- Lua platform ----------------------------------------------------------
 # lua_host runs scripts/tigrex_spin.lua (action_input force path). Keep the C
-# tigrex_spin OFF — both claim the vt[8] chain (CONFLICT).
-lua_host
+# tigrex_spin OFF — both claim the vt[8] chain (CONFLICT). OFF for bigmon_dup work.
+# lua_host
 
 # --- HUD ---------------------------------------------------------------------
 # monster_nameplates: projected name+HP labels over monsters; double-tap SELECT.

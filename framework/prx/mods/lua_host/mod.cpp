@@ -43,6 +43,7 @@
 
 #include "mhfu/mhfu.h"
 #include "mhfu/mips.h"
+#include "mhfu/bigmon_overlay.h"
 
 extern "C" {
 #include "lua.h"
@@ -299,6 +300,22 @@ static int lb_player_pos(lua_State *L)
 }
 static int lb_player_hp(lua_State *L){ lua_pushinteger(L, (lua_Integer)mhfu_get_player_hp()); return 1; }
 static int lb_paint_map(lua_State *L){ (void)L; mhfu_paint_map(); return 0; }
+
+/* mhfu.load_relocated_overlay(path[, run_inits]) -> region_base, new_load, delta
+ * (or nil,errcode). M2: load+relocate+place a 2nd em*.ovl at a fresh VA. */
+static int lb_load_relocated_overlay(lua_State *L)
+{
+    const char *path = luaL_checkstring(L, 1);
+    int run_inits = lua_isnoneornil(L, 2) ? 0 : lua_toboolean(L, 2);
+    static mhfu_ovl_region_t reg;   /* keep alive (region stays mapped) */
+    int rc = mhfu_bigmon_load_relocated(path, &reg);
+    if (rc != 0) { lua_pushnil(L); lua_pushinteger(L, rc); return 2; }
+    if (run_inits) mhfu_bigmon_run_static_inits(&reg);
+    lua_pushinteger(L, (lua_Integer)reg.region_base);
+    lua_pushinteger(L, (lua_Integer)reg.new_load);
+    lua_pushinteger(L, (lua_Integer)reg.delta);
+    return 3;
+}
 
 /* mhfu.buttons() -> buttons:u32, lx:0..255, ly:0..255
  * Reads the live controller. PSP_CTRL_* masks are exposed on the mhfu table.
@@ -642,6 +659,18 @@ static int lb_quest_replace_monster(lua_State *L)
         (mhfu_quest_t)luaL_checkinteger(L,1),
         (mhfu_monster_id_t)luaL_checkinteger(L,2),
         (mhfu_monster_id_t)luaL_checkinteger(L,3));
+    lua_pushboolean(L, rc == MHFU_HOOK_OK);
+    return 1;
+}
+static int lb_quest_add_monster(lua_State *L)
+{
+    /* quest_add_monster(quest, id [, x, z]) — ADD a 2nd big monster.
+     * MUST be called from on_quest_targets_building. x/z 0 = clone source. */
+    float x = (float)luaL_optnumber(L, 3, 0.0);
+    float z = (float)luaL_optnumber(L, 4, 0.0);
+    mhfu_hook_rc_t rc = mhfu_quest_add_monster(
+        (mhfu_quest_t)luaL_checkinteger(L,1),
+        (mhfu_monster_id_t)luaL_checkinteger(L,2), x, z);
     lua_pushboolean(L, rc == MHFU_HOOK_OK);
     return 1;
 }
@@ -1057,6 +1086,8 @@ static const luaL_Reg k_mhfu_api[] = {
     { "entities_of_type", lb_entities_of_type },
     { "quest_has",            lb_quest_has },
     { "quest_replace_monster", lb_quest_replace_monster },
+    { "quest_add_monster",    lb_quest_add_monster },
+    { "load_relocated_overlay", lb_load_relocated_overlay },
     { "action_ptr_for",   lb_action_ptr_for },
     /* AI override-event registration */
     { "on_quest_targets_building",  lb_on_quest },

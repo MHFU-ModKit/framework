@@ -39,11 +39,25 @@ mhfu_hook_rc_t mhfu_quest_replace_monster(mhfu_quest_t q,
                                           mhfu_monster_id_t from,
                                           mhfu_monster_id_t to);
 
-/* Append `id` as an additional monster at spawn (x,z). NOTE: a 2nd big
- * monster currently hits a per-quest spawn cap (returns MHFU_HOOK_NOSPACE)
- * — replace_monster is the reliable path until the cap is understood. */
+/* ADD `id` as a 2ND big monster (Section 38 cap = 2 groups). Fabricates a
+ * record + mon-header in the rec_base tail, appends a list-A node (native
+ * model load), and the framework's buildTargets postfix wires it into
+ * target[1] + raises Quest+0x67C to 2. MUST be called from a
+ * MHFU_EVENT_QUEST_TARGETS_BUILDING subscriber. x/z = spawn coords (0 = clone
+ * the source monster's section, then RELOCATE in-area for section 1). Only
+ * species with a known record layout (Tigrex) are supported. */
 mhfu_hook_rc_t mhfu_quest_add_monster(mhfu_quest_t q, mhfu_monster_id_t id,
                                       float x, float z);
+
+/* DUPLICATE the quest's existing big monster `id` as a 2ND instance of the SAME
+ * family (Section 48). buildTargets is uncapped, so two same-species list-A nodes
+ * land in group 0 (count 2) sharing the one resident overlay — no 2nd group, no
+ * forge, no relocation. Clones the source record, offsets its spawn coords by
+ * dx/dz so the pair don't stack, appends a list-A node. MUST be called from a
+ * MHFU_EVENT_QUEST_TARGETS_BUILDING subscriber. Returns MHFU_HOOK_OK, or BADARG
+ * if `id` isn't in the quest. */
+mhfu_hook_rc_t mhfu_quest_clone_monster(mhfu_quest_t q, mhfu_monster_id_t id,
+                                        float dx, float dz);
 
 #ifdef __cplusplus
 } /* extern "C" */

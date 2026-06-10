@@ -157,6 +157,30 @@ display-only icon catalog — no `.mib`, no model there); not a clean "count = 1
 header's 16/0 fields are spawn-point capacity, not the big-monster count). It's a
 **provisioned array** sized at allocation.
 
+**UPDATE (Section 38, 2026-06-09) — the cap is 2, and the count cell is found.**
+A native **2-big-monster** quest vs a **1-big** quest were loaded from savestates
+and their **Quest singleton** (`0x09A05DC0`, section-independent) diffed clean:
+- **`Quest+0x67C` (`0x09A0643C`) = big-monster-group count: `2` vs `1`** (live-confirmed).
+- **`Quest.targets[2]`** is statically **two** groups: `target[0]@+0x768`,
+  `target[1]@+0x794` (stride 0x2C). In the 2-big quest `target[1]` def-ptr =
+  `0x08A5DB90` + count 1; in the 1-big quest `target[1]` is **NULL / count 0**.
+  emId at `target+0x14` (`+0x77C` / `+0x7A8`).
+- a mirror sub-block `+0x728..+0x744` holds a 2nd `{0x11, emId, …}` entry that is
+  populated only in the 2-big quest (the 1-big has its 2nd entry's tail zeroed).
+
+**So the engine cap = 2 simultaneous big-monster groups** (`QuestTarget targets[2]`;
+spawner takes `definitions[0]` per group). The earlier "ADD blocked, crash
+`0x300000000`" was almost certainly **NOT a hard cap of 1** — the begin-hook
+injection populated `target[1]` but **never raised `Quest+0x67C` 1→2** (nor the
+`+0x738` mirror entry), so a count-sized loop walked off its 1-element
+provisioning. **To ADD a 2nd big monster, set together:** (1) `Quest+0x67C=2`,
+(2) `target[1]@+0x794` def-ptr + species-correct record, (3) the `+0x738..+0x744`
+mirror sub-entry. UNTESTED end-to-end (needs a live injection run with `+0x67C`
+bumped); a deeper *per-section* spawn-tile array may still need sizing — the
+field-section-vs-basecamp area mismatch in the diff (2-big landed in a field
+section, 1-big at basecamp) left `0x09A45xxx`-class spawn machinery confounded.
+Snapshots/diff: `tools/prov_*` + `/tmp/prov_{1big,2big}.bin`.
+
 **Finding/raising it = future work needing better tooling** (PPSSPP "Fast Memory"
 off still hard-crashes on macOS-ARM instead of logging the faulting PC): a PPSSPP
 build that traps invalid PSP accesses to capture the faulting PC → the exact
