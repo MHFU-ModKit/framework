@@ -6,10 +6,11 @@
 
 static const uint32_t SIZE_MIRRORS[5] = { 0x024, 0x220, 0x224, 0x228, 0x270 };
 
-/* Standard user RAM (0x08800000..0x09FFFFFF) plus the partition-allocated
- * clone scratch — which sceKernelAllocPartitionMemory hands out from the
- * same user partition (< 0x0A000000), so the normal bound already covers it. */
-static int in_ram(uint32_t a) { return a >= 0x08000000u && a < 0x0A000000u; }
+/* Standard user RAM (0x08000000..0x09FFFFFF) plus the `memory=64` extra-RAM
+ * region [0x0A000000,0x0C000000) where clone scratch lives (MHFU leaves <512KB
+ * free in the managed partition, so clones go up top). The engine reads/ticks
+ * entities there — proven by the overlay-reloc rebind (bigmon_overlay). */
+static int in_ram(uint32_t a) { return a >= 0x08000000u && a < 0x0C000000u; }
 
 extern "C" {
 
@@ -173,19 +174,46 @@ static int      g_clone_uid  = -1;
 static uint32_t g_clone_bump = 0;
 static uint32_t g_clone_end  = 0;
 
+/* Clones live above the overlay-reloc region (bigmon_overlay bumps from
+ * 0x0A000000) so the two never collide. */
+#define CLONE_XRAM_BASE 0x0A800000u
+#define CLONE_XRAM_END  0x0C000000u
+
 static uint32_t clone_alloc(uint32_t bytes)
 {
     bytes = (bytes + 0xFFu) & ~0xFFu;
     if (!g_clone_bump) {
         uint32_t need = CLONE_SLOT_BYTES * CLONE_POOL_SLOTS;
-        SceUID uid = sceKernelAllocPartitionMemory(2 /*USER*/, "mhfu_clones",
-                                                   PSP_SMEM_Low, need, 0);
-        if (uid < 0) { mhfu_log("[clone] partition alloc failed (%d)", (int)uid); return 0; }
-        g_clone_uid  = uid;
-        g_clone_bump = (uint32_t)sceKernelGetBlockHeadAddr(uid);
-        g_clone_end  = g_clone_bump + need;
-        mhfu_log("[clone] scratch pool @0x%08X..0x%08X",
-                 (unsigned)g_clone_bump, (unsigned)g_clone_end);
+        /* MHFU leaves <512KB free in the managed partition; try the top first,
+         * then the low end — both usually fail, then fall to the memory=64
+         * extra RAM the same way the overlay loader does. */
+        SceUID uid = sceKernelAllocPartitionMemory(2, "mhfu_clones", PSP_SMEM_High, need, 0);
+        if (uid < 0) uid = sceKernelAllocPartitionMemory(2, "mhfu_clones", PSP_SMEM_Low, need, 0);
+        if (uid >= 0) {
+            g_clone_uid  = uid;
+            g_clone_bump = (uint32_t)sceKernelGetBlockHeadAddr(uid);
+            g_clone_end  = g_clone_bump + need;
+            mhfu_log("[clone] pool (partmem) @0x%08X..0x%08X",
+                     (unsigned)g_clone_bump, (unsigned)g_clone_end);
+        } else {
+            /* extra RAM granted by plugin.ini `memory=64`; probe-write to
+             * confirm it's actually mapped before committing. */
+            uint32_t cand = CLONE_XRAM_BASE;
+            int mapped = 0;
+            if (cand + need <= CLONE_XRAM_END) {
+                volatile uint32_t *p = (volatile uint32_t *)cand;
+                uint32_t save = *p; *p = 0xA5C30001u;
+                mapped = (*p == 0xA5C30001u); *p = save;
+            }
+            if (!mapped) {
+                mhfu_log("[clone] no partmem + no extra RAM (add `memory = 64` to plugin.ini)");
+                return 0;
+            }
+            g_clone_bump = cand;
+            g_clone_end  = CLONE_XRAM_END;
+            mhfu_log("[clone] pool (extra RAM) @0x%08X..0x%08X",
+                     (unsigned)g_clone_bump, (unsigned)g_clone_end);
+        }
     }
     if (g_clone_bump + bytes > g_clone_end) { mhfu_log("[clone] pool exhausted"); return 0; }
     uint32_t a = g_clone_bump;
