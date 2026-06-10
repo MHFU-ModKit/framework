@@ -4,17 +4,17 @@
 # disabled. The Makefile turns each entry into mods/<entry>/mod.o.
 
 # --- Big monsters ----------------------------------------------------------
-# bigmon_dup: duplicate the quest's Tigrex as a 2nd same-family instance.
-# Section 48: buildTargets builds group0 count=2 OK (verified), but only def[0]
-# becomes an entity — cap is the SINGLE big-mon manager (0x08B0C7C0: 1 manager =
-# 1 monster; setup registers fixed resources, no group loop). Investigating the
-# entity-creation seam. (A host CoreAudio crash earlier was unrelated.)
-bigmon_dup
+# bigmon_dup: duplicate the quest's Tigrex as a 2nd same-family instance (the
+# §48 2-group split). OFF while megatigrex owns big-monster duplication — they'd
+# both edit the target list / clone, and bigmon_dup's extra Tigrex would break
+# megatigrex's "exactly one big monster" gate.
+# bigmon_dup
 
 # --- Lua platform ----------------------------------------------------------
-# lua_host runs scripts/tigrex_spin.lua (action_input force path). Keep the C
-# tigrex_spin OFF — both claim the vt[8] chain (CONFLICT). OFF for bigmon_dup work.
-# lua_host
+# lua_host runs the memstick scripts (ms0:/PSP/PLUGINS/mhfu_framework/mods/*.lua),
+# e.g. scripts/megatigrex.lua. Ships the entity_clone / quest_* bindings the
+# swarm needs. Keep the C tigrex_spin OFF (both claim the vt[8] chain).
+lua_host
 
 # --- HUD ---------------------------------------------------------------------
 # monster_nameplates: projected name+HP labels over monsters; double-tap SELECT.

@@ -1,9 +1,14 @@
 /* Monster-entity access — see include/mhfu/entity.h. */
 #include "mhfu/entity.h"
 #include "mhfu/memory.h"
+#include "mhfu/log.h"
+#include <pspsysmem.h>
 
 static const uint32_t SIZE_MIRRORS[5] = { 0x024, 0x220, 0x224, 0x228, 0x270 };
 
+/* Standard user RAM (0x08800000..0x09FFFFFF) plus the partition-allocated
+ * clone scratch — which sceKernelAllocPartitionMemory hands out from the
+ * same user partition (< 0x0A000000), so the normal bound already covers it. */
 static int in_ram(uint32_t a) { return a >= 0x08000000u && a < 0x0A000000u; }
 
 extern "C" {
@@ -144,6 +149,98 @@ void mhfu_entity_calm(uint32_t ent)
     static const uint32_t det_offs[6] = {0x064C, 0x0650, 0x0654, 0x067C, 0x0680, 0x0684};
     for (int k = 0; k < 6; k++) mhfu_write_f32(ent + det_offs[k], 0.0f);
     mhfu_write_f32(ent + MHFU_ENT_ENGAGE_FLAG, 0.0f);
+}
+
+/* ---------------------------------------------------------------- cloning */
+
+/* Per-species entity struct stride (the contiguous block we deep-copy). The
+ * entity pool is MIXED-stride; verified live (objbase-linked-list-spawn). */
+static uint32_t clone_stride(uint8_t type)
+{
+    switch (type) {
+    case 0x46: return 0x4A60u;   /* Popo                       */
+    case 0x45: return 0x4530u;   /* Anteka                     */
+    default:   return 0x7A00u;   /* Tigrex / big monster (31 KB)*/
+    }
+}
+
+/* Bump-allocated clone scratch from the user partition (guaranteed free, and
+ * < 0x0A000000 so the engine + in_ram() accept it). One pool covers up to
+ * CLONE_POOL_SLOTS clones; lazily allocated on the first clone. */
+#define CLONE_POOL_SLOTS   16u
+#define CLONE_SLOT_BYTES   0x8000u   /* >= max stride (0x7A00), 256-aligned   */
+static int      g_clone_uid  = -1;
+static uint32_t g_clone_bump = 0;
+static uint32_t g_clone_end  = 0;
+
+static uint32_t clone_alloc(uint32_t bytes)
+{
+    bytes = (bytes + 0xFFu) & ~0xFFu;
+    if (!g_clone_bump) {
+        uint32_t need = CLONE_SLOT_BYTES * CLONE_POOL_SLOTS;
+        SceUID uid = sceKernelAllocPartitionMemory(2 /*USER*/, "mhfu_clones",
+                                                   PSP_SMEM_Low, need, 0);
+        if (uid < 0) { mhfu_log("[clone] partition alloc failed (%d)", (int)uid); return 0; }
+        g_clone_uid  = uid;
+        g_clone_bump = (uint32_t)sceKernelGetBlockHeadAddr(uid);
+        g_clone_end  = g_clone_bump + need;
+        mhfu_log("[clone] scratch pool @0x%08X..0x%08X",
+                 (unsigned)g_clone_bump, (unsigned)g_clone_end);
+    }
+    if (g_clone_bump + bytes > g_clone_end) { mhfu_log("[clone] pool exhausted"); return 0; }
+    uint32_t a = g_clone_bump;
+    g_clone_bump += bytes;
+    return a;
+}
+
+uint32_t mhfu_entity_clone(uint32_t src)
+{
+    if (!in_ram(src)) return 0;
+    uint8_t  type   = mhfu_entity_type(src);
+    uint32_t stride = clone_stride(type);
+    uint32_t dst    = clone_alloc(stride);
+    if (!dst) return 0;
+    int32_t  delta  = (int32_t)dst - (int32_t)src;
+
+    /* 1. deep-copy the whole struct */
+    for (uint32_t o = 0; o < stride; o += 4)
+        mhfu_write_u32(dst + o, mhfu_read_u32(src + o));
+
+    /* 2. rebase every internal self-pointer (value within [src, src+stride))
+     *    so the clone's sub-structs point at ITS copy, not the source's.
+     *    Pointers OUTSIDE the struct (shared model/skeleton/overlay/species
+     *    buffers) are left alone — correct for a same-species clone. */
+    for (uint32_t o = 0; o < stride; o += 4) {
+        uint32_t v = mhfu_read_u32(dst + o);
+        if (v >= src && v < src + stride)
+            mhfu_write_u32(dst + o, (uint32_t)((int32_t)v + delta));
+    }
+
+    /* 3. fresh chain links + spawn CALM */
+    mhfu_write_u32(dst + MHFU_ENT_NEXTOBJ, 0);
+    mhfu_write_u32(dst + MHFU_ENT_PREVOBJ, 0);
+    mhfu_write_f32(dst + MHFU_ENT_ENGAGE_FLAG, 0.0f);
+
+    /* 4. splice onto the LIVE tail of the update chain (walk forward from src;
+     *    the walker is forward-only on +0x1C4). Re-walking each time keeps the
+     *    tail valid as earlier clones extend the chain. */
+    uint32_t tail = src, next;
+    for (int g = 0; g < 64; g++) {
+        next = mhfu_read_u32(tail + MHFU_ENT_NEXTOBJ);
+        if (!next || !in_ram(next)) break;
+        tail = next;
+    }
+    mhfu_write_u32(tail + MHFU_ENT_NEXTOBJ, dst);
+    mhfu_write_u32(dst  + MHFU_ENT_PREVOBJ, tail);
+
+    /* 5. publish into the first free registry slot (so the AI/HUD see it) */
+    for (int s = 1; s < MHFU_ENTITY_REGISTRY_SLOTS; s++) {
+        if (mhfu_entity_at(s) == 0) {
+            *(volatile uint32_t *)(MHFU_ENTITY_REGISTRY + s * 4) = dst;
+            break;
+        }
+    }
+    return dst;
 }
 
 } /* extern "C" */

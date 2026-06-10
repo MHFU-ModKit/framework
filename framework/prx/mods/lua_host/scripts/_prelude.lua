@@ -53,6 +53,15 @@ function Entity:section()    return M.entity_section(self.ptr) end
 function Entity:set_section(v) M.entity_set_section(self.ptr, v); return self end
 function Entity:calm()       M.entity_calm(self.ptr); return self end
 
+-- Clone this monster (same species). Returns a NEW Entity handle (a real,
+-- ticking, rendered monster sharing this one's model/overlay) or nil. The
+-- species must be resident (clone a Tigrex only where a Tigrex is loaded).
+function Entity:clone()
+  local p = M.entity_clone(self.ptr)
+  if not p or p == 0 then return nil end
+  return M.entity_wrap(p)
+end
+
 -- Render-fix: make him visible in `section` (default = the player's area).
 function Entity:make_visible(section)
   M.entity_make_visible(self.ptr, section or M.get_area_index()); return self
@@ -120,4 +129,15 @@ function M.world.first(type)
   return nil
 end
 
-M.log("[prelude] OO layer ready (mhfu.world / mhfu.entity / mhfu.mem)")
+------------------------------------------------------------------- enums
+-- Named monster ids (alias of the flat mhfu.MON_* constants).
+M.MON = {
+  ANTEKA = M.MON_ANTEKA, POPO = M.MON_POPO,
+  TIGREX = M.MON_TIGREX, GIADROME = M.MON_GIADROME,
+}
+-- Snowy-mountains area_index values (== entity +0x29A section encoding).
+-- area_index alone identifies the map+section (it's a global id, not per-map),
+-- so AREA.SNOW_S1 == 99 reliably means "snowy mountains, section 1".
+M.AREA = { BASECAMP = 98, SNOW_S1 = 99, SNOW_S6 = 100 }
+
+M.log("[prelude] OO layer ready (mhfu.world / mhfu.entity / mhfu.mem / mhfu.MON / mhfu.AREA)")

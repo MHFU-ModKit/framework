@@ -218,6 +218,15 @@ extern "C" int mhfu_quest_has(mhfu_quest_t q, mhfu_monster_id_t id)
     return 0;
 }
 
+extern "C" int mhfu_quest_first_monster(mhfu_quest_t q)
+{
+    uint32_t la = list_a(q), recb = recbase(q);
+    if (!la || !mhfu_mem_valid(recb)) return -1;
+    uint32_t roff = mhfu_read_u32(la + NODE_REC_OFF);
+    if (!roff) return -1;
+    return (int)(mhfu_read_u16(recb + roff) & 0xFF);
+}
+
 extern "C" mhfu_hook_rc_t mhfu_quest_replace_monster(mhfu_quest_t q,
                                                      mhfu_monster_id_t from,
                                                      mhfu_monster_id_t to)

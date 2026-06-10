@@ -31,6 +31,11 @@ mhfu_quest_t mhfu_quest_current(void);
 int          mhfu_quest_monster_count(mhfu_quest_t q);
 int          mhfu_quest_has(mhfu_quest_t q, mhfu_monster_id_t id);
 
+/* emId of the quest's FIRST big-monster record (list-A node 0), or -1 if
+ * none. Lets a mod retag "whatever single monster this quest has" without
+ * knowing the species up front. */
+int          mhfu_quest_first_monster(mhfu_quest_t q);
+
 /* Retag the quest's existing monster `from` -> `to` in place (count
  * stays the same, native spawn). The engine then loads `to`'s model
  * natively at the loading screen. Returns MHFU_HOOK_OK, or BADARG if the

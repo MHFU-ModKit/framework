@@ -674,6 +674,23 @@ static int lb_quest_add_monster(lua_State *L)
     lua_pushboolean(L, rc == MHFU_HOOK_OK);
     return 1;
 }
+static int lb_quest_monster_count(lua_State *L)
+{
+    lua_pushinteger(L, mhfu_quest_monster_count((mhfu_quest_t)luaL_checkinteger(L,1)));
+    return 1;
+}
+static int lb_quest_first_monster(lua_State *L)
+{
+    lua_pushinteger(L, mhfu_quest_first_monster((mhfu_quest_t)luaL_checkinteger(L,1)));
+    return 1;
+}
+/* mhfu.entity_clone(src_ptr) -> clone_ptr (0 on failure). Same-species deep
+ * copy + self-ptr rebase + splice into the engine update chain + registry. */
+static int lb_entity_clone(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)mhfu_entity_clone((uint32_t)luaL_checkinteger(L,1)));
+    return 1;
+}
 static int lb_action_ptr_for(lua_State *L)
 {
     lua_pushinteger(L, (lua_Integer)mhfu_action_ptr_for(
@@ -1083,8 +1100,11 @@ static const luaL_Reg k_mhfu_api[] = {
     { "entity_set_section", lb_entity_set_section },
     { "entity_make_visible", lb_entity_make_visible },
     { "entity_force_aggro", lb_entity_force_aggro },
+    { "entity_clone",     lb_entity_clone },
     { "entities_of_type", lb_entities_of_type },
     { "quest_has",            lb_quest_has },
+    { "quest_monster_count",  lb_quest_monster_count },
+    { "quest_first_monster",  lb_quest_first_monster },
     { "quest_replace_monster", lb_quest_replace_monster },
     { "quest_add_monster",    lb_quest_add_monster },
     { "load_relocated_overlay", lb_load_relocated_overlay },

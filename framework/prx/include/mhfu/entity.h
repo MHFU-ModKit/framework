@@ -34,6 +34,8 @@ extern "C" {
 #define MHFU_ENT_PURSUIT     0x05D0 /* vec3 — pursuit/target vec (w/ engage)   */
 #define MHFU_ENT_ENGAGE_FLAG 0x05DC /* f32 — 1.0 = engaged */
 #define MHFU_ENT_FLAGS638    0x638  /* u32 — bit 0x8000 = visibility gate B    */
+#define MHFU_ENT_NEXTOBJ     0x1C4  /* ObjBase nextObj — engine update/tick chain */
+#define MHFU_ENT_PREVOBJ     0x1C8  /* ObjBase prevObj                            */
 
 typedef struct { float x, y, z; } mhfu_vec3_t;
 
@@ -81,6 +83,17 @@ void        mhfu_entity_force_aggro(uint32_t ent, mhfu_vec3_t target);
  * detection ranges so it won't re-acquire the player. Pair with
  * mhfu_species_set_detection() to also block NEW aggro (monster.h). */
 void        mhfu_entity_calm(uint32_t ent);
+
+/* Clone a live monster entity (SAME species) into fresh scratch RAM and
+ * make it a real, ticking, rendered monster. Deep-copies the per-species
+ * struct, rebases every internal self-pointer, splices the copy onto the
+ * engine update chain (+0x1C4) + a free registry slot, and spawns it CALM.
+ * The clone SHARES the source's read-only model / skeleton / overlay /
+ * species buffers, so duplicating is cheap (only the entity struct is
+ * copied) — but the species MUST be resident (clone a Tigrex only in a
+ * quest where a Tigrex is loaded). Returns the clone's pointer, or 0 on
+ * failure. Recipe: memory tigrex-clone-recipe / objbase-linked-list-spawn. */
+uint32_t    mhfu_entity_clone(uint32_t src);
 
 #ifdef __cplusplus
 } /* extern "C" */
