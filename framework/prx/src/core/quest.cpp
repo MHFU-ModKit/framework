@@ -120,10 +120,17 @@ static uint32_t list_a(mhfu_quest_t q)
     return mhfu_mem_valid(la) ? la : 0;
 }
 
-/* --- pending-ADD state (set in prefix, consumed in postfix) --- */
+/* --- pending-ADD state (set in prefix, consumed in postfix) ---
+ * Now an ARRAY: each pending add becomes its OWN target group (target[1..n]),
+ * so N adds => N+1 big-mon groups => N+1 engine managers => N+1 combat-resolved
+ * (damaging) monsters. Each pending uses a unique scratch record/hdr slot
+ * (stride 0x50 from SCRATCH_REC_OFF) so multiple adds don't clobber. */
+#define MAX_PENDING_ADD  3       /* up to 3 extra groups -> 4 big monsters total */
+#define SCRATCH_SLOT_STRIDE 0x50u
 static volatile uint32_t g_add_quest   = 0;
-static volatile uint32_t g_add_rec_abs = 0;   /* abs ptr of the fabricated record */
-static volatile uint32_t g_add_id      = 0;
+static volatile int      g_add_n       = 0;
+static volatile uint32_t g_add_rec_abs[MAX_PENDING_ADD] = { 0 };  /* abs ptr of each fabricated record */
+static volatile uint32_t g_add_id[MAX_PENDING_ADD]      = { 0 };
 
 /* --- script-resource injection (set by ADD, consumed at the barrier poll) ---
  * g_script_n>0 while a non-resident ADD's scripts still need registering. Reset
@@ -270,6 +277,14 @@ extern "C" mhfu_hook_rc_t mhfu_quest_add_monster(mhfu_quest_t q, mhfu_monster_id
     uint32_t la = list_a(q), recb = recbase(q);
     if (!la || !mhfu_mem_valid(recb)) return MHFU_HOOK_BADARG;
 
+    /* a fresh build resets g_add_quest in prefix; bind the array to this quest */
+    if (g_add_quest != q) { g_add_quest = q; g_add_n = 0; }
+    int slot = g_add_n;
+    if (slot >= MAX_PENDING_ADD) {
+        mhfu_log("[quest] add: pending-group cap %d reached", MAX_PENDING_ADD);
+        return MHFU_HOOK_BADARG;
+    }
+
     /* find a source record to clone (the quest's first big monster) */
     uint32_t src = 0;
     for (uint32_t node = la; mhfu_read_u32(node + NODE_HDR_OFF) != 0; node += NODE_STRIDE) {
@@ -278,8 +293,9 @@ extern "C" mhfu_hook_rc_t mhfu_quest_add_monster(mhfu_quest_t q, mhfu_monster_id
     }
     if (!src) return MHFU_HOOK_BADARG;
 
-    uint32_t rec = recb + SCRATCH_REC_OFF;
-    uint32_t hdr = recb + SCRATCH_HDR_OFF;
+    /* unique scratch slot for this pending add */
+    uint32_t rec = recb + SCRATCH_REC_OFF + (uint32_t)slot * SCRATCH_SLOT_STRIDE;
+    uint32_t hdr = recb + SCRATCH_HDR_OFF + (uint32_t)slot * SCRATCH_SLOT_STRIDE;
 
     /* clone 0x40 bytes of the source record, then retag species fields */
     for (uint32_t o = 0; o < 0x40; o += 4)
@@ -298,18 +314,22 @@ extern "C" mhfu_hook_rc_t mhfu_quest_add_monster(mhfu_quest_t q, mhfu_monster_id
     mhfu_write_u32(hdr + 0x08, 0xFFFFFFFFu);
     mhfu_write_u32(hdr + 0x0C, 0xFFFFFFFFu);
 
-    /* append a list-A node at the END marker, then re-terminate */
+    /* append a list-A node at the END marker, then re-terminate. Node carries the
+     * per-slot scratch offsets so each pending add references its own record/hdr. */
+    uint32_t rec_off = SCRATCH_REC_OFF + (uint32_t)slot * SCRATCH_SLOT_STRIDE;
+    uint32_t hdr_off = SCRATCH_HDR_OFF + (uint32_t)slot * SCRATCH_SLOT_STRIDE;
     uint32_t end = la;
     while (mhfu_read_u32(end + NODE_HDR_OFF) != 0) end += NODE_STRIDE;
     mhfu_write_u32(end + 0x00, 1);                 /* flag */
     mhfu_write_u32(end + 0x04, 0);
-    mhfu_write_u32(end + NODE_HDR_OFF, SCRATCH_HDR_OFF);
-    mhfu_write_u32(end + NODE_REC_OFF, SCRATCH_REC_OFF);
+    mhfu_write_u32(end + NODE_HDR_OFF, hdr_off);
+    mhfu_write_u32(end + NODE_REC_OFF, rec_off);
     mhfu_write_u32(end + NODE_STRIDE + NODE_HDR_OFF, 0);   /* new END */
 
-    g_add_quest   = q;
-    g_add_rec_abs = rec;
-    g_add_id      = (uint32_t)id;
+    g_add_quest        = q;
+    g_add_rec_abs[slot] = rec;
+    g_add_id[slot]      = (uint32_t)id;
+    g_add_n            = slot + 1;
 
     /* FORGE DISARMED (Section 39-44): the abandoned manual mount/register forge
      * crashed; the script is now provided by an OVERLAY RELOCATION + bind
@@ -386,6 +406,7 @@ extern "C" mhfu_hook_rc_t mhfu_quest_clone_monster(mhfu_quest_t q,
 static void quest_targets_prefix(uint32_t quest)
 {
     g_add_quest   = 0;             /* arm fresh each build */
+    g_add_n       = 0;
     g_script_n    = 0;             /* no forge unless this build ADDs */
     g_mount_n     = 0;
     g_forge_phase = 0;
@@ -401,22 +422,26 @@ static void quest_targets_prefix(uint32_t quest)
 static void quest_targets_postfix(uint32_t quest)
 {
     if (!g_add_quest || g_add_quest != quest || !mhfu_mem_valid(quest)) return;
+    if (g_add_n <= 0) { g_add_quest = 0; return; }
     uint32_t t0 = quest + TARGET0_OFF;
-    uint32_t t1 = t0 + TARGET_STRIDE;
 
-    /* SPAWN: a 2nd DIFFERENT-species monster needs its own group. buildTargets
-     * lumped both list-A monsters into group 0 — move the 2nd into group 1 and
-     * raise Quest+0x67C to 2 (native dual pattern). The forge poll-hook loads the
-     * 2nd monster's scripts (group-0 resolver only covers the primary). */
+    /* SPAWN: each added monster gets its OWN target group. buildTargets lumped all
+     * list-A monsters into group 0 — keep group 0 at count 1 and split each extra
+     * into target[1..n], one per group, then raise Quest+0x67C to 1+n (native
+     * multi-big pattern). N groups => N+1 engine managers => N+1 damaging monsters
+     * (the hypothesis under test). */
     mhfu_write_u16(t0 + TGT_COUNT_OFF, 1);
-    mhfu_write_u32(t1 + TGT_DEF0_OFF, g_add_rec_abs);
-    mhfu_write_u32(t1 + TGT_EMID_OFF, g_add_id);
-    mhfu_write_u8 (t1 + TGT_B19_OFF, 1);
-    mhfu_write_u16(t1 + TGT_COUNT_OFF, 1);
-    mhfu_write_u32(quest + BIGMON_COUNT_OFF, 2);
+    for (int k = 0; k < g_add_n; k++) {
+        uint32_t tk = t0 + (uint32_t)(k + 1) * TARGET_STRIDE;
+        mhfu_write_u32(tk + TGT_DEF0_OFF, g_add_rec_abs[k]);
+        mhfu_write_u32(tk + TGT_EMID_OFF, g_add_id[k]);
+        mhfu_write_u8 (tk + TGT_B19_OFF, 1);
+        mhfu_write_u16(tk + TGT_COUNT_OFF, 1);
+    }
+    mhfu_write_u32(quest + BIGMON_COUNT_OFF, (uint32_t)(1 + g_add_n));
 
-    mhfu_log("[quest] add finalized: group1 emId=0x%02x +0x67C=2 (forge will load scripts)",
-             (unsigned)g_add_id);
+    mhfu_log("[quest] add finalized: %d extra group(s), +0x67C=%d (groups 1..%d filled)",
+             g_add_n, 1 + g_add_n, g_add_n);
     g_add_quest = 0;
 }
 

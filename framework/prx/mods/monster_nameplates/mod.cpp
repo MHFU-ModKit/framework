@@ -90,7 +90,7 @@ static int w_uint(unsigned short *w, int n, unsigned int v, int cap){
     w[n] = 0; return n;
 }
 
-static unsigned short g_wbuf[8][48];
+static unsigned short g_wbuf[16][48];   /* up to 11 swarm tigrex on screen */
 static TextDesc       g_desc;
 
 static void draw_label(unsigned int ctx, int x, int y, unsigned short *w){
@@ -122,7 +122,8 @@ static void hud_postfix(uint32_t ctx){
     int slot = 0;
     for (int i = 0; i < REG_SLOTS; i++){
         unsigned int ent = mhfu_read_u32(ENT_REG + i*4);
-        if (ent < 0x08000000u || ent >= 0x0A000000u) continue;
+        /* include extra-RAM clones (megatigrex swarm lives at 0x0A800000+) */
+        if (ent < 0x08000000u || ent >= 0x0C000000u) continue;
         unsigned char type = mhfu_entity_type(ent);
         if (type == 0 || type == 0xFF) continue;
         unsigned int  hp = mhfu_entity_hp(ent);
@@ -132,9 +133,13 @@ static void hud_postfix(uint32_t ctx){
         V3 p = mkv(mp.x, mp.y + 150.0f + size*120.0f, mp.z);   /* lift to head */
         float sx, sy;
         if (!project(p, &sx, &sy)) continue;
-        unsigned short *w = g_wbuf[slot & 7]; slot++;
+        unsigned short *w = g_wbuf[slot & 15]; slot++;
         const char *nm = mhfu_monster_name(type);
         int n = w_ascii(w, nm ? nm : "Monster", 48);
+        /* per-registry-slot tag so otherwise-identical clones are distinguishable
+         * ("TIGREX #7 2400"). Slot index is stable per session → I can say
+         * "watch #N" during the collision-registration injection test. */
+        if (n < 42){ w[n++] = ' '; w[n++] = '#'; w[n] = 0; n = w_uint(w, n, (unsigned)i, 48); }
         if (n < 44){ w[n++] = ' '; w[n] = 0; n = w_uint(w, n, hp, 48); }
         draw_label(ctx, (int)sx - 20, (int)sy, w);
     }

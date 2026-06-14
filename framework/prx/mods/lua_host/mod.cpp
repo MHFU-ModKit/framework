@@ -301,6 +301,118 @@ static int lb_player_pos(lua_State *L)
 static int lb_player_hp(lua_State *L){ lua_pushinteger(L, (lua_Integer)mhfu_get_player_hp()); return 1; }
 static int lb_paint_map(lua_State *L){ (void)L; mhfu_paint_map(); return 0; }
 
+/* mhfu.resolve_attack(entity) — run the engine's OWN per-monster attack resolver
+ * for `entity`. This is z_un_08865934(entity): it advances the attack-state
+ * timers and (if entity+0x33C==0) calls entity->vt[0x3C](entity) = the full
+ * attack resolution (hitboxes, per-body-part, damage formula -> player applier
+ * 0x088D6594). The engine's combat enumeration only resolves the ~2 manager-
+ * registered combatants, so an injected CLONE never gets here and deals 0 damage
+ * (RE this session). Calling this for a clone makes the engine compute + apply
+ * its damage exactly like a native — no reimplementation, no manager.
+ *
+ * THREADING: this is a heavy engine call. It MUST run game-thread-synced — i.e.
+ * from inside an override callback (which executes on the exec thread WHILE the
+ * game thread is blocked == engine quiescent). Do NOT call it from mhfu_tick()
+ * (the free-running 2 Hz worker) — that races the engine. */
+typedef void (*mhfu_attack_resolver_fn)(uint32_t entity);
+#define MHFU_ATTACK_RESOLVER 0x08865934u
+static int lb_resolve_attack(lua_State *L)
+{
+    uint32_t e = (uint32_t)luaL_checkinteger(L, 1);
+    if (e >= 0x08000000u && e < 0x0C000000u) ((mhfu_attack_resolver_fn)MHFU_ATTACK_RESOLVER)(e);
+    return 0;
+}
+
+/* Per-frame, game-thread CLONE COMBAT DRIVER.
+ * Registered as an ai_step prefix (mhfu_on_bigmonster_ai_step) — fires per big
+ * monster, per frame, ON THE GAME THREAD (prefix on z_un_08865648, the per-entity
+ * AI tick). The engine's combat enumeration only resolves the ~2 manager-
+ * registered combatants, so a CLONE gets its AI/movement tick but never its
+ * attack-resolve tick -> it roams but its attack state never advances and it
+ * deals 0 damage. Here, for each extra-RAM clone, we run the engine attack
+ * resolver z_un_08865934(clone) every frame — same cadence the engine gives the
+ * native — so the clone advances its attack state AND resolves hits. No marshal
+ * (this is a C cb, runs inline on the game thread); no manager. */
+typedef void (*mhfu_entity_tick_fn)(uint32_t entity);
+#define MHFU_AI_TICK 0x08865648u   /* z_un_08865648 = per-entity AI tick (movement/pick) */
+typedef void (*mhfu_executor_fn)(uint32_t entity, uint32_t a1, uint32_t a2, uint32_t a3);
+#define MHFU_EXECUTOR 0x09AC5228u  /* big-mon action executor f(entity, a1=action_id,..) */
+#define CLONE_SPIN_A1 0x2Bu        /* ANGRY_SPIN (tigrex): a1=0x2B (memory big-mon-action-seam) */
+#define FREEZE_GATE_OFF 0x4B8u     /* clear bits 0x100|0x10000 each force or AI tick halts */
+
+/* Clone list the driver ticks. The engine enumerates AI via the REGISTRY, which
+ * holds only the native — clones (extra RAM, not registry-listed, not chained)
+ * never get z_un_08865648, so they never run their own AI and never attack. Lua
+ * pushes the live clone pointers here each tick (mhfu.clones_set). */
+static uint32_t      g_clones[12];
+static volatile int  g_clone_count  = 0;
+static volatile int  g_clone_resolve = 0;
+
+/* ai_step prefix: fires per big monster per frame on the game thread. The NATIVE
+ * is registry-enumerated so it fires every frame; we hang the swarm off it. For
+ * each clone we run BOTH the AI tick (so it picks + drives attacks like a real
+ * monster) and the attack resolver (so the active attack's hitbox lands damage).
+ * Both run inline on the game thread, mid-frame — the same context the native
+ * gets. We drive only when fired for the native (low RAM) so the nested clone
+ * ticks (which re-enter this prefix with a clone ptr) don't recurse. */
+static void clone_combat_step(const mhfu_ai_step_ctx_t *ctx)
+{
+    if (!g_clone_resolve) return;
+    if (ctx->entity_ptr >= 0x0A000000u) return;   /* clone re-entry: bail (no recursion) */
+    int n = g_clone_count;
+    static int dbg = 0;
+    int log_now = ((dbg++ % 180) == 0);   /* ~ every 3 s @60fps */
+    if (log_now)
+        mhfu_log("[clonecmb] fire nat=0x%08X resolve=%d count=%d c0=0x%08X",
+                 ctx->entity_ptr, g_clone_resolve, n, n > 0 ? g_clones[0] : 0);
+    for (int i = 0; i < n; i++) {
+        uint32_t c = g_clones[i];
+        if (c >= 0x0A000000u && c < 0x0C000000u) {
+            uint8_t ai0 = mhfu_read_u8(c + 0x334);
+            /* Natural behaviour: drive the clone's own AI tick (it aggros on sight +
+             * runs its own attack patterns, like a real Tigrex) then run the attack
+             * resolver so its active-attack hitbox can land on the player. The AI tick
+             * is what makes them attack — do NOT puppet/force a fixed action. */
+            ((mhfu_entity_tick_fn)MHFU_AI_TICK)(c);              /* AI: aggro + attack patterns */
+            ((mhfu_attack_resolver_fn)MHFU_ATTACK_RESOLVER)(c); /* resolve active attack -> damage */
+            if (log_now && i == 0)
+                mhfu_log("[clonecmb]  c0=0x%08X AISTATE %d->%d 0x33C=%d eng=%d",
+                         c, ai0, mhfu_read_u8(c + 0x334), mhfu_read_u8(c + 0x33C),
+                         (int)mhfu_read_u32(c + 0x5DC));
+        }
+    }
+}
+/* mhfu.clone_combat(enable) — turn the per-frame clone driver on/off. The ai_step
+ * detour is installed LAZILY on first enable (not at init) so a default-off config
+ * never patches z_un_08865648 — keeping quest entry on the known-stable path.
+ * NOTE: the driver re-enters z_un_08865648 from inside the ai_step prefix, which
+ * can misalign the stack for the engine's nested VFPU-quad transform code (observed
+ * crash: alignment at 088652dc). EXPERIMENTAL — leave off unless testing. */
+static int lb_clone_combat(lua_State *L)
+{
+    int en = lua_toboolean(L, 1);
+    g_clone_resolve = en;
+    static int s_installed = 0;
+    if (en && !s_installed) { mhfu_on_bigmonster_ai_step(clone_combat_step, 50); s_installed = 1; }
+    return 0;
+}
+/* mhfu.clones_set({ptr,ptr,...}) — set the live clone pointers the driver ticks. */
+static int lb_clones_set(lua_State *L)
+{
+    int n = 0;
+    if (lua_istable(L, 1)) {
+        int len = (int)lua_rawlen(L, 1);
+        for (int i = 1; i <= len && n < 12; i++) {
+            lua_rawgeti(L, 1, i);
+            uint32_t v = (uint32_t)lua_tointeger(L, -1);
+            lua_pop(L, 1);
+            if (v) g_clones[n++] = v;
+        }
+    }
+    g_clone_count = n;
+    return 0;
+}
+
 /* mhfu.load_relocated_overlay(path[, run_inits]) -> region_base, new_load, delta
  * (or nil,errcode). M2: load+relocate+place a 2nd em*.ovl at a fresh VA. */
 static int lb_load_relocated_overlay(lua_State *L)
@@ -1073,6 +1185,9 @@ static const luaL_Reg k_mhfu_api[] = {
     { "get_player_hp",    lb_player_hp },
     { "player_pos",       lb_player_pos },
     { "paint_map",        lb_paint_map },
+    { "resolve_attack",   lb_resolve_attack },
+    { "clone_combat",     lb_clone_combat },
+    { "clones_set",       lb_clones_set },
     { "buttons",          lb_buttons },
     { "freecam",          lb_freecam },
     { "freecam_active",   lb_freecam_active },
@@ -1457,6 +1572,9 @@ static int lua_host_init(void)
      * may have already installed framework hooks (spawn poll thread); g_ready
      * gates them until the VM + refs are fully built. */
     g_ready = 1;
+    /* NB: the experimental clone combat driver's ai_step detour is installed lazily
+     * by mhfu.clone_combat(true) (see lb_clone_combat), NOT here — so a default-off
+     * config never patches z_un_08865648 and quest entry stays on the stable path. */
 
     /* Exec thread: runs ALL game-thread override callbacks' Lua work in a
      * known-good context (the engine's AI-tick thread corrupts Lua heap
