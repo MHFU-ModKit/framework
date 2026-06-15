@@ -9,6 +9,7 @@ CORE_OBJS = \
   src/core/region.o \
   src/core/memory.o \
   src/core/entity.o \
+  src/core/world.o \
   src/core/monster.o \
   src/core/registry.o \
   src/core/trampoline.o \
@@ -16,6 +17,8 @@ CORE_OBJS = \
   src/core/hooks.o \
   src/core/install.o \
   src/core/quest.o \
+  src/core/ovl_reloc.o \
+  src/core/bigmon_overlay.o \
   src/core/ai.o \
   src/core/modtable.o \
   src/core/bootstrap.o
@@ -48,3 +51,20 @@ LIBS = -lpspdebug -lpspdisplay -lpspge -lpspctrl -lpspsdk -lc -lpspuser -llua -l
 
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak
+
+# Lua scripts embedded into lua_host. Source of truth = the .lua files; the
+# generated .lua.h are committed so the Docker build needs no python. After
+# editing a .lua, regenerate on the HOST with `make -f Makefile.psp embed`.
+# Declared AFTER build.mak so `all` stays the default goal.
+LUA_SRC   := $(wildcard mods/lua_host/scripts/*.lua)
+LUA_EMBED := $(LUA_SRC:.lua=.lua.h)
+
+.PHONY: embed
+embed: $(LUA_EMBED)
+mods/lua_host/scripts/%.lua.h: mods/lua_host/scripts/%.lua
+	python3 ../../tools/embed_lua.py $< $@
+
+# lua_host/mod.cpp #includes the generated headers — make doesn't auto-track
+# that, and `clean` doesn't remove mods/**/*.o, so without this the object
+# goes stale and edits to a .lua silently never recompile. Force the dep.
+mods/lua_host/mod.o: $(LUA_EMBED)

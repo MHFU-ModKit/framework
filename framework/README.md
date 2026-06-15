@@ -12,9 +12,13 @@ Two backends share **one event API**:
 |-------------------------|------------------------------|----------------------------------------------|
 | **Live (Python)**       | Outside PPSSPP, over the WS debugger | Iterate, debug, RE new events, hot-reload  |
 | **PRX (C++, compiled)** | Inside the emulated PSP, via PPSSPP's plugin loader | Ship to other players, native game speed |
+| **Lua (in-PRX script)** | Inside the emulated PSP, run by the `lua_host` PRX mod | Ship native-speed mods without recompiling; hot-reload `.lua` off the memstick |
 
-Both expose the same event names; a mod proven out in live mode can be
-ported to a PRX with minimal changes.
+Both compiled backends expose the same event names; a mod proven out in
+live mode can be ported to a PRX with minimal changes. The **Lua**
+platform (`prx/mods/lua_host/`) runs sandboxed `.lua` scripts off the
+memstick against the same events through a curated `mhfu.*` API — author
+without a toolchain, edit live. See `prx/mods/lua_host/README.md`.
 
 ## Layout
 
@@ -108,6 +112,11 @@ single `mhfu_framework.prx`. See `prx/README.md` for hook arbitration
 | 10 | **Framework refactor → C++ core + hookmgr + descriptor mods + typed SDK** | ✅ builds + in-PPSSPP runtime re-verified (2026-05-30; Tigrex injection on snow Giadrome quest) |
 | 11 | Region detection (NA/JP) + approach-B drop-in loader | 🟥 stubbed / spike pending |
 | 12 | Documentation | ✅ done |
+| 13 | **Lua scripting platform** (sandboxed Lua 5.4 in the PRX, memstick scripts, hot reload, OO API) | ✅ Phases 0–4 verified live (`prx/mods/lua_host/`) |
+| 14 | AI override-event API (force big-monster actions coherently) | ✅ verified (Tigrex spin-lock; `docs/AI_SCRIPTING_ENGINE.md` §32k) |
+| 15 | Multi-big-monster: N same-family (target-group split + entity clone) | ✅ verified (2× then 10× Tigrex; `docs/BIG_MONSTER_OVERLAY_RELOCATION.md`, CLAUDE.md §48–49) |
+| 16 | HUD/overlay: projected monster nameplates | ✅ shipped (`prx/mods/monster_nameplates/`) |
+| 17 | Free camera (quest orbit + village) | ✅ shipped (`prx/mods/lua_host/scripts/freecam.lua`, `docs/agent_camera_freecam.md`) |
 
 The PRX path is proven end-to-end: trampolines patch correctly, the
 spawn-poll thread tracks new entities, and mods (popo_growth size

@@ -18,7 +18,7 @@ all:
 	    bash -c "psp-pacman -S --noconfirm pspsdk-bin >/dev/null 2>&1 || true; make -f Makefile.psp"
 
 clean:
-	rm -f *.o *.elf *.prx *.SFO *.PBP src/*.o
+	rm -f *.o *.elf *.prx *.SFO *.PBP src/*.o src/core/*.o mods/*/mod.o mods/*/*/mod.o
 
 host-make:
 	make -f Makefile.psp

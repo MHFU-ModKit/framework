@@ -24,6 +24,7 @@
 #include "mhfu/log.h"
 #include "mhfu/entity.h"
 #include "mhfu/hooks.h"
+#include "mhfu/events.h"
 #include "internal.h"
 
 /* Action-validity walker — reads the species data table at runtime so the
@@ -153,6 +154,23 @@ static const species_vt_t g_species_vts[] = {
 #define OVL_SLOT_LOOP_DISPLACED0  0x8EA30640u   /* lw $v1, 0x640($s5)   */
 #define OVL_SLOT_LOOP_DISPLACED1  0x24040002u   /* addiu $a0, $zero, 2 */
 
+/* Big-monster action EXECUTOR entry (RE'd 2026-06-03). The function at
+ * 0x09AC5228 is f(a0=entity, a1=action_id, a2, a3): it selects the action
+ * descriptor row by a1, computes per-slot inputs (a1+0x3E8+slot*0xC8),
+ * stores them to entity+0x324/6/8, and runs the engine's vt[8] resolver +
+ * applier — fanning ONE action id to all body slots coherently. The single
+ * upstream decision is a1. We entry-detour to rewrite a1 (the COHERENT
+ * action-force seam; the per-slot input hook desyncs the body → crash).
+ *   0x09AC5228  addiu $sp,$sp,-0x40   (0x27BDFFC0)   <- displaced #0
+ *   0x09AC522C  sw    $ra,0x2C($sp)   (0xAFBF002C)   <- displaced #1
+ *   0x09AC5230  ...                                  <- resume here
+ * Overlay code → installed from the overlay-loaded helper (before JIT
+ * caches it), same as the overlay slot hook. */
+#define OVL_EXEC_ENTRY        0x09AC5228u
+#define OVL_EXEC_RESUME       0x09AC5230u
+#define OVL_EXEC_DISPLACED0   0x27BDFFC0u   /* addiu $sp,$sp,-0x40 */
+#define OVL_EXEC_DISPLACED1   0xAFBF002Cu   /* sw $ra,0x2C($sp)    */
+
 #define AI_OWNER_TAG "mhfu_ai"
 
 /* --- chain storage --------------------------------------------------- */
@@ -164,6 +182,7 @@ typedef struct { mhfu_action_override_cb_t cb; int priority; } action_entry_t;
 typedef struct { mhfu_ai_step_cb_t         cb; int priority; } step_entry_t;
 typedef struct { mhfu_bigmonster_spawn_cb_t cb; int priority; } bmspawn_entry_t;
 typedef struct { mhfu_bigmonster_death_cb_t cb; int priority; } bmdeath_entry_t;
+typedef struct { mhfu_action_sel_override_cb_t cb; int priority; } actionsel_entry_t;
 
 static overlay_entry_t g_overlay_chain[MAX_HANDLERS];
 static int             g_overlay_n = 0;
@@ -179,6 +198,8 @@ static bmspawn_entry_t g_bmspawn_chain[MAX_HANDLERS];
 static int             g_bmspawn_n = 0;
 static bmdeath_entry_t g_bmdeath_chain[MAX_HANDLERS];
 static int             g_bmdeath_n = 0;
+static actionsel_entry_t g_actionsel_chain[MAX_HANDLERS];
+static int               g_actionsel_n = 0;
 
 /* Current slot index seen by the loop wrapper this iteration, for
  * action_input/decided ctx.slot enrichment. Valid only between loop
@@ -200,6 +221,8 @@ static uint32_t      *g_action_stub = 0;
 static uint32_t      *g_slot_wrapper = 0;
 static uint32_t      *g_overlay_slot_wrapper = 0;
 static int            g_overlay_slot_hook_installed = 0;
+static uint32_t      *g_actionsel_wrapper = 0;
+static int            g_actionsel_hook_installed = 0;
 
 /* --- chain insert/remove --------------------------------------------- */
 
@@ -536,28 +559,32 @@ static int install_action_hook(void)
 extern "C" void mhfu_ai_overlay_loaded_helper(uint32_t /*ctx_a0*/)
 {
     /* Postfix on the loader's jal: $a0 is the caller's loader-context
-     * (we ignore it). Detect by signature at OVERLAY_AI_PROBE, fire
-     * once per session — on the next quest map-enter we want the
-     * subscriber to re-apply if needed, but for now one-shot is safe
-     * because cold boot is the only path that resets engine memory. */
-    static volatile int s_fired = 0;
-    if (s_fired) return;
+     * (we ignore it). The probe gates re-patching: it only proceeds when the
+     * executor bytes are the ORIGINAL prologue (0x27BDFFC0) — i.e. a fresh or
+     * just-reloaded overlay, JIT-cold. After we patch, the probe reads our J
+     * (!= sig) so subsequent loader fires no-op; if the engine later re-memcpy's
+     * the overlay (e.g. on a section roam, which wipes our patch — verified
+     * 2026-06-03), the probe sees the original again and we RE-PATCH in that
+     * cold window. NOT one-shot anymore. */
     uint32_t w = *(volatile uint32_t *)OVERLAY_AI_PROBE;
-    if (w != OVERLAY_AI_PROBE_SIG) return;     /* not our overlay */
-    s_fired = 1;
+    if (w != OVERLAY_AI_PROBE_SIG) return;     /* not freshly-loaded original */
 
-    /* Now that the AI overlay bytes are in RAM but the engine hasn't
-     * ticked AI yet (= no JIT translation of the overlay AI code), this
-     * is the window to install the overlay-side slot-loop wrapper that
-     * mirrors the EBOOT one. No-op if no slot_picked subscribers. */
+    static volatile int s_fires = 0;
+    s_fires++;
+
+    /* Original bytes resident ⇒ any prior patch is gone; re-arm + re-patch. */
+    g_overlay_slot_hook_installed = 0;
+    g_actionsel_hook_installed    = 0;
+
     extern int install_overlay_slot_hook_fwd(void);  /* see install fn below */
     install_overlay_slot_hook_fwd();
+    extern int install_overlay_action_hook_fwd(void);
+    install_overlay_action_hook_fwd();
 
-    if (g_overlay_n == 0) {
-        mhfu_log("[ai] AI overlay loaded (probe@0x%08X = 0x%08X) — no subscribers",
-                 OVERLAY_AI_PROBE, (unsigned)w);
-        return;
-    }
+    mhfu_log("[ai] overlay-loaded fire#%d (probe=0x%08X) repatch actionsel=%d",
+             s_fires, (unsigned)w, g_actionsel_hook_installed);
+
+    if (g_overlay_n == 0) return;
     mhfu_ai_overlay_ctx_t ctx;
     ctx.dest = OVERLAY_AI_BASE;
     ctx.src  = 0;
@@ -738,6 +765,99 @@ static int install_overlay_slot_hook(void)
 
 extern "C" int install_overlay_slot_hook_fwd(void) { return install_overlay_slot_hook(); }
 
+/* --- big-monster action executor (the coherent action-force seam) -------
+ *
+ * Entry-detour on 0x09AC5228 = f(a0=entity, a1=action_id, a2, a3). We call a
+ * C dispatcher with (entity, a1), put its return back in $a1, restore the
+ * other arg regs, replay the 2 displaced prologue insns, and resume at
+ * 0x09AC5230. The function then fans OUR action id to all body slots through
+ * the engine's own machinery — coherent, no per-slot desync. Installed from
+ * the overlay-loaded helper (overlay bytes resident, JIT not yet warmed). */
+extern "C" uint32_t mhfu_bigmonster_action_dispatch_c(uint32_t entity, uint32_t a1)
+{
+    if (g_actionsel_n == 0) return a1;
+    if (!mhfu_entity_is_big_monster(entity)) return a1;   /* executor is shared */
+    mhfu_action_sel_ctx_t ctx;
+    ctx.entity_ptr   = entity;
+    ctx.monster_type = mhfu_entity_type(entity);
+    ctx.action_id    = (uint16_t)a1;
+    uint32_t v = a1;
+    for (int i = 0; i < g_actionsel_n; i++) v = g_actionsel_chain[i].cb(&ctx, v);
+    return v;
+}
+
+/* Wrapper layout (17 insns; cave alloc 20):
+ *   addiu sp,sp,-0x20 ; sw ra,0x18 ; sw a0,0x10 ; sw a2,0x08 ; sw a3,0x0C
+ *   jal dispatch_c    ; nop                      ; (a0=entity, a1=action_id)
+ *   move a1, v0                                  ; a1 = chosen action id
+ *   lw a0,0x10 ; lw a2,0x08 ; lw a3,0x0C ; lw ra,0x18 ; addiu sp,sp,0x20
+ *   addiu sp,sp,-0x40 ; sw ra,0x2C(sp)           ; replay displaced prologue
+ *   j OVL_EXEC_RESUME ; nop                                                  */
+static int build_overlay_action_wrapper(uint32_t *w, uint32_t dispatch_addr)
+{
+    int i = 0;
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);
+    w[i++] = mips_sw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A0, 0x10, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A2, 0x08, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A3, 0x0C, MIPS_REG_SP);
+    w[i++] = mips_jal  (dispatch_addr);             /* a0=entity, a1=action_id */
+    w[i++] = MIPS_NOP;                              /* delay slot */
+    w[i++] = mips_move (MIPS_REG_A1, MIPS_REG_V0);  /* a1 = chosen action id */
+    w[i++] = mips_lw   (MIPS_REG_A0, 0x10, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_A2, 0x08, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_A3, 0x0C, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x40);   /* replay displaced #0 */
+    w[i++] = mips_sw   (MIPS_REG_RA, 0x2C, MIPS_REG_SP);    /* replay displaced #1 */
+    w[i++] = mips_j    (OVL_EXEC_RESUME);
+    w[i++] = MIPS_NOP;                              /* J delay slot */
+    while (i < 20) w[i++] = MIPS_NOP;
+    return i;
+}
+
+extern "C" int install_overlay_action_hook_fwd(void);
+
+static int install_overlay_action_hook(void)
+{
+    if (g_actionsel_hook_installed) return 0;
+    if (g_actionsel_n == 0) return 0;            /* no subscribers — skip */
+
+    /* Allocate the cave wrapper once; reuse it on every re-patch (re-install
+     * fires on overlay reload / section roam, so we must NOT leak cave). */
+    uint32_t *w = g_actionsel_wrapper;
+    if (!w) {
+        w = mhfu_cave_alloc(20);
+        if (!w) { mhfu_log("[ai] cave exhausted for action executor wrapper"); return -1; }
+        build_overlay_action_wrapper(w,
+            (uint32_t)(uintptr_t)&mhfu_bigmonster_action_dispatch_c);
+        mhfu_flush_caches();
+        g_actionsel_wrapper = w;
+    }
+
+    /* Only patch when the bytes are the ORIGINAL prologue (JIT-cold). If they
+     * are our J (already patched) or a JIT marker (re-translated, too late),
+     * skip — re-patching a hot/markered block won't take (Section 25). */
+    uint32_t cur0 = *(volatile uint32_t *)OVL_EXEC_ENTRY;
+    uint32_t cur1 = *(volatile uint32_t *)(OVL_EXEC_ENTRY + 4);
+    if (cur0 != OVL_EXEC_DISPLACED0 || cur1 != OVL_EXEC_DISPLACED1) {
+        mhfu_log("[ai] exec entry not original (0x%08lx) — skip patch",
+                 (unsigned long)cur0);
+        return -1;
+    }
+    *(volatile uint32_t *)OVL_EXEC_ENTRY       = mips_j((uint32_t)(uintptr_t)w);
+    *(volatile uint32_t *)(OVL_EXEC_ENTRY + 4) = MIPS_NOP;
+    mhfu_flush_caches();
+
+    g_actionsel_hook_installed = 1;
+    mhfu_log("[ai] action executor (re)patched @ 0x%08X (wrapper 0x%08X)",
+             OVL_EXEC_ENTRY, (unsigned)(uintptr_t)w);
+    return 0;
+}
+
+extern "C" int install_overlay_action_hook_fwd(void) { return install_overlay_action_hook(); }
+
 static int install_slot_hook(void)
 {
     if (g_slot_hook_installed) return 0;
@@ -889,6 +1009,43 @@ extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_action_decided(
     if (install_action_hook() != 0) return MHFU_HOOK_CONFLICT;
     CHAIN_INSERT(g_action_chain, g_action_n, MAX_HANDLERS, cb, priority);
     return MHFU_HOOK_OK;
+}
+
+/* Re-patch fallback: a map-section change can re-translate our executor patch
+ * away (overlay roam, verified 2026-06-03). On each section entry, re-arm and
+ * re-apply — install_overlay_action_hook only patches when the bytes are back
+ * to the original prologue (JIT-cold), so this is a safe no-op otherwise. */
+static int g_actionsel_section_hook = 0;
+extern "C" void mhfu_ai_section_repatch_cb(const void * /*ctx*/)
+{
+    g_actionsel_hook_installed = 0;
+    install_overlay_action_hook();
+}
+
+extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_action(
+    mhfu_action_sel_override_cb_t cb, int priority)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    /* Executor is overlay code — can't patch until the AI overlay loads.
+     * Arm the overlay-loaded detector; the install fires from its helper
+     * (install_overlay_action_hook_fwd) once the bytes are resident, and
+     * RE-fires on overlay reload. */
+    if (install_overlay_hook() != 0) return MHFU_HOOK_CONFLICT;
+    /* Belt-and-suspenders: also re-patch on section transitions. */
+    if (!g_actionsel_section_hook) {
+        mhfu_register_event(MHFU_EVENT_MAP_SECTION_ENTERED,
+                            (mhfu_event_cb_t)(void *)mhfu_ai_section_repatch_cb);
+        g_actionsel_section_hook = 1;
+    }
+    CHAIN_INSERT(g_actionsel_chain, g_actionsel_n, MAX_HANDLERS, cb, priority);
+    return MHFU_HOOK_OK;
+}
+
+extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_action(
+    mhfu_action_sel_override_cb_t cb)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    CHAIN_REMOVE(g_actionsel_chain, g_actionsel_n, cb);
 }
 
 extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_ai_step(

@@ -3,15 +3,27 @@
 # One mod per line, path relative to mods/. Lines starting with # are
 # disabled. The Makefile turns each entry into mods/<entry>/mod.o.
 
+# --- Big monsters ----------------------------------------------------------
+# bigmon_dup: §48 2-group split (2 same-family Tigrex). The N>2 group test PROVED
+# the engine caps at 2 target groups structurally (target[2] @+0x7C0 isn't a real
+# slot; writing it corrupts adjacent quest data -> kills small monsters). OFF —
+# the >2-damaging-monster path is megatigrex clones + resolve_attack (below).
+# bigmon_dup
+
+# --- Lua platform ----------------------------------------------------------
+# lua_host runs the memstick scripts (ms0:/PSP/PLUGINS/mhfu_framework/mods/*.lua),
+# e.g. scripts/megatigrex.lua (3-Tigrex swarm + per-clone resolve_attack damage).
+# Ships the entity_clone / quest_* / resolve_attack bindings the swarm needs.
+# Keep the C tigrex_spin OFF (both claim the vt[8] chain).
 lua_host
 
-# --- disabled --------------------------------------------------------------
-# noop          # core-only bisect build (kept for future isolation)
-# tigrex_spin   # injects Tigrex -> crashes section-1 entry; keep OFF for popo
+# --- HUD ---------------------------------------------------------------------
+# monster_nameplates: projected name+HP labels over monsters; double-tap SELECT.
+monster_nameplates
 
 # --- disabled --------------------------------------------------------------
-# tigrex_spin   # injects Tigrex into the quest -> crashes on section-1 entry
-#               # (no big-monster spawn tile there). Keep OFF for popo tests.
+# tigrex_spin   # C baseline; crashes on spin via action_decided ptr-force
+# noop          # core-only bisect build (kept for future isolation)
 # diag
 # tigrex_inject
 # ai_publish

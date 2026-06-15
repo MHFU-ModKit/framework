@@ -28,8 +28,14 @@ extern "C" {
 #define MHFU_ENT_MONSTER_TYPE 0x1E8 /* u8  — 0x46 Popo, 0x45 Anteka, 0x4B Tigrex */
 #define MHFU_ENT_POSITION    0x200  /* vec3 world pos */
 #define MHFU_ENT_HP          0x2E4  /* u16 */
-#define MHFU_ENT_AI_STATE    0x334  /* u8  */
+#define MHFU_ENT_SECTION     0x29A  /* u16 — map section (visibility gate A)   */
+#define MHFU_ENT_TARGET_ACQ  0x2A4  /* u8  — target-acquired                   */
+#define MHFU_ENT_AI_STATE    0x334  /* u8  — 2 = engaged                       */
+#define MHFU_ENT_PURSUIT     0x05D0 /* vec3 — pursuit/target vec (w/ engage)   */
 #define MHFU_ENT_ENGAGE_FLAG 0x05DC /* f32 — 1.0 = engaged */
+#define MHFU_ENT_FLAGS638    0x638  /* u32 — bit 0x8000 = visibility gate B    */
+#define MHFU_ENT_NEXTOBJ     0x1C4  /* ObjBase nextObj — engine update/tick chain */
+#define MHFU_ENT_PREVOBJ     0x1C8  /* ObjBase prevObj                            */
 
 typedef struct { float x, y, z; } mhfu_vec3_t;
 
@@ -57,10 +63,75 @@ void        mhfu_entity_set_ai_state(uint32_t ent, uint8_t s);
 int         mhfu_entity_engaged(uint32_t ent);          /* +0x05DC f32 >= 0.5 */
 void        mhfu_entity_set_engaged(uint32_t ent, int engaged);
 
+uint16_t    mhfu_entity_section(uint32_t ent);          /* +0x29A */
+void        mhfu_entity_set_section(uint32_t ent, uint16_t section);
+
+/* Make a (swapped/relocated) monster render in `section`: set the section
+ * tracker +0x29A and OR the +0x638 visibility bit, so the per-frame gate
+ * 0x09AC4960 stops culling it. Pass the player's current area_index as
+ * `section` (memory tigrex-section1 / giadrome-tigrex-render-bug). */
+void        mhfu_entity_make_visible(uint32_t ent, uint16_t section);
+
+/* Force an entity to engage `target` (world pos): write the pursuit vec
+ * (target - pos) at +0x5D0, engage flag +0x5DC = 1.0, ai_state +0x334 = 2,
+ * and target-acquired +0x2A4 = 1 — together, the way the engine's own
+ * per-frame sv.q writes them (Section 33g). Use to force aggro where the
+ * engine's target resolver returns null (e.g. basecamp). */
+void        mhfu_entity_force_aggro(uint32_t ent, mhfu_vec3_t target);
+
 /* Clear an entity's aggression: zero the engage flag + the per-entity
  * detection ranges so it won't re-acquire the player. Pair with
  * mhfu_species_set_detection() to also block NEW aggro (monster.h). */
 void        mhfu_entity_calm(uint32_t ent);
+
+/* Clone a live monster entity (SAME species) into fresh scratch RAM and
+ * make it a real, ticking, rendered monster. Deep-copies the per-species
+ * struct, rebases every internal self-pointer, splices the copy onto the
+ * engine update chain (+0x1C4) + a free registry slot, and spawns it CALM.
+ * The clone SHARES the source's read-only model / skeleton / overlay /
+ * species buffers, so duplicating is cheap (only the entity struct is
+ * copied) — but the species MUST be resident (clone a Tigrex only in a
+ * quest where a Tigrex is loaded). Returns the clone's pointer, or 0 on
+ * failure. Recipe: memory tigrex-clone-recipe / objbase-linked-list-spawn. */
+uint32_t    mhfu_entity_clone(uint32_t src);
+
+/* ---------------------------------------------------------- combat nodes
+ * A monster damages the player only if it owns a COLLISION NODE in the
+ * engine's per-frame hit-test list (memory combat-registration-node-gate):
+ *   - global  [0x09C18FD0] -> base; list HEAD at base+0x502C
+ *   - link    node+0x04 = next  (singly-linked, walked each frame by 0x09C41E58)
+ *   - node+0x10 = entity backref, +0x68 = player, +0x40 = pos, +0x1a/+0x18 = id
+ * Entity-clones never get a node (entity+0x2EC == 0) -> 0 damage. These give
+ * a clone a real node so the engine collision-resolves it NATIVELY (Route A,
+ * pure data writes — no engine call, no VFPU/stack-align crash). */
+#define MHFU_ENT_COMBAT_NODE 0x2EC  /* u32 -> this entity's collision node    */
+
+/* Clone the template collision node `tmpl` (a NATIVE monster's node, i.e.
+ * native_entity+0x2EC) into fresh scratch RAM, rebind it to `ent` with a
+ * unique combatant id `uid`, link entity<->node, register `uid` in the
+ * player combatant array (cap 16), and splice the node at the list HEAD.
+ * Returns the new node ptr, or 0. Call ONCE per clone (after a native node
+ * exists). */
+uint32_t mhfu_node_clone(uint32_t tmpl, uint32_t ent, uint16_t uid);
+
+/* This entity's collision node (entity+0x2EC), or 0. */
+uint32_t mhfu_node_of(uint32_t ent);
+
+/* Is `node` currently reachable from the list head? (section transitions
+ * rebuild the list and drop foreign nodes.) */
+int  mhfu_node_linked(uint32_t node);
+
+/* Head-insert `node` back into the list if it isn't linked. Returns 1 if it
+ * re-linked, else 0. Call per-frame as a safety (like the +0x1C4 shepherd). */
+int  mhfu_node_relink(uint32_t node);
+
+/* Per-frame: copy `ent` world pos into node+0x40 so the hit-test uses the
+ * clone's live position. */
+void mhfu_node_sync(uint32_t node, uint32_t ent);
+
+/* Unlink `node` from the list (call on teardown — a dangling node = the
+ * engine walks garbage = crash). */
+void mhfu_node_detach(uint32_t node);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -133,6 +133,11 @@ hook the per-frame per-entity tick `z_un_08865648` and its sub-calls
   monster appears in the entity registry.
 - `mhfu_on_bigmonster_death(cb, priority)` — observe; HP > 0 → 0 edge,
   one-shot per slot.
+- `mhfu_on_bigmonster_action(cb, priority)` — **the production action-force
+  seam** (Section 32k). Entry detour on the big-mon executor `0x09AC5228`;
+  rewrite the `a1` action id and the engine fans it to every body-part slot
+  itself — coherent, no desync/crash (verified Tigrex spin-lock). Prefer this
+  over poking per-slot inputs. See `docs/AI_SCRIPTING_ENGINE.md` §32k.
 
 Big-monster filtering uses an allowlist on `entity+0x1E8` (Tigrex 0x4B,
 Giadrome 0x4D). Will switch to `quest.targets[2]` enumeration once

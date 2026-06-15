@@ -26,6 +26,10 @@ void mhfu_write_f32(uint32_t a, float v)
 
 int mhfu_mem_valid(uint32_t a)
 {
+    /* Main managed RAM only. The extra memory=64 region [0x0A000000,0x0C000000)
+     * (clones / relocated overlays) is validated with explicit range checks at the
+     * call sites that need it — NOT here — so this stays a conservative gate for
+     * the quest/recbase/EBOOT-pointer checks that rely on it. */
     return a >= 0x08000000u && a < 0x0A000000u;
 }
 

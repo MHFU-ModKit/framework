@@ -208,26 +208,88 @@ end)
   memory-budget bug (512 KB slab > free contiguous RAM); fixed by a 64 KB slab.
   See `## Phase 1 RESULTS` below.
 
-**Phase 2 — Events + AI override binding. ~1–2 days.**
-- Bind `mhfu.on(...)` for the 5 fan-out events (ctx→table). Bind the AI override
-  chain (`on_action_input` first — it's the durable force path). Port the
-  `tigrex_spin` C mod to Lua as the reference/acceptance test; behavior must match.
-- `lua_atpanic` + per-callback `pcall` error logging to `framework.log`.
+**Phase 2 — Events + AI override binding. 🔄 BUILT 2026-06-02, awaiting HITL.**
+- Bound the AI override chain into Lua (`mhfu.on_bigmonster_action_decided` /
+  `_action_input` / `_slot_picked`, `on_ai_overlay_loaded`, `on_bigmonster_spawn`
+  / `_death`, `on_quest_targets_building`) + helper bindings (`write_u8/16/32`,
+  `entity_set_size`, `quest_has`, `quest_replace_monster`, `action_ptr_for`).
+  Lua callback return value is threaded back into the engine register.
+- Ported `tigrex_spin` C mod → `mods/lua_host/scripts/tigrex_spin.lua` (1:1).
+- `lua_atpanic` + per-callback `pcall` error logging; VM serialised by a binary
+  semaphore (game-thread overrides vs poll-thread spawn/death).
+- See `## Phase 2 RESULTS` below.
 
-**Phase 3 — Runtime loading from memstick. ~1 day.**
-- `sceIoDopen` scan of `.../mods/*.lua` (+ `.lc`), `sceIoRead` + `luaL_loadbuffer`
-  into a per-mod `_ENV`. Load order deterministic (sorted). Errors isolated
-  per file.
+**Phase 3 — Runtime loading from memstick. ✅ DONE 2026-06-03. PASS (HITL).**
+- `sceIoDopen` scan of `ms0:/PSP/PLUGINS/mhfu_framework/mods/*.lua`, `sceIoRead`
+  into a 48 KB BSS scratch buffer, `luaL_loadbuffer` + `lua_pcall`, per-file
+  error isolation. Embedded `tigrex_spin.lua.h` kept ONLY as a fallback when the
+  dir is empty/absent (never bricks the PRX). `mod.cpp` `load_lua_dir()` /
+  `load_lua_file()`. tigrex_spin now loads from the on-disk `.lua` — verified
+  live: `[lua_host] loaded mod tigrex_spin.lua (5436B)` + `1 mod(s) loaded`
+  (5436 B == file size; NOT the fallback), then `ANGRY_SPIN -> LOCKED`, then the
+  expected AI-brittleness crash on the natural spin.
+- NOT YET DONE (deferred to Phase 4/5): per-mod `_ENV` isolation (all mods
+  currently share one global env + one `lua_State`); deterministic sort order
+  (relies on dir-read order); `.lc` bytecode. The residual game-thread
+  `action_input err: attempt to call a boolean value` is the known game-thread
+  Lua-corruption bug (separate from Phase 3).
 
-**Phase 4 — Hot reload + polish. ~1 day.**
-- Reload one mod (unref its callbacks, drop env, gc, reload). Trigger = file
-  mtime poll or debug flag. GC pacing (`LUA_GCSTEP` every ~5 frames).
-- Author docs + 2–3 example Lua mods (calm-tigrex, popo-grow, quest-inject).
+**Phase 4 — Hot reload. ✅ DONE 2026-06-03. PASS (HITL, live).**
+- Worker thread (2 Hz) polls each memstick `.lua`'s (size, mtime) via
+  `sceIoGetstat`; on change it takes the VM lock and re-execs the file in the
+  SAME `lua_State`. The mod's `mhfu.on_*(fn)` calls run again and `store_ref()`
+  unrefs the old handler + stores the new — the framework's C event hooks are
+  already installed and keep dispatching, now into the fresh closures. So a
+  live edit takes effect with NO hook reinstall and NO cold boot. `lua_gc`
+  after each reload reclaims the old closures. `mod.cpp`: `hot_reload_scan()`,
+  `prime_tracked()`, `track_set()`, `tracked_t g_tracked[16]`.
+- VERIFIED live (game in village, edit driven from host shell): appending a
+  comment 5436B→5486B fired `[lua_host] hot-reload tigrex_spin.lua ...` →
+  re-exec `registered` line → `loaded mod tigrex_spin.lua (5486B)` (new size =
+  edited file re-read) → `hot-reloaded 1 mod(s)` with `live` dropping
+  23080B→19216B (GC). Repeatable: restoring to 5436B fired a 2nd reload.
+  PPSSPP surfaces the host file's changed mtime/size to `sceIoGetstat`.
+- NOT done (deferred): GC pacing via `LUA_GCSTEP` (currently a full
+  `GCCOLLECT` only on reload, which is fine — reloads are rare); author docs +
+  example mods. Per-mod `_ENV`/state isolation and unregister-on-delete still
+  Phase 5 (one shared env/`lua_State`; module `local` state resets on reload —
+  intended; deleting a `.lua` leaves its handlers registered).
+
+**Game-thread Lua-corruption bug — ✅ FIXED 2026-06-03 (v0.4). PASS (HITL).**
+Long-standing bug: the AI override callbacks (`action_input` / `action_decided`
+/ `slot_picked` / `overlay_loaded` / `quest_targets_building`) fire on the
+engine's GAME thread (AI-tick), and Lua HEAP ALLOCATION done in that thread's
+context corrupted — a fresh table's node array collapsed so every key read back
+as the last value (`tostring`→"call a number value", concat→"call a boolean",
+ctx tables → all fields = last). Surfaced as `action_input err: attempt to call
+a number/boolean value`.
+- ROOT CAUSE bisected exhaustively (hot-reload + a `probe.lua` ladder + C
+  instrumentation). RULED OUT: C-stack overflow (30 KB headroom), FPU/COP1
+  (float math fine on the game thread), `$gp` (0 GPREL relocs in liblua AND our
+  objects), GC (corrupts with `GCSTOP`), allocator/region (corrupts with the
+  slab AND newlib `malloc`; no stack overlap), write/read path (writing a
+  pre-allocated table on the game thread is fine). Decisive control: the SAME
+  inline table test runs **always-OK on the worker thread and always-CORRUPT on
+  the game thread**, interleaved in real time. Conclusion: a per-thread
+  emulation quirk — Lua's table-construction code misbehaves only in the
+  engine's AI-tick thread context; not fixable at the Lua source.
+- FIX: game-thread override callbacks NEVER touch the VM. They marshal the
+  request to a dedicated **exec thread** (a proven-good context) via two binary
+  semaphores (`g_req_sema`/`g_resp_sema` + `volatile lua_req_t g_req`) and block
+  for the result; the exec thread runs the Lua handler and threads the return
+  back into the engine register. spawn/death (poll thread) and `mhfu_tick`
+  (worker) already run on good threads → direct. `mod.cpp`: `exec_thread()`,
+  `marshal()`, `dispatch_input/decided/slot/overlay/quest()`.
+- VERIFIED live on the real Tigrex (`type=0x4B`): every game-thread callback now
+  passes the full stress — fresh table build + `tostring` + concat +
+  `string.format` + ctx table — all `true`, real engine `vt8_input`s flowing, no
+  errors, no freeze. Workaround constraints in `tigrex_spin.lua` (positional
+  args, `string.format`-not-concat) are no longer required.
 
 **Phase 5 (optional/later).** Parser-strip + bytecode-only shipping; per-mod
-isolated `lua_State`s; richer userdata-with-metatable ctx; a Lua API for the
-quest-injection helpers; expose action-id enum tables generated from
-`ai_actions.h`.
+isolated `lua_State`s; richer userdata-with-metatable ctx (now unblocked by the
+marshal fix); a Lua API for the quest-injection helpers; expose action-id enum
+tables generated from `ai_actions.h`.
 
 Total core (Phases 0–4): ~4–6 focused days, sequential, each phase
 independently testable on PPSSPP.
@@ -473,3 +535,65 @@ lua-users GC-in-realtime-games. Alternatives: Squirrel (ps2dev forum, Wikipedia)
 AngelScript (gamedev.net PSP), Berry/Wren/PocketPy repos, schemescape
 "smallest scripting language" benchmark.
 ```
+
+---
+
+## Phase 2 RESULTS — BUILT 2026-06-02, awaiting HITL verification
+
+**Deliverable: a PRX that loads a Lua mod replicating `tigrex_spin`.** Installed
+at `~/.config/ppsspp/PSP/PLUGINS/mhfu_framework/mhfu_framework.prx`
+(pre-Phase-2 build backed up as `mhfu_framework.prx.bak-pre-luaspin-*`).
+Manifest: `lua_host` ENABLED, C `tigrex_spin` DISABLED (both claim the vt[8]
+`action_decided` chain → would CONFLICT; the Lua port supersedes the C mod).
+
+**Lua-facing AI override API** (`framework/prx/mods/lua_host/mod.cpp`):
+
+| Lua call | C binding | Semantics |
+|----------|-----------|-----------|
+| `mhfu.on_quest_targets_building(fn)` | `MHFU_EVENT_QUEST_TARGETS_BUILDING` | `fn(quest)` — edit list before model-load |
+| `mhfu.on_bigmonster_spawn(fn)` | `mhfu_on_bigmonster_spawn` | `fn(ent,type,slot,hp)` (poll thread) |
+| `mhfu.on_bigmonster_death(fn)` | `mhfu_on_bigmonster_death` | `fn(ent,type,slot)` (poll thread) |
+| `mhfu.on_ai_overlay_loaded(fn)` | `mhfu_on_ai_overlay_loaded` | `fn()` observe (load-bearing) |
+| `mhfu.on_bigmonster_slot_picked(fn,prio)` | `mhfu_on_bigmonster_slot_picked` | `fn(ctx,slot)->slot` (OOB-clamped) |
+| `mhfu.on_bigmonster_action_input(fn,prio)` | `mhfu_on_bigmonster_action_input` | `fn(ctx,input)->input` (force path) |
+| `mhfu.on_bigmonster_action_decided(fn,prio)` | `mhfu_on_bigmonster_action_decided` | `fn(ctx,value)->value` (vt[8] post) |
+
+ctx table = `{ entity, type, slot, input }` (+ `count` for slot_picked). Plus
+helper bindings `write_u8/u16/u32`, `entity_set_size`, `quest_has`,
+`quest_replace_monster`, `action_ptr_for`, and the Phase-1 read/getter set.
+
+**Design notes:**
+- **Return-value threading**: each override C trampoline pushes the ctx + the
+  engine's current value, `lua_pcall(…,1 result)`, and casts the Lua return
+  back into the engine register (uint32 ptr / uint16 input / uint8 slot). Lua
+  is built `LUA_32BITS` (lua_Integer = int32), so tigrex outcome pointers
+  (0x08–0x0A range, < 2^31) round-trip exactly as positive integers.
+- **Concurrency**: the override callbacks run on the GAME thread inside the
+  engine call stack; spawn/death on the framework 5 Hz poll thread; the
+  optional `mhfu_tick()` on our 2 Hz worker. The non-reentrant VM is serialised
+  by a binary semaphore (`lua_enter`/`lua_leave`); `g_ready` gates trampolines
+  until setup + refs are built; the panic handler releases the lock before
+  parking so a dead VM can't hang the game thread.
+- **Script packaging**: `mods/lua_host/scripts/tigrex_spin.lua` is the source of
+  truth; `tools/embed_lua.py` emits a committed `*.lua.h` C string literal
+  (octal escapes — no signed-char narrowing on UTF-8) that lua_host `#include`s
+  and runs. `make -f Makefile.psp embed` (HOST) regenerates after a `.lua` edit;
+  the Docker build needs no python. This is the bridge until Phase 3 ships
+  memstick `.lua` loading.
+
+**HITL acceptance test** (same env as the C mod — the Giadrome quest, NOT the
+snow popo section-1): cold-boot PPSSPP (plugins load only on cold boot; `--state`
+bypasses them), start the Giadrome quest. Expected `framework.log`:
+`[lua_host] VM ready …`, `[tigrex_spin.lua] registered`, then on quest begin
+`[tigrex_spin.lua] giadrome -> tigrex (native coords)`, on spawn
+`… tigrex spawn … (resized 0.5x)`, then on the first natural spin
+`… SPIN slot N cached …` ×3 and `… natural SPIN observed -> pin armed …`,
+after which the 0.5x Tigrex stays locked spinning until first hit
+(`… hp X -> Y, releasing pin`). PASS = behaviour matches the C `tigrex_spin`.
+
+**Risk flagged for HITL**: running a `lua_pcall` per vt[8] decision on the
+333 MHz game thread is heavier than the C mod's inline check. Steady-state hot
+path does only integer ops + 12 `write_*` C calls (no string.format), so cost
+should be bounded, but if it stutters/freezes the mitigations are: gate the
+override on `pin_active` earlier, or move the maintenance writes into a single
+C helper binding. Report observed behaviour to decide.
