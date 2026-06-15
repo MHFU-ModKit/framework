@@ -95,6 +95,44 @@ void        mhfu_entity_calm(uint32_t ent);
  * failure. Recipe: memory tigrex-clone-recipe / objbase-linked-list-spawn. */
 uint32_t    mhfu_entity_clone(uint32_t src);
 
+/* ---------------------------------------------------------- combat nodes
+ * A monster damages the player only if it owns a COLLISION NODE in the
+ * engine's per-frame hit-test list (memory combat-registration-node-gate):
+ *   - global  [0x09C18FD0] -> base; list HEAD at base+0x502C
+ *   - link    node+0x04 = next  (singly-linked, walked each frame by 0x09C41E58)
+ *   - node+0x10 = entity backref, +0x68 = player, +0x40 = pos, +0x1a/+0x18 = id
+ * Entity-clones never get a node (entity+0x2EC == 0) -> 0 damage. These give
+ * a clone a real node so the engine collision-resolves it NATIVELY (Route A,
+ * pure data writes — no engine call, no VFPU/stack-align crash). */
+#define MHFU_ENT_COMBAT_NODE 0x2EC  /* u32 -> this entity's collision node    */
+
+/* Clone the template collision node `tmpl` (a NATIVE monster's node, i.e.
+ * native_entity+0x2EC) into fresh scratch RAM, rebind it to `ent` with a
+ * unique combatant id `uid`, link entity<->node, register `uid` in the
+ * player combatant array (cap 16), and splice the node at the list HEAD.
+ * Returns the new node ptr, or 0. Call ONCE per clone (after a native node
+ * exists). */
+uint32_t mhfu_node_clone(uint32_t tmpl, uint32_t ent, uint16_t uid);
+
+/* This entity's collision node (entity+0x2EC), or 0. */
+uint32_t mhfu_node_of(uint32_t ent);
+
+/* Is `node` currently reachable from the list head? (section transitions
+ * rebuild the list and drop foreign nodes.) */
+int  mhfu_node_linked(uint32_t node);
+
+/* Head-insert `node` back into the list if it isn't linked. Returns 1 if it
+ * re-linked, else 0. Call per-frame as a safety (like the +0x1C4 shepherd). */
+int  mhfu_node_relink(uint32_t node);
+
+/* Per-frame: copy `ent` world pos into node+0x40 so the hit-test uses the
+ * clone's live position. */
+void mhfu_node_sync(uint32_t node, uint32_t ent);
+
+/* Unlink `node` from the list (call on teardown — a dangling node = the
+ * engine walks garbage = crash). */
+void mhfu_node_detach(uint32_t node);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

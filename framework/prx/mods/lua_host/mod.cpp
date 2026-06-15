@@ -413,6 +413,163 @@ static int lb_clones_set(lua_State *L)
     return 0;
 }
 
+/* ---- Path 1b: NATIVE combat-node registration (real clone damage) ----------
+ * RE 2026-06-14 (memory combat-registration-node-gate): a monster damages the
+ * player only if it owns a node in the per-frame collision list. The engine
+ * builds that node, for each managed combatant EVERY FRAME, via:
+ *   0x09B661EC(mgr_this, entity, idx):
+ *      if 0x8865bac(entity) != 1 return        ; GATE: entity+0x29a == cur section
+ *      node = 0x8859b44(g+0x5000, 0xe0, 0x10)  ; per-frame pool alloc
+ *      0x09D4B318(node, entity, idx)           ; init fields + splice into list
+ * A clone passes the section gate (the shepherd keeps clone+0x29a == cur section),
+ * so calling 0x09B661EC(mgr, clone, idx) ourselves each frame makes the engine
+ * build a REAL node for the clone -> it becomes a genuine combatant that frame ->
+ * native hitbox/per-part/formula damage. The node is a per-FRAME transient (pool
+ * reset+rebuilt each frame), so teardown is uniform (no dangling-node crash that
+ * a STATIC injected node caused). a0 = manager `this` (must be nonzero — gates the
+ * alloc branch). Integer + single-float only (no VFPU quads) -> lower call risk. */
+/* Native per-frame node builder: jal 0x9b661e8 (from 0x09D383A0 &c) with
+ * a0 = g = [0x09C18FD0] (collision global), a1 = entity, a2 = idx byte.
+ * (Entry is 0x09B661E8 — the +4 mistake skipped `addiu sp,-0x10` -> stack corrupt
+ * -> NULL node -> Write@0x10. And a0 is g, NOT the manager.) */
+typedef void (*mhfu_combat_build_fn)(uint32_t g, uint32_t entity, uint32_t idx);
+#define MHFU_COMBAT_BUILD    0x09B661E8u
+#define MHFU_COLL_GLOBAL_PTR 0x09C18FD0u
+#define MHFU_COMBAT_IDX      0x0Eu          /* the idx the native uses (0x09D383A4) */
+static volatile int g_combat_nodes = 0;
+
+/* IN-CONTEXT via JIT-IMMUNE FIELD SWAP (Path 1b v6). The overlay detours (v4/v5)
+ * were install-timing-blocked (the builder/call-site overlay regions aren't
+ * covered by the framework's cold-window helper). But the per-frame drive calls
+ * the per-monster PROCESSOR through a function-pointer FIELD: manager+0xC
+ * (0x08B0C7CC) = 0x09A60198, dispatched via JALR. A pointer field is a DATA word
+ * → swapping it is JIT-IMMUNE (no cold window needed), the production override
+ * mechanism. We point it at a cave stub: call the original processor (native node
+ * built) THEN build clone nodes — in-context (pool live), in the same per-frame
+ * drive, before the consumer. Re-applied each tick (survives quest reload). */
+extern "C" uint32_t *mhfu_cave_alloc(int n_insns);
+#define MGR_PROC_SLOT 0x08B0C7CCu   /* manager+0xC: fn-ptr the per-frame drive JALRs */
+#define MGR_PROC_ORIG 0x09A60198u   /* per-monster processor it normally points to    */
+static uint32_t g_combat_stub = 0;
+
+/* Called by the stub AFTER the engine's per-monster processor (native node built),
+ * on the game thread, in-context. Build a node for each clone. */
+#define MGR_FRAME_CTR 0x08B0C7F0u   /* manager+0x30: ++ once per drive (frame) */
+/* Does any node in the collision list have +0x10 == entity? (the engine NEVER
+ * removes our injected nodes — building unconditionally floods the pool, count 75
+ * — so we add a clone's node only when it has none, self-healing.) */
+static int node_in_list(uint32_t g, uint32_t entity)
+{
+    uint32_t n = mhfu_read_u32(g + 0x502c);
+    for (int i = 0; i < 96 && n >= 0x08000000u && n < 0x0C000000u; i++) {
+        if (mhfu_read_u32(n + 0x10) == entity) return 1;
+        n = mhfu_read_u32(n + 0x04);
+    }
+    return 0;
+}
+static uint32_t find_node(uint32_t g, uint32_t entity)
+{
+    uint32_t n = mhfu_read_u32(g + 0x502c);
+    for (int i = 0; i < 96 && n >= 0x08000000u && n < 0x0C000000u; i++) {
+        if (mhfu_read_u32(n + 0x10) == entity) return n;
+        n = mhfu_read_u32(n + 0x04);
+    }
+    return 0;
+}
+/* The first node whose entity backref is a low-RAM (native) monster = the fully
+ * engine-populated template. */
+static uint32_t find_native_node(uint32_t g)
+{
+    uint32_t n = mhfu_read_u32(g + 0x502c);
+    for (int i = 0; i < 96 && n >= 0x08000000u && n < 0x0C000000u; i++) {
+        uint32_t e = mhfu_read_u32(n + 0x10);
+        if (e >= 0x08000000u && e < 0x0A000000u && mhfu_read_u8(e + 0x1e8) == 0x4B) return n;
+        n = mhfu_read_u32(n + 0x04);
+    }
+    return 0;
+}
+extern "C" void mhfu_combat_node_dispatch_c(void)
+{
+    if (!g_combat_nodes) return;
+    static uint32_t last_frame = 0xFFFFFFFFu;
+    uint32_t frame = mhfu_read_u32(MGR_FRAME_CTR);
+    if (frame == last_frame) return;            /* once per frame */
+    last_frame = frame;
+    uint32_t g = mhfu_read_u32(MHFU_COLL_GLOBAL_PTR);
+    if (g < 0x08000000u || g >= 0x0C000000u) return;
+    uint32_t natn = find_native_node(g);
+    if (!natn) return;                          /* native not engaged yet */
+    int n = g_clone_count;
+    static int dbg = 0;
+    if ((dbg++ % 120) == 0)
+        mhfu_log("[combatnode] dispatch frame=%u clones=%d count=%u natnode=0x%08X",
+                 (unsigned)frame, n, (unsigned)mhfu_read_u32(g + 0x5034), natn);
+    for (int i = 0; i < n; i++) {
+        uint32_t c = g_clones[i];
+        if (c < 0x0A000000u || c >= 0x0C000000u) continue;
+        uint32_t cn = find_node(g, c);
+        if (!cn) { ((mhfu_combat_build_fn)MHFU_COMBAT_BUILD)(g, c, MHFU_COMBAT_IDX); cn = find_node(g, c); }
+        if (!cn || cn == natn) continue;
+        /* Fully POPULATE the clone node from the native's (the bare builder leaves
+         * it skeletal — missing the hitbox/combat fields the consumer needs). Keep
+         * the clone node's list links + rebind entity/pos. */
+        uint32_t nx = mhfu_read_u32(cn + 0x04);
+        uint32_t bk = mhfu_read_u32(cn + 0x08);
+        for (uint32_t o = 0; o < 0x110u; o += 4)
+            mhfu_write_u32(cn + o, mhfu_read_u32(natn + o));
+        mhfu_write_u32(cn + 0x04, nx);
+        mhfu_write_u32(cn + 0x08, bk);
+        mhfu_write_u32(cn + 0x10, c);            /* entity backref = clone */
+        mhfu_vec3_t p = mhfu_entity_pos(c);
+        mhfu_write_f32(cn + 0x40, p.x); mhfu_write_f32(cn + 0x44, p.y); mhfu_write_f32(cn + 0x48, p.z);
+    }
+}
+
+/* mhfu.combat_swap() — install (idempotent) the field swap. Builds the cave stub
+ * once; (re)points manager+0xC at it whenever the slot holds the original (quest
+ * reload reverts it). Call each tick when combat_nodes(true). */
+static int lb_combat_swap(lua_State *L)
+{
+    (void)L;
+    if (!g_combat_nodes) return 0;
+    if (!g_combat_stub) {
+        uint32_t *w = mhfu_cave_alloc(12);
+        if (!w) { mhfu_log("[combatnode] cave exhausted"); return 0; }
+        int i = 0;
+        w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x10);
+        w[i++] = mips_sw(MIPS_REG_RA, 0x0C, MIPS_REG_SP);
+        w[i++] = mips_jal(MGR_PROC_ORIG);                 /* native processor (a0-a3 intact) */
+        w[i++] = MIPS_NOP;
+        w[i++] = mips_sw(MIPS_REG_V0, 0x08, MIPS_REG_SP); /* preserve its return */
+        w[i++] = mips_jal((uint32_t)(uintptr_t)&mhfu_combat_node_dispatch_c);
+        w[i++] = MIPS_NOP;
+        w[i++] = mips_lw(MIPS_REG_V0, 0x08, MIPS_REG_SP);
+        w[i++] = mips_lw(MIPS_REG_RA, 0x0C, MIPS_REG_SP);
+        w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x10);
+        w[i++] = mips_jr(MIPS_REG_RA);
+        w[i++] = MIPS_NOP;
+        mhfu_flush_caches();
+        g_combat_stub = (uint32_t)(uintptr_t)w;
+    }
+    volatile uint32_t *slot = (volatile uint32_t *)MGR_PROC_SLOT;
+    if (*slot == MGR_PROC_ORIG) {
+        *slot = g_combat_stub;
+        mhfu_flush_caches();
+        mhfu_log("[combatnode] field swap @0x%08X -> stub 0x%08X (orig 0x%08X)",
+                 MGR_PROC_SLOT, g_combat_stub, MGR_PROC_ORIG);
+    }
+    return 0;
+}
+
+/* mhfu.combat_nodes(enable) — arm/disarm the clone combat-node builder. */
+static int lb_combat_nodes(lua_State *L)
+{
+    g_combat_nodes = lua_toboolean(L, 1);
+    return 0;
+}
+/* mhfu.combat_register_all() — retained no-op (the field swap drives it now). */
+static int lb_combat_register_all(lua_State *L) { (void)L; return 0; }
+
 /* mhfu.load_relocated_overlay(path[, run_inits]) -> region_base, new_load, delta
  * (or nil,errcode). M2: load+relocate+place a 2nd em*.ovl at a fresh VA. */
 static int lb_load_relocated_overlay(lua_State *L)
@@ -803,6 +960,45 @@ static int lb_entity_clone(lua_State *L)
     lua_pushinteger(L, (lua_Integer)mhfu_entity_clone((uint32_t)luaL_checkinteger(L,1)));
     return 1;
 }
+/* ---- Route A: collision-node clone (give a clone NATIVE player damage) ---- */
+/* mhfu.node_clone(template_node, clone_ent, uid) -> node_ptr (0 on failure) */
+static int lb_node_clone(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)mhfu_node_clone(
+        (uint32_t)luaL_checkinteger(L,1), (uint32_t)luaL_checkinteger(L,2),
+        (uint16_t)luaL_checkinteger(L,3)));
+    return 1;
+}
+/* mhfu.node_of(ent) -> node_ptr (entity+0x2EC), 0 if none */
+static int lb_node_of(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)mhfu_node_of((uint32_t)luaL_checkinteger(L,1)));
+    return 1;
+}
+/* mhfu.node_linked(node) -> bool */
+static int lb_node_linked(lua_State *L)
+{
+    lua_pushboolean(L, mhfu_node_linked((uint32_t)luaL_checkinteger(L,1)));
+    return 1;
+}
+/* mhfu.node_relink(node) -> bool (re-linked?) */
+static int lb_node_relink(lua_State *L)
+{
+    lua_pushboolean(L, mhfu_node_relink((uint32_t)luaL_checkinteger(L,1)));
+    return 1;
+}
+/* mhfu.node_sync(node, ent) */
+static int lb_node_sync(lua_State *L)
+{
+    mhfu_node_sync((uint32_t)luaL_checkinteger(L,1), (uint32_t)luaL_checkinteger(L,2));
+    return 0;
+}
+/* mhfu.node_detach(node) */
+static int lb_node_detach(lua_State *L)
+{
+    mhfu_node_detach((uint32_t)luaL_checkinteger(L,1));
+    return 0;
+}
 static int lb_action_ptr_for(lua_State *L)
 {
     lua_pushinteger(L, (lua_Integer)mhfu_action_ptr_for(
@@ -1187,6 +1383,9 @@ static const luaL_Reg k_mhfu_api[] = {
     { "paint_map",        lb_paint_map },
     { "resolve_attack",   lb_resolve_attack },
     { "clone_combat",     lb_clone_combat },
+    { "combat_nodes",         lb_combat_nodes },
+    { "combat_swap",          lb_combat_swap },
+    { "combat_register_all",  lb_combat_register_all },
     { "clones_set",       lb_clones_set },
     { "buttons",          lb_buttons },
     { "freecam",          lb_freecam },
@@ -1216,6 +1415,12 @@ static const luaL_Reg k_mhfu_api[] = {
     { "entity_make_visible", lb_entity_make_visible },
     { "entity_force_aggro", lb_entity_force_aggro },
     { "entity_clone",     lb_entity_clone },
+    { "node_clone",       lb_node_clone },
+    { "node_of",          lb_node_of },
+    { "node_linked",      lb_node_linked },
+    { "node_relink",      lb_node_relink },
+    { "node_sync",        lb_node_sync },
+    { "node_detach",      lb_node_detach },
     { "entities_of_type", lb_entities_of_type },
     { "quest_has",            lb_quest_has },
     { "quest_monster_count",  lb_quest_monster_count },

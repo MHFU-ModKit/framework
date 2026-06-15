@@ -271,4 +271,137 @@ uint32_t mhfu_entity_clone(uint32_t src)
     return dst;
 }
 
+/* ----------------------------------------------------------- combat nodes
+ * The collision hit-test (consumer 0x09C41E58) walks a singly-linked list of
+ * nodes; only listed nodes are tested against the player -> damage. Route A:
+ * clone a native node + splice it in so a clone is resolved natively. All the
+ * field offsets/globals here are from the cold disasm of the registrar
+ * (0x09C42F00) + consumer (memory combat-registration-node-gate). */
+#define COLL_GLOBAL_PTR   0x09C18FD0u   /* [*] -> base; head at base+0x502C   */
+#define COLL_HEAD_OFF     0x502Cu
+#define PLAYER_ENTITY     0x090B3440u   /* the player entity = combat target  */
+#define NODE_NEXT         0x04u         /* next-ptr (list link)               */
+#define NODE_STATE        0x0Eu         /* u8, must be != 0xFF to register     */
+#define NODE_ENTITY       0x10u         /* entity backref                      */
+#define NODE_ID0          0x18u         /* u16 combatant id (consumer matches) */
+#define NODE_ID1          0x1Au         /* u16 id (registrar reads -> player[])*/
+#define NODE_POS          0x40u         /* vec3 hit-test position              */
+#define NODE_PLAYER       0x68u         /* player ptr                          */
+#define PLAYER_COMBAT_CNT 0x398u        /* u8 count                            */
+#define PLAYER_COMBAT_ARR 0x33Eu        /* u16[16] ids                         */
+#define ENT_NODE_SLOTIDX  0x364u        /* = combat slot index                 */
+#define ENT_ENGAGED2      0x33Du        /* u8 = 1                              */
+#define ENT_REG_FLAG      0x3F8u        /* u8 = 1                              */
+#define NODE_COPY_SIZE    0x110u        /* exactly one node (stride 0x110)     */
+
+static uint32_t coll_head_cell(void)
+{
+    uint32_t g = mhfu_read_u32(COLL_GLOBAL_PTR);
+    if (!in_ram(g)) return 0;
+    return g + COLL_HEAD_OFF;
+}
+
+uint32_t mhfu_node_of(uint32_t ent)
+{
+    return in_ram(ent) ? mhfu_read_u32(ent + MHFU_ENT_COMBAT_NODE) : 0;
+}
+
+int mhfu_node_linked(uint32_t node)
+{
+    uint32_t hc = coll_head_cell();
+    if (!hc || !in_ram(node)) return 0;
+    uint32_t n = mhfu_read_u32(hc);
+    for (int i = 0; i < 64 && in_ram(n); i++) {
+        if (n == node) return 1;
+        n = mhfu_read_u32(n + NODE_NEXT);
+    }
+    return 0;
+}
+
+int mhfu_node_relink(uint32_t node)
+{
+    if (!in_ram(node) || mhfu_node_linked(node)) return 0;
+    uint32_t hc = coll_head_cell();
+    if (!hc) return 0;
+    mhfu_write_u32(node + NODE_NEXT, mhfu_read_u32(hc));
+    mhfu_write_u32(hc, node);
+    return 1;
+}
+
+void mhfu_node_sync(uint32_t node, uint32_t ent)
+{
+    if (!in_ram(node) || !in_ram(ent)) return;
+    mhfu_vec3_t p = mhfu_entity_pos(ent);
+    mhfu_write_f32(node + NODE_POS + 0, p.x);
+    mhfu_write_f32(node + NODE_POS + 4, p.y);
+    mhfu_write_f32(node + NODE_POS + 8, p.z);
+}
+
+void mhfu_node_detach(uint32_t node)
+{
+    uint32_t hc = coll_head_cell();
+    if (!hc || !in_ram(node)) return;
+    uint32_t nxt  = mhfu_read_u32(node + NODE_NEXT);
+    uint32_t head = mhfu_read_u32(hc);
+    if (head == node) { mhfu_write_u32(hc, nxt); return; }
+    uint32_t cur = head;
+    for (int i = 0; i < 64 && in_ram(cur); i++) {
+        uint32_t cn = mhfu_read_u32(cur + NODE_NEXT);
+        if (cn == node) { mhfu_write_u32(cur + NODE_NEXT, nxt); return; }
+        cur = cn;
+    }
+}
+
+uint32_t mhfu_node_clone(uint32_t tmpl, uint32_t ent, uint16_t uid)
+{
+    if (!in_ram(tmpl) || !in_ram(ent)) return 0;
+    uint32_t hc = coll_head_cell();
+    if (!hc) return 0;
+    uint32_t node = clone_alloc(NODE_COPY_SIZE);
+    if (!node) return 0;
+    int32_t delta = (int32_t)node - (int32_t)tmpl;
+
+    /* deep-copy the template node + rebase its internal self-pointers */
+    for (uint32_t o = 0; o < NODE_COPY_SIZE; o += 4)
+        mhfu_write_u32(node + o, mhfu_read_u32(tmpl + o));
+    for (uint32_t o = 0; o < NODE_COPY_SIZE; o += 4) {
+        uint32_t v = mhfu_read_u32(node + o);
+        if (v >= tmpl && v < tmpl + NODE_COPY_SIZE)
+            mhfu_write_u32(node + o, (uint32_t)((int32_t)v + delta));
+    }
+
+    /* rebind to the clone. The id (node+0x18/+0x1a) is left as the template's
+     * (the native's) id by default — it's small + in-range, and the engine may
+     * use it as a table INDEX (a large invented id => OOB ptr => bad jalr crash,
+     * seen live). Pass uid != 0 ONLY to override with a known-safe small id +
+     * register it in the player combatant array. */
+    mhfu_write_u32(node + NODE_ENTITY, ent);
+    mhfu_write_u32(node + NODE_PLAYER, PLAYER_ENTITY);
+    if (*(volatile uint8_t *)(node + NODE_STATE) == 0xFF)
+        *(volatile uint8_t *)(node + NODE_STATE) = 0;
+    mhfu_node_sync(node, ent);
+
+    /* entity -> node links (registrar effect) */
+    mhfu_write_u32(ent + MHFU_ENT_COMBAT_NODE, node);
+    *(volatile uint8_t *)(ent + ENT_ENGAGED2) = 1;
+    *(volatile uint8_t *)(ent + ENT_REG_FLAG) = 1;
+
+    if (uid != 0) {
+        *(volatile uint16_t *)(node + NODE_ID0) = uid;
+        *(volatile uint16_t *)(node + NODE_ID1) = uid;
+        volatile uint8_t *cnt = (volatile uint8_t *)(PLAYER_ENTITY + PLAYER_COMBAT_CNT);
+        uint8_t c = *cnt;
+        if (c < 0x10) {
+            *(volatile uint16_t *)(PLAYER_ENTITY + PLAYER_COMBAT_ARR + c * 2) = uid;
+            mhfu_write_u32(ent + ENT_NODE_SLOTIDX, c);
+            *cnt = (uint8_t)(c + 1);
+        }
+    }
+
+    /* splice at the list HEAD (head-insert, like the native registrar path) */
+    mhfu_write_u32(node + NODE_NEXT, mhfu_read_u32(hc));
+    mhfu_write_u32(hc, node);
+    return node;
+}
+
 } /* extern "C" */
