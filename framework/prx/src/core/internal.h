@@ -48,6 +48,9 @@ int  mhfu_deferred_poll_thread(SceSize args, void *argp);
 int  mhfu_install_event_trampolines(void);
 void mhfu_uninstall_event_trampolines(void);
 int  mhfu_install_worker_thread(SceSize args, void *argp);
+/* Generic prefix-trampoline on an arbitrary (non-event) anchor PC; dispatcher
+ * receives a0=&mhfu_anchor_regs_t. Install while JIT-cold. Idempotent per addr. */
+int  mhfu_install_trampoline(uint32_t anchor_pc, uint32_t dispatcher);
 
 /* --- hook arbitration (hooks.cpp / hookmgr) --- */
 void mhfu_hookmgr_init(void);

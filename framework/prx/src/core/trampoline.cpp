@@ -145,6 +145,24 @@ static int install_trampoline_for(uint32_t anchor_pc,
     return 0;
 }
 
+/* Generic prefix-trampoline on an arbitrary anchor PC (non-event). Used by the
+ * inject module to hook get_subresource. Same wrapper shape as the event ones;
+ * the dispatcher receives a0=&mhfu_anchor_regs_t. Install while JIT-cold (boot /
+ * pre-quest). Records are kept here only so the cave wrapper survives. */
+#define MHFU_EXTRA_TRAMPS 4
+static install_record_t g_extra[MHFU_EXTRA_TRAMPS];
+static int              g_extra_n;
+
+extern "C" int mhfu_install_trampoline(uint32_t anchor_pc, uint32_t dispatcher)
+{
+    for (int i = 0; i < g_extra_n; i++)
+        if (g_extra[i].installed && g_extra[i].anchor_pc == anchor_pc) return 0; /* idempotent */
+    if (g_extra_n >= MHFU_EXTRA_TRAMPS) return -3;
+    int rc = install_trampoline_for(anchor_pc, dispatcher, &g_extra[g_extra_n]);
+    if (rc == 0) g_extra_n++;
+    return rc;
+}
+
 extern "C" int mhfu_install_event_trampolines(void)
 {
     const mhfu_region_addrs_t *r = mhfu_region();

@@ -44,6 +44,7 @@
 #include "mhfu/mhfu.h"
 #include "mhfu/mips.h"
 #include "mhfu/bigmon_overlay.h"
+#include "mhfu/inject.h"
 
 extern "C" {
 #include "lua.h"
@@ -315,6 +316,30 @@ static int lb_load_relocated_overlay(lua_State *L)
     lua_pushinteger(L, (lua_Integer)reg.new_load);
     lua_pushinteger(L, (lua_Integer)reg.delta);
     return 3;
+}
+
+/* mhfu.inject_register(file_id, path) -> ok:bool
+ * Phase 4: watch a Blender-edited big-monster PAC on the memstick and overwrite
+ * the species' loaded buffer in place (anim live; skeleton/geom on next rebuild).
+ * The worker thread drives mhfu_inject_tick() at 2 Hz. */
+static int lb_inject_register(lua_State *L)
+{
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    const char *path = luaL_checkstring(L, 2);
+    lua_pushboolean(L, mhfu_inject_register(id, path) == 0);
+    return 1;
+}
+/* mhfu.inject_now(file_id) -> dst_addr (0 = not located) — force re-read+apply. */
+static int lb_inject_now(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)mhfu_inject_now((uint32_t)luaL_checkinteger(L, 1)));
+    return 1;
+}
+/* mhfu.inject_locate(file_id) -> live buffer addr (0 = not found). */
+static int lb_inject_locate(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)mhfu_inject_locate((uint32_t)luaL_checkinteger(L, 1)));
+    return 1;
 }
 
 /* mhfu.buttons() -> buttons:u32, lx:0..255, ly:0..255
@@ -1108,6 +1133,9 @@ static const luaL_Reg k_mhfu_api[] = {
     { "quest_replace_monster", lb_quest_replace_monster },
     { "quest_add_monster",    lb_quest_add_monster },
     { "load_relocated_overlay", lb_load_relocated_overlay },
+    { "inject_register",  lb_inject_register },
+    { "inject_now",       lb_inject_now },
+    { "inject_locate",    lb_inject_locate },
     { "action_ptr_for",   lb_action_ptr_for },
     /* AI override-event registration */
     { "on_quest_targets_building",  lb_on_quest },
@@ -1416,6 +1444,7 @@ static int worker(SceSize args, void *argp)
         sceKernelDelayThread(500 * 1000);    /* 2 Hz */
         call_tick();
         hot_reload_scan();                   /* Phase 4: live .lua reload */
+        mhfu_inject_tick();                  /* Phase 4: live PAC injection */
     }
     return 0;
 }
