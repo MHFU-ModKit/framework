@@ -20,10 +20,24 @@
 
 #include <pspiofilemgr.h>
 #include <psputils.h>          /* sceKernelDcacheWritebackRange */
+#include <pspthreadman.h>      /* sceKernelDelayThread */
 #include <string.h>
 #include <stdio.h>             /* snprintf */
 
-#define GETSUB_ADDR    0x088B89B0u   /* get_subresource(pkg, type) */
+#define GETSUB_ADDR    0x088B89B0u   /* get_subresource(pkg, type) — POST-transform (unused) */
+
+/* Overlay resource descriptor table (RE'd live 2026-06-17, memory
+ * `phase4-descriptor-table-seam`): [DESCR_TBL_PTR] -> table base; entries stride
+ * 0xC: flags u16 @+0, fileId u16 @+2, raw-file buffer u32 @+4. The big-monster
+ * model's RAW on-disk PAC (count=7) lands in buffer@+4 verbatim (byte-identical to
+ * the data_files/file_0NNNNN.bin) BEFORE the overlay restructures it. We overwrite
+ * that buffer with our edited PAC so the engine transforms OUR data. Content-gated
+ * (full match vs the original file) so only the intended species is touched. */
+#define DESCR_TBL_PTR  0x09A4F0D0u
+#define DESCR_STRIDE   0x0Cu
+#define DESCR_MAX      0x200u        /* engine scans 0x200 slots (resource_reg) */
+#define DESCR_FID_OFF  0x02u
+#define DESCR_BUF_OFF  0x04u
 
 /* Inject scratch in the stock-PPSSPP `memory=64` extra RAM, disjoint from
  * bigmon_overlay (0x0A000000) and the clone pool (0x0A800000). */
@@ -55,6 +69,7 @@ typedef struct {
     int            nsubs;
     sub_ent_t      subs[MHFU_MAX_SUBS];
     uint32_t       hits;          /* diagnostic: # of in-game overwrites */
+    uint32_t       applied_addr;  /* last buffer addr we overwrote (idempotency) */
 } inject_entry_t;
 
 static inject_entry_t g_tab[MHFU_INJECT_MAX];
@@ -227,20 +242,71 @@ int mhfu_inject_register(uint32_t file_id, const char *path)
     }
     snprintf(e->path, sizeof(e->path), "%s", path);
 
-    /* Install the get_subresource trampoline once, now (lua setup = boot = the
-     * fn is JIT-cold; it isn't called until a quest loads). */
-    if (!g_hook_installed) {
-        int rc = mhfu_install_trampoline(GETSUB_ADDR, (uint32_t)&mhfu_dispatch_get_subresource);
-        g_hook_installed = (rc == 0);
-        mhfu_log("[inject] get_subresource hook install rc=%d", rc);
-    }
-    mhfu_log("[inject] register file=%u path=%s", (unsigned)file_id, e->path);
+    /* No get_subresource trampoline: that seam is POST-transform (it returns the
+     * restructured sub, wrong format — proven 2026-06-16). The descriptor-table
+     * scan in mhfu_inject_tick overwrites the RAW pre-transform buffer instead. */
+    (void)g_hook_installed; (void)&mhfu_dispatch_get_subresource;
+    mhfu_log("[inject] register file=%u path=%s (raw-buffer descriptor scan)", (unsigned)file_id, e->path);
     return 0;
+}
+
+/* Scan the overlay descriptor table for any registered file's RAW buffer and
+ * overwrite it with our edited PAC. Content-gated: we only write when buffer@+4
+ * byte-matches the ORIGINAL file (e->obuf) — so a same-size look-alike never
+ * matches, and once we've written our edited bytes the entry no longer matches
+ * (idempotent). Returns # of buffers overwritten this pass. Called every worker
+ * tick AND in a tight burst around load (see mhfu_inject_burst). */
+static int scan_descriptor_overwrite(void)
+{
+    uint32_t base = rd32(DESCR_TBL_PTR);
+    if (!gmem_ok(base)) return 0;
+    int n = 0;
+    /* Cheap gate: compare only the PAC header prefix (count + sub (off,size) table)
+     * — species-unique — against the original. Full 1.2 MB memcmp per slot per tick
+     * would crush emulation. The 256 B prefix overlaps the sub table + start of the
+     * skeleton; a same-size look-alike differs there. */
+    const uint32_t GATE = 256;
+    for (uint32_t s = 0; s < DESCR_MAX; s++) {
+        uint32_t ent = base + s * DESCR_STRIDE;
+        if (!gmem_ok(ent)) break;
+        uint32_t buf = rd32(ent + DESCR_BUF_OFF);
+        if (!gmem_ok(buf)) continue;
+        for (int i = 0; i < MHFU_INJECT_MAX; i++) {
+            inject_entry_t *e = &g_tab[i];
+            if (!e->used || !e->buf || !e->obuf || e->file_size < 0x40) continue;
+            if (!gmem_ok(buf + e->file_size - 1)) continue;
+            /* already handled this buffer (the engine reads each file once per load;
+             * survives header-identical edits where a prefix check could not). */
+            if (e->applied_addr == buf) continue;
+            uint32_t g = e->file_size < GATE ? e->file_size : GATE;
+            /* act only on the UNEDITED original (a freshly populated buffer) */
+            if (memcmp((const void *)buf, (const void *)e->obuf, g) != 0) continue;
+            memcpy((void *)buf, (const void *)e->buf, e->file_size);
+            e->applied_addr = buf;
+            sceKernelDcacheWritebackRange((void *)buf, e->file_size);
+            e->hits++; n++;
+            mhfu_log("[inject] OVERWROTE raw buffer file=%u @0x%08X (%uB) slot=%u",
+                     (unsigned)e->file_id, (unsigned)buf, (unsigned)e->file_size, (unsigned)s);
+        }
+    }
+    return n;
+}
+
+/* Tight burst to beat the one-shot overlay transform during a section load: hammer
+ * the descriptor scan for ~BURST_MS so we overwrite the raw buffer the instant it
+ * is populated, before the engine reads it to build its transformed copy. */
+#define BURST_MS 1500
+void mhfu_inject_burst(void)
+{
+    for (int t = 0; t < BURST_MS / 5; t++) {
+        scan_descriptor_overwrite();
+        sceKernelDelayThread(5 * 1000);   /* 5 ms -> ~200 Hz */
+    }
 }
 
 void mhfu_inject_tick(void)
 {
-    /* Keep each edited PAC fresh in xram; the dispatcher applies it at load. */
+    /* Keep each edited PAC fresh in xram; reload when the memstick file changes. */
     for (int i = 0; i < MHFU_INJECT_MAX; i++) {
         inject_entry_t *e = &g_tab[i];
         if (!e->used) continue;
@@ -253,9 +319,12 @@ void mhfu_inject_tick(void)
         if (!changed) continue;
         e->st_size = st.st_size; e->st_mtime = st.sce_st_mtime; e->primed = 1;
         if (read_file(e) == 0)
-            mhfu_log("[inject] loaded edit file=%u (%uB, %d subs) — applies on quest re-enter",
+            mhfu_log("[inject] loaded edit file=%u (%uB, %d subs) — overwrites raw buffer on load",
                      (unsigned)e->file_id, (unsigned)e->file_size, e->nsubs);
     }
+    /* Every tick: catch the raw model buffer (also keeps it pinned if the render
+     * reads it live). The burst (mhfu_inject_burst) is the pre-transform path. */
+    scan_descriptor_overwrite();
 }
 
 uint32_t mhfu_inject_now(uint32_t file_id)

@@ -2,26 +2,27 @@
 --
 -- Registers a Blender-edited big-monster PAC to be injected into the running
 -- game with ZERO on-disk DATA.BIN edits. The C worker (mhfu_inject_tick, 2 Hz)
--- watches the memstick inject file and overwrites the species' loaded buffer in
--- place: animation value edits update the LIVE monster next frame; skeleton /
--- geometry edits apply on the next engine rebuild (re-enter the monster's
--- section).
+-- watches the memstick inject file, reads it + its `.orig` sibling, and scans the
+-- overlay descriptor table [0x09A4F0D0]: when a loaded resource's RAW buffer
+-- byte-matches the original, it overwrites it with our edited PAC BEFORE the
+-- overlay restructures the data -> the engine rebuilds the monster from OUR bytes.
 --
 -- HOST WORKFLOW (no game files touched):
---   1. Edit the monster in Blender (the mhfu addon), or run the example:
---        PYTHONPATH=tools python tools/mhfu_model/examples/edit_anim_demo.py
---   2. Push it to the live game:
---        PYTHONPATH=tools python -m mhfu_model.inject workspace/modified/file_06134.bin
---      (writes ms0:/PSP/PLUGINS/mhfu_framework/inject/file_06134.bin atomically)
---   3. Watch framework.log for "[inject] applied file=6134 -> 0x09xxxxxx".
+--   1. Edit the monster in Blender (the mhfu addon), or run an example editor.
+--   2. Push it to the live game (writes the inject file + a .orig copy atomically):
+--        PYTHONPATH=tools python -m mhfu_model.inject workspace/extracted/data_files/file_06185.bin
+--   3. Cold-boot, enter the Tigrex's section; watch framework.log for
+--        "[inject] OVERWROTE raw buffer file=6185 @0x09xxxxxx".
 --
--- Run this script ALONE (it defines no mhfu_tick, but keep it simple): deploy to
--- ms0:/PSP/PLUGINS/mhfu_framework/mods/ alongside the framework.
+-- Deploy to ms0:/PSP/PLUGINS/mhfu_framework/mods/ alongside the framework.
 
--- em75 = Tigrex; PAC = file_06134 (em_id 0x4B + 0x17AB index 6134). Swap the id
--- + path for a different species.
-local TIGREX_PAC_ID = 6134
-local INJECT_PATH   = "ms0:/PSP/PLUGINS/mhfu_framework/inject/file_06134.bin"
+-- IMPORTANT (RE'd live 2026-06-17): the native-Tigrex-quest Tigrex's model is
+-- file_06185 (NOT file_06134 / em75 — that file is never loaded for this quest).
+-- Confirmed by linking the on-screen Tigrex entity (species 0x4B, size 0.9) to its
+-- model buffer. The C side content-matches against file_06185.bin.orig, so the
+-- registered id below is only for logging.
+local TIGREX_PAC_ID = 6185
+local INJECT_PATH   = "ms0:/PSP/PLUGINS/mhfu_framework/inject/file_06185.bin"
 
 if mhfu.inject_register(TIGREX_PAC_ID, INJECT_PATH) then
     mhfu.log("[model_inject] watching " .. INJECT_PATH ..

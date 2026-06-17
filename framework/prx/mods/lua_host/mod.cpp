@@ -1440,11 +1440,18 @@ static int worker(SceSize args, void *argp)
 {
     (void)args; (void)argp;
     sceKernelDelayThread(3 * 1000 * 1000);   /* let game + framework settle */
+    /* Inject scan runs at ~10 Hz (every 100 ms) to better catch the raw model
+     * buffer BEFORE the overlay transform reads it; the heavier per-tick + hot-
+     * reload duties stay at 2 Hz (every 5th iteration). */
+    int sub = 0;
     for (;;) {
-        sceKernelDelayThread(500 * 1000);    /* 2 Hz */
-        call_tick();
-        hot_reload_scan();                   /* Phase 4: live .lua reload */
-        mhfu_inject_tick();                  /* Phase 4: live PAC injection */
+        sceKernelDelayThread(100 * 1000);    /* 10 Hz base */
+        mhfu_inject_tick();                  /* Phase 4: live PAC injection (10 Hz) */
+        if (++sub >= 5) {
+            sub = 0;
+            call_tick();
+            hot_reload_scan();               /* Phase 4: live .lua reload */
+        }
     }
     return 0;
 }
