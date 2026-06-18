@@ -44,6 +44,7 @@
 #include "mhfu/mhfu.h"
 #include "mhfu/mips.h"
 #include "mhfu/bigmon_overlay.h"
+#include "mhfu/inject.h"
 
 extern "C" {
 #include "lua.h"
@@ -584,6 +585,42 @@ static int lb_load_relocated_overlay(lua_State *L)
     lua_pushinteger(L, (lua_Integer)reg.new_load);
     lua_pushinteger(L, (lua_Integer)reg.delta);
     return 3;
+}
+
+/* mhfu.inject_register(file_id, path) -> ok:bool
+ * Phase 4: watch a Blender-edited big-monster PAC on the memstick and overwrite
+ * the species' loaded buffer in place (anim live; skeleton/geom on next rebuild).
+ * The worker thread drives mhfu_inject_tick() at 2 Hz. */
+static int lb_inject_register(lua_State *L)
+{
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    const char *path = luaL_checkstring(L, 2);
+    lua_pushboolean(L, mhfu_inject_register(id, path) == 0);
+    return 1;
+}
+/* mhfu.inject_relocate(file_id, grown_path, orig_path) -> ok:bool
+ * Phase 5 topology-grow: deliver a BIGGER PAC than the engine's fixed raw buffer by
+ * redirecting the load transform's source (get_subresource a0) to a grown PAC in
+ * xram. orig_path recognizes the engine's raw buffer. */
+static int lb_inject_relocate(lua_State *L)
+{
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    const char *grown = luaL_checkstring(L, 2);
+    const char *orig  = luaL_checkstring(L, 3);
+    lua_pushboolean(L, mhfu_inject_register_relocate(id, grown, orig) == 0);
+    return 1;
+}
+/* mhfu.inject_now(file_id) -> dst_addr (0 = not located) — force re-read+apply. */
+static int lb_inject_now(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)mhfu_inject_now((uint32_t)luaL_checkinteger(L, 1)));
+    return 1;
+}
+/* mhfu.inject_locate(file_id) -> live buffer addr (0 = not found). */
+static int lb_inject_locate(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)mhfu_inject_locate((uint32_t)luaL_checkinteger(L, 1)));
+    return 1;
 }
 
 /* mhfu.buttons() -> buttons:u32, lx:0..255, ly:0..255
@@ -1428,6 +1465,10 @@ static const luaL_Reg k_mhfu_api[] = {
     { "quest_replace_monster", lb_quest_replace_monster },
     { "quest_add_monster",    lb_quest_add_monster },
     { "load_relocated_overlay", lb_load_relocated_overlay },
+    { "inject_register",  lb_inject_register },
+    { "inject_relocate",  lb_inject_relocate },
+    { "inject_now",       lb_inject_now },
+    { "inject_locate",    lb_inject_locate },
     { "action_ptr_for",   lb_action_ptr_for },
     /* AI override-event registration */
     { "on_quest_targets_building",  lb_on_quest },
@@ -1732,10 +1773,18 @@ static int worker(SceSize args, void *argp)
 {
     (void)args; (void)argp;
     sceKernelDelayThread(3 * 1000 * 1000);   /* let game + framework settle */
+    /* Inject scan runs at ~10 Hz (every 100 ms) to better catch the raw model
+     * buffer BEFORE the overlay transform reads it; the heavier per-tick + hot-
+     * reload duties stay at 2 Hz (every 5th iteration). */
+    int sub = 0;
     for (;;) {
-        sceKernelDelayThread(500 * 1000);    /* 2 Hz */
-        call_tick();
-        hot_reload_scan();                   /* Phase 4: live .lua reload */
+        sceKernelDelayThread(100 * 1000);    /* 10 Hz base */
+        mhfu_inject_tick();                  /* Phase 4: live PAC injection (10 Hz) */
+        if (++sub >= 5) {
+            sub = 0;
+            call_tick();
+            hot_reload_scan();               /* Phase 4: live .lua reload */
+        }
     }
     return 0;
 }
