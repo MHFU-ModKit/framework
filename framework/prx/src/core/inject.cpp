@@ -16,7 +16,10 @@
  */
 #include "mhfu/inject.h"
 #include "mhfu/log.h"
-#include "internal.h"          /* mhfu_anchor_regs_t, mhfu_install_trampoline */
+#include "mhfu/mips.h"         /* mips_* encoders for the game-thread detour */
+#include "mhfu/ai.h"           /* mhfu_on_ai_overlay_loaded (JIT-cold install window) */
+#include "mhfu/events.h"       /* MHFU_EVENT_MAP_SECTION_ENTERED repatch */
+#include "internal.h"          /* mhfu_anchor_regs_t, cave_alloc, flush_caches */
 
 #include <pspiofilemgr.h>
 #include <psputils.h>          /* sceKernelDcacheWritebackRange */
@@ -38,6 +41,25 @@
 #define DESCR_MAX      0x200u        /* engine scans 0x200 slots (resource_reg) */
 #define DESCR_FID_OFF  0x02u
 #define DESCR_BUF_OFF  0x04u
+
+/* --- racefree game-thread overwrite (2026-06-17) --------------------------
+ * The worker-thread descriptor scan raced the engine's model parse: a 1.2 MB
+ * memcpy on the lua_host worker collided with the GE display-list builder
+ * z_un_0886477c on the game thread -> torn read -> "Invalid Read 0x80" crash.
+ * Fix: drive the overwrite SYNCHRONOUSLY on the game thread from an entry-detour
+ * on the per-entity model-setup function 0x09AC4D30 (the raw-buffer consumer —
+ * it descends into the GE builder). Confirmed live to run per-frame (~80/s); on
+ * its FIRST call after a section load the raw descriptor buffer is filled and
+ * pristine (== .orig), so the detour overwrites it BEFORE the same function's
+ * body transforms it -> the engine builds OUR bytes, sequential on one thread,
+ * no concurrency. Per-frame thereafter the content gate (applied_addr / ==orig)
+ * makes it a no-op. 0x09AC4D30 lives in the AI overlay (0x09ABF200..), so we
+ * install it from the overlay-loaded helper's JIT-cold window — exactly like the
+ * action executor 0x09AC5228 (ai.cpp), and re-patch on section roam. */
+#define MODEL_SETUP_ENTRY     0x09AC4D30u
+#define MODEL_SETUP_DISP0     0x27BDFFE0u   /* addiu $sp,$sp,-0x20 */
+#define MODEL_SETUP_DISP1     0xAFBF001Cu   /* sw    $ra,0x1C($sp) */
+#define MODEL_SETUP_RESUME    0x09AC4D38u
 
 /* Inject scratch in the stock-PPSSPP `memory=64` extra RAM, disjoint from
  * bigmon_overlay (0x0A000000) and the clone pool (0x0A800000). */
@@ -69,15 +91,27 @@ typedef struct {
     int            nsubs;
     sub_ent_t      subs[MHFU_MAX_SUBS];
     uint32_t       hits;          /* diagnostic: # of in-game overwrites */
-    uint32_t       applied_addr;  /* last buffer addr we overwrote (idempotency) */
+    uint32_t       applied_addr;  /* last buffer addr we overwrote (diagnostic) */
+    /* Diff fingerprint: the first WORD where edit != orig. The PAC header (first
+     * 256 B = count + sub table) is identical pristine-vs-edited (edits are deep
+     * geometry), so a header gate can't tell them apart and an address-based
+     * idempotency check wrongly skips a buffer the engine RELOADS at the same
+     * address. We gate on this differing word instead: == orig -> pristine
+     * (overwrite); == edit -> already done (skip); naturally re-fires on reload. */
+    int            has_diff;
+    uint32_t       diff_off;      /* word-aligned byte offset of first difference */
+    uint32_t       diff_orig;     /* orig word at diff_off */
+    uint32_t       diff_edit;     /* edit word at diff_off */
 } inject_entry_t;
 
 static inject_entry_t g_tab[MHFU_INJECT_MAX];
 static int            g_hook_installed;
-static int            g_diag_n;        /* cap diagnostic log lines */
 
 static inline uint32_t rd32(uint32_t a) { return *(volatile uint32_t *)a; }
 static inline int gmem_ok(uint32_t a) { return a >= 0x08000000u && a < 0x0A000000u; }
+
+static void arm_model_setup_hook(void);        /* defined below (game-thread detour) */
+static int  install_model_setup_hook(void);
 
 static inject_entry_t *find_entry(uint32_t file_id)
 {
@@ -169,63 +203,63 @@ static int read_file(inject_entry_t *e)
         e->obuf = 0;
         mhfu_log("[inject] no .orig (%s) -> falling back to 64B-prefix match", opath);
     }
+
+    /* Compute the diff fingerprint: first WORD where edit != orig. */
+    e->has_diff = 0;
+    if (e->obuf && e->buf) {
+        for (uint32_t o = 0; o + 4 <= fsz; o += 4) {
+            uint32_t ew = rd32(e->buf + o), ow = rd32(e->obuf + o);
+            if (ew != ow) {
+                e->has_diff = 1; e->diff_off = o; e->diff_orig = ow; e->diff_edit = ew;
+                break;
+            }
+        }
+        if (e->has_diff)
+            mhfu_log("[inject] diff fingerprint @+0x%X orig=0x%08X edit=0x%08X",
+                     (unsigned)e->diff_off, (unsigned)e->diff_orig, (unsigned)e->diff_edit);
+        else
+            mhfu_log("[inject] WARNING edit == orig (no geometry change?)");
+    }
     return 0;
 }
 
-/* Prefix-trampoline dispatcher on get_subresource(pkg=a0, type=a1). Runs for
- * EVERY sub fetch of EVERY model; cheap, and only overwrites on a content match. */
-extern "C" void mhfu_dispatch_get_subresource(const mhfu_anchor_regs_t *regs)
+/* Core racefree primitive: if `buf` is a registered file's RAW pre-transform PAC
+ * buffer, sitting pristine (== .orig), overwrite the WHOLE thing with our edit.
+ * Gates: 256 B header == .orig (species-unique) AND the diff-fingerprint word ==
+ * orig (pristine, since the header is identical pristine-vs-edited). Returns 1 on
+ * overwrite. Used by BOTH the get_subresource hook (pre-transform consumption
+ * point, the proven correct timing) and the descriptor-table scan. */
+static int try_overwrite_buffer(uint32_t buf)
 {
-    uint32_t pkg = regs->a0, type = regs->a1;
-    if (!gmem_ok(pkg) || type >= MHFU_MAX_SUBS) return;
-
-    /* game package: same PAC layout. off=[pkg+4+type*8], size=[pkg+8+type*8]. */
-    uint32_t cnt = rd32(pkg);
-    if (cnt == 0 || cnt > 256 || type >= cnt) return;
-    uint32_t goff  = rd32(pkg + 4 + type * 8);
-    uint32_t gsize = rd32(pkg + 8 + type * 8);
-    if (goff == 0 || gsize == 0) return;
-    uint32_t gsub = pkg + goff;
-    if (!gmem_ok(gsub) || !gmem_ok(gsub + gsize - 1)) return;
-    uint32_t gmagic = rd32(gsub);
-
-    /* Search ALL our subs by CONTENT (magic + size + 64-byte head), not by the
-     * package's type index — the package's sub ORDER differs from our file's
-     * (the big-mon package puts PMO at type 1 / skeleton at type 2, but our
-     * file is skeleton=sub0 / PMO=sub1). The 64-byte head is the sub's UNEDITED
-     * region (PAC/anim/skeleton header), so it equals the original game sub for
-     * OUR species but not a same-size look-alike (e.g. player armor texture). */
+    if (!gmem_ok(buf)) return 0;
     for (int i = 0; i < MHFU_INJECT_MAX; i++) {
         inject_entry_t *e = &g_tab[i];
-        if (!e->used || !e->buf) continue;
-        for (int j = 0; j < e->nsubs; j++) {
-            sub_ent_t *s = &e->subs[j];
-            if (s->size == 0 || s->magic != gmagic || s->size != gsize) continue;
-            /* UNIQUE id: the fetched sub must byte-match the ORIGINAL species sub
-             * (full compare) — a look-alike monster with a same-size skeleton and
-             * a generic root bone will differ further in. Fall back to a 64B head
-             * compare only if no .orig was provided. */
-            int match;
-            if (e->obuf)
-                match = (memcmp((const void *)gsub, (const void *)(e->obuf + s->off), s->size) == 0);
-            else {
-                uint32_t pre = s->size < 64 ? s->size : 64;
-                match = (memcmp((const void *)gsub, (const void *)(e->buf + s->off), pre) == 0);
-            }
-            /* diagnostic for skeleton-magic calls: see whether the Tigrex's own
-             * skeleton even comes through + matches (capped). */
-            if (gmagic == 0xC0000000u && g_diag_n < 24) { g_diag_n++;
-                mhfu_log("[inject] skel call sz=%u match=%d (orig=%d)",
-                         (unsigned)gsize, match, e->obuf ? 1 : 0); }
-            if (match) {
-                memcpy((void *)gsub, (const void *)(e->buf + s->off), s->size);
-                sceKernelDcacheWritebackRange((void *)gsub, s->size);
-                e->hits++;
-                mhfu_log("[inject] OVERWROTE sub[%d] magic=0x%08X sz=%u", j, (unsigned)gmagic, (unsigned)s->size);
-                return;
-            }
-        }
+        if (!e->used || !e->buf || !e->obuf || !e->has_diff || e->file_size < 0x40) continue;
+        if (!gmem_ok(buf + e->file_size - 1)) continue;
+        uint32_t g = e->file_size < 256 ? e->file_size : 256;
+        if (memcmp((const void *)buf, (const void *)e->obuf, g) != 0) continue;  /* not our species */
+        uint32_t cur = rd32(buf + e->diff_off);
+        if (cur == e->diff_edit) return 0;     /* already our edit */
+        if (cur != e->diff_orig) continue;     /* not pristine (mid-write / other) */
+        memcpy((void *)buf, (const void *)e->buf, e->file_size);
+        e->applied_addr = buf;
+        sceKernelDcacheWritebackRange((void *)buf, e->file_size);
+        e->hits++;
+        mhfu_log("[inject] OVERWROTE raw buffer file=%u @0x%08X (%uB)",
+                 (unsigned)e->file_id, (unsigned)buf, (unsigned)e->file_size);
+        return 1;
     }
+    return 0;
+}
+
+/* Prefix-trampoline on get_subresource(pkg=a0, type=a1). The big-mon transform
+ * calls this ON THE RAW count=7 buffer to extract subs (captured live 2026-06-18:
+ * a0=raw buffer, before the cache is built). As a PREFIX we overwrite the raw
+ * buffer in place BEFORE get_subresource returns the sub pointer -> the transform
+ * extracts OUR data. EBOOT code => JIT-warm, no overlay-timing race. */
+extern "C" void mhfu_dispatch_get_subresource(const mhfu_anchor_regs_t *regs)
+{
+    try_overwrite_buffer(regs->a0);
 }
 
 int mhfu_inject_register(uint32_t file_id, const char *path)
@@ -242,59 +276,151 @@ int mhfu_inject_register(uint32_t file_id, const char *path)
     }
     snprintf(e->path, sizeof(e->path), "%s", path);
 
-    /* No get_subresource trampoline: that seam is POST-transform (it returns the
-     * restructured sub, wrong format — proven 2026-06-16). The descriptor-table
-     * scan in mhfu_inject_tick overwrites the RAW pre-transform buffer instead. */
-    (void)g_hook_installed; (void)&mhfu_dispatch_get_subresource;
-    mhfu_log("[inject] register file=%u path=%s (raw-buffer descriptor scan)", (unsigned)file_id, e->path);
+    /* PRIMARY racefree seam (proven 2026-06-18): prefix-trampoline on get_subresource
+     * 0x088B89B0. The big-mon transform calls it on the RAW count=7 buffer; we
+     * overwrite the buffer there, synchronously, before the sub is extracted. EBOOT
+     * code => JIT-warm, installs cleanly. (The earlier "post-transform" verdict was
+     * for a DIFFERENT caller passing the restructured package; the raw-buffer caller
+     * is pre-transform.) */
+    if (!g_hook_installed) {
+        int rc = mhfu_install_trampoline(GETSUB_ADDR, (uint32_t)&mhfu_dispatch_get_subresource);
+        g_hook_installed = (rc == 0);
+        mhfu_log("[inject] get_subresource trampoline @0x%08X rc=%d", GETSUB_ADDR, rc);
+    }
+
+    /* Belt-and-suspenders: also arm the 0x09AC4D30 game-thread detour (a per-frame
+     * descriptor scan). It fires post-transform so it can't fix the render alone,
+     * but it keeps the raw buffer pinned to our edit and costs only a gated scan. */
+    arm_model_setup_hook();
+
+    mhfu_log("[inject] register file=%u path=%s (getsub seam @0x%08X + detour @0x%08X)",
+             (unsigned)file_id, e->path, GETSUB_ADDR, MODEL_SETUP_ENTRY);
     return 0;
 }
 
 /* Scan the overlay descriptor table for any registered file's RAW buffer and
- * overwrite it with our edited PAC. Content-gated: we only write when buffer@+4
- * byte-matches the ORIGINAL file (e->obuf) — so a same-size look-alike never
- * matches, and once we've written our edited bytes the entry no longer matches
- * (idempotent). Returns # of buffers overwritten this pass. Called every worker
- * tick AND in a tight burst around load (see mhfu_inject_burst). */
+ * overwrite it (via try_overwrite_buffer). Secondary to the get_subresource seam;
+ * keeps the buffer pinned to our edit. Returns # overwritten this pass. */
 static int scan_descriptor_overwrite(void)
 {
     uint32_t base = rd32(DESCR_TBL_PTR);
     if (!gmem_ok(base)) return 0;
     int n = 0;
-    /* Cheap gate: compare only the PAC header prefix (count + sub (off,size) table)
-     * — species-unique — against the original. Full 1.2 MB memcmp per slot per tick
-     * would crush emulation. The 256 B prefix overlaps the sub table + start of the
-     * skeleton; a same-size look-alike differs there. */
-    const uint32_t GATE = 256;
     for (uint32_t s = 0; s < DESCR_MAX; s++) {
         uint32_t ent = base + s * DESCR_STRIDE;
         if (!gmem_ok(ent)) break;
         uint32_t buf = rd32(ent + DESCR_BUF_OFF);
         if (!gmem_ok(buf)) continue;
-        for (int i = 0; i < MHFU_INJECT_MAX; i++) {
-            inject_entry_t *e = &g_tab[i];
-            if (!e->used || !e->buf || !e->obuf || e->file_size < 0x40) continue;
-            if (!gmem_ok(buf + e->file_size - 1)) continue;
-            /* already handled this buffer (the engine reads each file once per load;
-             * survives header-identical edits where a prefix check could not). */
-            if (e->applied_addr == buf) continue;
-            uint32_t g = e->file_size < GATE ? e->file_size : GATE;
-            /* act only on the UNEDITED original (a freshly populated buffer) */
-            if (memcmp((const void *)buf, (const void *)e->obuf, g) != 0) continue;
-            memcpy((void *)buf, (const void *)e->buf, e->file_size);
-            e->applied_addr = buf;
-            sceKernelDcacheWritebackRange((void *)buf, e->file_size);
-            e->hits++; n++;
-            mhfu_log("[inject] OVERWROTE raw buffer file=%u @0x%08X (%uB) slot=%u",
-                     (unsigned)e->file_id, (unsigned)buf, (unsigned)e->file_size, (unsigned)s);
-        }
+        n += try_overwrite_buffer(buf);
     }
     return n;
 }
 
-/* Tight burst to beat the one-shot overlay transform during a section load: hammer
- * the descriptor scan for ~BURST_MS so we overwrite the raw buffer the instant it
- * is populated, before the engine reads it to build its transformed copy. */
+/* --- game-thread entry-detour on the model-setup consumer 0x09AC4D30 ------- */
+
+static uint32_t *g_model_wrapper;
+static int       g_model_hook_installed;
+static int       g_model_arm;           /* overlay-loaded + section subscribe done */
+
+/* Synchronous game-thread overwrite: runs at the very entry of 0x09AC4D30,
+ * before its body reads the raw buffer. Arg regs are preserved by the wrapper. */
+extern "C" void mhfu_inject_model_setup_dispatch_c(void)
+{
+    scan_descriptor_overwrite();
+}
+
+/* Wrapper (18 insns; cave 20): save a0-a3 + ra, call the dispatch, restore,
+ * replay the 2 displaced prologue insns of 0x09AC4D30, jump back to +8. The
+ * replayed prologue runs on the ENGINE's frame (our own -0x20/+0x20 balanced
+ * first), identical to what the un-patched entry would have executed. */
+static void build_model_setup_wrapper(uint32_t *w, uint32_t dispatch_addr)
+{
+    int i = 0;
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);
+    w[i++] = mips_sw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A0, 0x10, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A1, 0x14, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A2, 0x08, MIPS_REG_SP);
+    w[i++] = mips_sw   (MIPS_REG_A3, 0x0C, MIPS_REG_SP);
+    w[i++] = mips_jal  (dispatch_addr);
+    w[i++] = MIPS_NOP;                              /* delay slot */
+    w[i++] = mips_lw   (MIPS_REG_A0, 0x10, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_A1, 0x14, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_A2, 0x08, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_A3, 0x0C, MIPS_REG_SP);
+    w[i++] = mips_lw   (MIPS_REG_RA, 0x18, MIPS_REG_SP);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, 0x20);
+    w[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -0x20);   /* replay displaced #0 */
+    w[i++] = mips_sw   (MIPS_REG_RA, 0x1C, MIPS_REG_SP);    /* replay displaced #1 */
+    w[i++] = mips_j    (MODEL_SETUP_RESUME);
+    w[i++] = MIPS_NOP;                              /* J delay slot */
+    while (i < 20) w[i++] = MIPS_NOP;
+}
+
+/* Patch 0x09AC4D30 -> our wrapper, but ONLY when its bytes are the original
+ * prologue (JIT-cold) and a model edit is actually registered. Self-gating so
+ * re-fire from the overlay/section repatch is a safe no-op. */
+static int install_model_setup_hook(void)
+{
+    if (g_model_hook_installed) return 0;
+    int any = 0;
+    for (int i = 0; i < MHFU_INJECT_MAX; i++)
+        if (g_tab[i].used && g_tab[i].buf && g_tab[i].obuf) { any = 1; break; }
+    if (!any) return 0;                              /* nothing to inject — skip */
+
+    uint32_t *w = g_model_wrapper;
+    if (!w) {
+        w = mhfu_cave_alloc(20);
+        if (!w) { mhfu_log("[inject] cave exhausted for model-setup wrapper"); return -1; }
+        build_model_setup_wrapper(w, (uint32_t)(uintptr_t)&mhfu_inject_model_setup_dispatch_c);
+        mhfu_flush_caches();
+        g_model_wrapper = w;
+    }
+
+    uint32_t cur0 = *(volatile uint32_t *)MODEL_SETUP_ENTRY;
+    uint32_t cur1 = *(volatile uint32_t *)(MODEL_SETUP_ENTRY + 4);
+    if (cur0 != MODEL_SETUP_DISP0 || cur1 != MODEL_SETUP_DISP1) {
+        mhfu_log("[inject] model-setup entry not original (0x%08X) — skip patch",
+                 (unsigned)cur0);
+        return -1;
+    }
+    *(volatile uint32_t *)MODEL_SETUP_ENTRY       = mips_j((uint32_t)(uintptr_t)w);
+    *(volatile uint32_t *)(MODEL_SETUP_ENTRY + 4) = MIPS_NOP;
+    mhfu_flush_caches();
+    g_model_hook_installed = 1;
+    mhfu_log("[inject] model-setup detour (re)patched @ 0x%08X (wrapper 0x%08X)",
+             MODEL_SETUP_ENTRY, (unsigned)(uintptr_t)w);
+    return 0;
+}
+
+/* Overlay just (re)loaded JIT-cold -> bytes pristine: (re)install the detour. */
+extern "C" void mhfu_inject_overlay_loaded_cb(const mhfu_ai_overlay_ctx_t * /*ctx*/)
+{
+    g_model_hook_installed = 0;
+    install_model_setup_hook();
+}
+
+/* Belt-and-suspenders: a section roam can re-translate our patch away; re-arm
+ * on each section entry (self-gates on the original prologue). */
+extern "C" void mhfu_inject_section_repatch_cb(const void * /*ctx*/)
+{
+    g_model_hook_installed = 0;
+    install_model_setup_hook();
+}
+
+/* Arm the install triggers once (called from mhfu_inject_register). */
+static void arm_model_setup_hook(void)
+{
+    if (g_model_arm) return;
+    mhfu_on_ai_overlay_loaded(mhfu_inject_overlay_loaded_cb, 0);
+    mhfu_register_event(MHFU_EVENT_MAP_SECTION_ENTERED,
+                        (mhfu_event_cb_t)(void *)mhfu_inject_section_repatch_cb);
+    g_model_arm = 1;
+}
+
+/* Legacy worker-thread hammer (the racing path). No longer wired into the
+ * worker tick — kept for manual/diagnostic use only. The game-thread detour
+ * above is the production racefree path. */
 #define BURST_MS 1500
 void mhfu_inject_burst(void)
 {
@@ -318,13 +444,18 @@ void mhfu_inject_tick(void)
                     || memcmp(&e->st_mtime, &st.sce_st_mtime, sizeof(ScePspDateTime)) != 0;
         if (!changed) continue;
         e->st_size = st.st_size; e->st_mtime = st.sce_st_mtime; e->primed = 1;
-        if (read_file(e) == 0)
-            mhfu_log("[inject] loaded edit file=%u (%uB, %d subs) — overwrites raw buffer on load",
+        if (read_file(e) == 0) {
+            mhfu_log("[inject] loaded edit file=%u (%uB, %d subs) — game-thread detour applies on load",
                      (unsigned)e->file_id, (unsigned)e->file_size, e->nsubs);
+            /* Files just became available: arm the detour if a section is
+             * already loaded (overlay-loaded fire may have preceded the load). */
+            install_model_setup_hook();
+        }
     }
-    /* Every tick: catch the raw model buffer (also keeps it pinned if the render
-     * reads it live). The burst (mhfu_inject_burst) is the pre-transform path. */
-    scan_descriptor_overwrite();
+    /* NOTE: the worker no longer overwrites the raw buffer — that 1.2 MB memcpy
+     * raced the engine's parse on the game thread (crash). The overwrite now runs
+     * synchronously from the 0x09AC4D30 entry-detour (install_model_setup_hook).
+     * The worker's only job here is keeping the edited PAC fresh in xram. */
 }
 
 uint32_t mhfu_inject_now(uint32_t file_id)
