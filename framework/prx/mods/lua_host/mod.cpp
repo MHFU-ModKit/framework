@@ -329,6 +329,18 @@ static int lb_inject_register(lua_State *L)
     lua_pushboolean(L, mhfu_inject_register(id, path) == 0);
     return 1;
 }
+/* mhfu.inject_relocate(file_id, grown_path, orig_path) -> ok:bool
+ * Phase 5 topology-grow: deliver a BIGGER PAC than the engine's fixed raw buffer by
+ * redirecting the load transform's source (get_subresource a0) to a grown PAC in
+ * xram. orig_path recognizes the engine's raw buffer. */
+static int lb_inject_relocate(lua_State *L)
+{
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    const char *grown = luaL_checkstring(L, 2);
+    const char *orig  = luaL_checkstring(L, 3);
+    lua_pushboolean(L, mhfu_inject_register_relocate(id, grown, orig) == 0);
+    return 1;
+}
 /* mhfu.inject_now(file_id) -> dst_addr (0 = not located) — force re-read+apply. */
 static int lb_inject_now(lua_State *L)
 {
@@ -1134,6 +1146,7 @@ static const luaL_Reg k_mhfu_api[] = {
     { "quest_add_monster",    lb_quest_add_monster },
     { "load_relocated_overlay", lb_load_relocated_overlay },
     { "inject_register",  lb_inject_register },
+    { "inject_relocate",  lb_inject_relocate },
     { "inject_now",       lb_inject_now },
     { "inject_locate",    lb_inject_locate },
     { "action_ptr_for",   lb_action_ptr_for },

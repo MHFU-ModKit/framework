@@ -48,6 +48,14 @@ extern "C" {
  * `path` is copied. Returns 0 on success, <0 on table-full / bad args. */
 int mhfu_inject_register(uint32_t file_id, const char *path);
 
+/* RELOCATE registration (Phase 5 topology-grow): deliver a BIGGER PAC than the
+ * engine's fixed raw-buffer block by redirecting the load transform's source.
+ * `grown_path` = the larger edited PAC, `orig_path` = the original (un-grown) PAC
+ * used to recognize the engine's raw buffer at get_subresource. Both are loaded
+ * into xram immediately. Returns 0 on success, <0 on failure. */
+int mhfu_inject_register_relocate(uint32_t file_id, const char *grown_path,
+                                  const char *orig_path);
+
 /* Per-poll driver (call from a worker thread, e.g. lua_host's 2 Hz worker).
  * Re-stats each registered file; on (size,mtime) change, reads it and overwrites
  * the located live buffer. Cheap no-op when nothing changed. */

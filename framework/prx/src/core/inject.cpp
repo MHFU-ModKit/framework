@@ -102,6 +102,15 @@ typedef struct {
     uint32_t       diff_off;      /* word-aligned byte offset of first difference */
     uint32_t       diff_orig;     /* orig word at diff_off */
     uint32_t       diff_edit;     /* edit word at diff_off */
+    /* RELOCATE mode (Phase 5, topology-GROW): instead of a same-size in-place
+     * overwrite, `buf` holds a BIGGER replacement PAC in xram and `obuf` holds the
+     * ORIGINAL (un-grown) PAC for header matching. At get_subresource we rewrite the
+     * caller's a0 (pkg) from the engine's fixed-size raw buffer to our grown buf, so
+     * the transform reads OUR larger PMO and builds a larger decoded draw buffer —
+     * the only no-disk path that can exceed the raw buffer's fixed heap block. */
+    int            relocate;
+    uint32_t       orig_size;     /* size of obuf (original PAC) for the 256B match */
+    uint32_t       redirects;     /* diagnostic: # of a0 redirects performed */
 } inject_entry_t;
 
 static inject_entry_t g_tab[MHFU_INJECT_MAX];
@@ -252,13 +261,38 @@ static int try_overwrite_buffer(uint32_t buf)
     return 0;
 }
 
+/* RELOCATE: if a0 is the engine's raw buffer for a relocate-registered species
+ * (its first 256 B == our stored ORIGINAL header), rewrite a0 to point at our
+ * BIGGER replacement PAC in xram. The trampoline reloads a0 from the stack slot
+ * after we return (see trampoline.cpp), so get_subresource runs on OUR buffer and
+ * the transform reformats our larger PMO. Returns 1 if redirected. */
+static int try_redirect_pkg(mhfu_anchor_regs_t *regs)
+{
+    uint32_t a0 = regs->a0;
+    if (!gmem_ok(a0)) return 0;
+    for (int i = 0; i < MHFU_INJECT_MAX; i++) {
+        inject_entry_t *e = &g_tab[i];
+        if (!e->used || !e->relocate || !e->buf || !e->obuf || e->orig_size < 0x40) continue;
+        if (!gmem_ok(a0 + 255)) continue;
+        if (memcmp((const void *)a0, (const void *)e->obuf, 256) != 0) continue; /* not our species */
+        regs->a0 = e->buf;                 /* -> grown PAC in xram */
+        if (e->redirects == 0)
+            mhfu_log("[inject] RELOCATE redirect file=%u a0 0x%08X -> 0x%08X (grown %uB)",
+                     (unsigned)e->file_id, (unsigned)a0, (unsigned)e->buf, (unsigned)e->file_size);
+        e->redirects++;
+        return 1;
+    }
+    return 0;
+}
+
 /* Prefix-trampoline on get_subresource(pkg=a0, type=a1). The big-mon transform
  * calls this ON THE RAW count=7 buffer to extract subs (captured live 2026-06-18:
- * a0=raw buffer, before the cache is built). As a PREFIX we overwrite the raw
- * buffer in place BEFORE get_subresource returns the sub pointer -> the transform
- * extracts OUR data. EBOOT code => JIT-warm, no overlay-timing race. */
+ * a0=raw buffer, before the cache is built). RELOCATE entries redirect a0 to a
+ * grown PAC; same-size entries overwrite the raw buffer in place. EBOOT code =>
+ * JIT-warm, no overlay-timing race. */
 extern "C" void mhfu_dispatch_get_subresource(const mhfu_anchor_regs_t *regs)
 {
+    if (try_redirect_pkg((mhfu_anchor_regs_t *)regs)) return;
     try_overwrite_buffer(regs->a0);
 }
 
@@ -295,6 +329,64 @@ int mhfu_inject_register(uint32_t file_id, const char *path)
 
     mhfu_log("[inject] register file=%u path=%s (getsub seam @0x%08X + detour @0x%08X)",
              (unsigned)file_id, e->path, GETSUB_ADDR, MODEL_SETUP_ENTRY);
+    return 0;
+}
+
+/* Load a PAC file into a fresh xram block. Returns base (0 on failure); sets *out_sz. */
+static uint32_t load_pac_to_xram(const char *path, uint32_t *out_sz)
+{
+    SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd < 0) { mhfu_log("[inject] reloc open FAILED %s rc=0x%08X", path, (unsigned)fd); return 0; }
+    SceOff sz = sceIoLseek(fd, 0, PSP_SEEK_END);
+    sceIoLseek(fd, 0, PSP_SEEK_SET);
+    uint32_t fsz = (uint32_t)sz;
+    if (fsz < 0x40) { sceIoClose(fd); return 0; }
+    uint32_t cap = (fsz + 0xFFFu) & ~0xFFFu;
+    uint32_t b = xram_alloc(cap);
+    if (!b) { sceIoClose(fd); mhfu_log("[inject] reloc xram exhausted (%uKB)", (unsigned)(cap / 1024)); return 0; }
+    int rd = sceIoRead(fd, (void *)b, (int)fsz);
+    sceIoClose(fd);
+    if (rd != (int)fsz) { mhfu_log("[inject] reloc read short %s", path); return 0; }
+    *out_sz = fsz;
+    return b;
+}
+
+/* RELOCATE registration (Phase 5 topology-grow): grown_path = the BIGGER edited PAC,
+ * orig_path = the ORIGINAL (un-grown) PAC used to recognize the engine's raw buffer.
+ * Both are loaded into xram now; at get_subresource we redirect a0 -> grown. */
+int mhfu_inject_register_relocate(uint32_t file_id, const char *grown_path,
+                                  const char *orig_path)
+{
+    if (!grown_path || !orig_path) return -1;
+    inject_entry_t *e = find_entry(file_id);
+    if (!e) {
+        for (int i = 0; i < MHFU_INJECT_MAX; i++)
+            if (!g_tab[i].used) { e = &g_tab[i]; break; }
+        if (!e) { mhfu_log("[inject] table full"); return -2; }
+    }
+    memset(e, 0, sizeof(*e));
+    e->used = 1;
+    e->file_id = file_id;
+    e->relocate = 1;
+    snprintf(e->path, sizeof(e->path), "%s", grown_path);
+
+    uint32_t gsz = 0, osz = 0;
+    e->buf  = load_pac_to_xram(grown_path, &gsz);
+    e->obuf = load_pac_to_xram(orig_path,  &osz);
+    if (!e->buf || !e->obuf) { e->used = 0; mhfu_log("[inject] reloc load FAILED"); return -3; }
+    e->file_size = gsz;        /* grown size */
+    e->buf_cap   = (gsz + 0xFFFu) & ~0xFFFu;
+    e->orig_size = osz;
+    parse_subs(e);             /* parse the GROWN sub table (for diagnostics) */
+
+    if (!g_hook_installed) {
+        int rc = mhfu_install_trampoline(GETSUB_ADDR, (uint32_t)&mhfu_dispatch_get_subresource);
+        g_hook_installed = (rc == 0);
+        mhfu_log("[inject] get_subresource trampoline @0x%08X rc=%d", GETSUB_ADDR, rc);
+    }
+    mhfu_log("[inject] RELOCATE register file=%u grown=%uB@0x%08X orig=%uB@0x%08X",
+             (unsigned)file_id, (unsigned)gsz, (unsigned)e->buf,
+             (unsigned)osz, (unsigned)e->obuf);
     return 0;
 }
 
@@ -436,6 +528,7 @@ void mhfu_inject_tick(void)
     for (int i = 0; i < MHFU_INJECT_MAX; i++) {
         inject_entry_t *e = &g_tab[i];
         if (!e->used) continue;
+        if (e->relocate) continue;   /* fully set up at register; read_file would wipe obuf */
         SceIoStat st;
         memset(&st, 0, sizeof(st));
         if (sceIoGetstat(e->path, &st) < 0) continue;
