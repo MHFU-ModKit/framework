@@ -233,6 +233,87 @@ version = 1
 7. **C++ atan2f etc. need `extern "C"`** (or `<math.h>`) or the linker
    looks for the mangled name.
 
+## Lua AI scripting layer (v1) — ported monsters
+
+Lets a Lua script define the behaviour of a ported monster that runs on a
+resident MHFU species as its engine host.  Brute Tigrex (port target) runs
+on the resident Tigrex rig; the engine handles rendering, physics, and slot
+management; the Lua script controls action selection.
+
+Reference: `mods/lua_host/scripts/brute_tigrex.lua`.
+Header:    `include/mhfu/ai_script.h` (a1 constants, C helper inlines, docs).
+
+### v1 event surface
+
+| Event | API | Thread | Purpose |
+|-------|-----|--------|---------|
+| spawn | `mhfu.on_bigmonster_spawn(fn)` | poll (5 Hz) | initial setup, render fix |
+| action override | `mhfu.on_bigmonster_action(fn, prio)` | exec (marshalled) | force actions |
+| tick | `function mhfu_tick()` | worker (2 Hz) | maintenance, state advance |
+| death | `mhfu.on_bigmonster_death(fn)` | poll (5 Hz) | disarm AI |
+
+`on_action_end` is **deferred to v2** — detecting a slot-timer expiry cheaply
+requires per-slot polling that isn't yet wired.
+
+### Action force seam (coherent, no desync)
+
+From an `on_bigmonster_action` callback, return an `a1` constant and the engine
+fans it to all 3 body-part slots itself (executor `0x09AC5228`, `docs/AI_SCRIPTING_ENGINE.md` §32k):
+
+```lua
+mhfu.on_bigmonster_action(function(ctx)
+    if ctx.entity ~= my_ent then return ctx.action_id end  -- filter
+    return 0x2B   -- MHFU_AI_A1_ANGRY_SPIN: Tigrex tail spin
+end, 10)
+```
+
+Named `a1` constants (defined in `include/mhfu/ai_script.h`):
+
+| Constant | a1 | Input | Animation |
+|----------|----|-------|-----------|
+| `MHFU_AI_A1_IDLE_WALK` | `0x03` | `0x057B` | Walk straight |
+| `MHFU_AI_A1_IDLE_STAND` | `0x20` | `0x0598` | Stand idle |
+| `MHFU_AI_A1_ANGRY_SPIN` | `0x2B` | `0x05A3` | Tail spin (AoE) |
+| `MHFU_AI_A1_ANGRY_CHARGE` | `0x11` | `0x0589` | Charge lunge |
+| `MHFU_AI_A1_ANGRY_BITE_FWD` | `0x29` | `0x05A1` | Forward bite |
+| `MHFU_AI_A1_ANGRY_JUMP_FWD` | `0x2F` | `0x05A7` | Jump forward |
+| `MHFU_AI_A1_ANGRY_THROW_ROCKS` | `0x2D` | `0x05A5` | Rock throw |
+| `MHFU_AI_A1_IDLE_SUSPICIOUS` | `0x50` | `0x05C8` | Alert look-around |
+
+Derivation: `a1 = vt8_input(slot2) - 0x578`.  To add a new action, observe the
+`input` value in `on_bigmonster_action_decided` for the animation you want, then
+compute `a1 = input - 0x578`.
+
+### Required maintenance (always do these)
+
+**Freeze gate** — the engine sets bits `0x100|0x10000` at `entity+0x4B8` on
+forced repeat-fire and halts the AI tick.  Zero those bits every action tick
+AND from the 2 Hz worker (the halted AI tick cannot self-clear):
+
+```lua
+local function clear_freeze_gate(ent)
+    local v = mhfu.read_u32(ent + 0x4B8)
+    if (v & 0x10100) ~= 0 then mhfu.write_u32(ent + 0x4B8, v & ~0x10100) end
+end
+```
+
+**Render fix** — swap-spawned monsters are culled until the first natural roam
+sets `entity+0x29A` (section tracker).  Write the player's area + set
+`entity+0x638 bit 0x8000` while co-located:
+
+```lua
+mhfu.entity_make_visible(ent, mhfu.get_area_index())
+-- or raw:
+mhfu.write_u16(ent + 0x29A, mhfu.get_area_index())
+mhfu.write_u32(ent + 0x638, mhfu.read_u32(ent + 0x638) | 0x8000)
+```
+
+### Deferred (v2)
+
+- `on_action_end` — slot-timer expiry detection (needs per-slot `+0x10` polling).
+- Damage-per-part, part-break, wall-hit events.
+- Multi-species support (non-Tigrex host).
+
 ## Limits today
 
 - **Region detection stubbed** → defaults to EU (ULES01213). Fill NA/JP

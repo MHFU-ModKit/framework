@@ -11,15 +11,29 @@
 # bigmon_dup
 
 # --- Lua platform ----------------------------------------------------------
-# lua_host runs the memstick scripts (ms0:/PSP/PLUGINS/mhfu_framework/mods/*.lua),
-# e.g. scripts/megatigrex.lua (3-Tigrex swarm + per-clone resolve_attack damage).
-# Ships the entity_clone / quest_* / resolve_attack bindings the swarm needs.
-# Keep the C tigrex_spin OFF (both claim the vt[8] chain).
+# RE-ENABLED 2026-06-19: the pure-C build hit a PPSSPP plugin-memory collision
+# (engine construction-thread stack overwrites the small PRX's import stubs ->
+# mhfu_deferred jumps to garbage). The larger lua_host PRX loads at a layout that
+# historically dodges this exact collision (tigrex_spin ran the same swap fine);
+# the original "Lua VM corruption" was very plausibly the SAME collision. Brute
+# port now runs via scripts/brute_tigrex.lua (v7 in-place inject + Giadrome swap).
 lua_host
+# monster_nameplates
 
-# --- HUD ---------------------------------------------------------------------
-# monster_nameplates: projected name+HP labels over monsters; double-tap SELECT.
-monster_nameplates
+# --- Brute Tigrex port -----------------------------------------------------
+# brute_overlay_hook: joint-fix patch at 0x088dc444. DISABLED 2026-06-19 as the
+# decisive test: its fix_c->mhfu_log adds a deep vsnprintf frame DURING big-mon
+# construction on the engine thread whose stack sits inside the PRX (~0x09D8A000),
+# tipping it into critical PRX memory -> the Lua VM / import-stub clobber crash.
+# With v7 (layout-matched skel offset) the bad-skel-ptr fix should be unneeded.
+# 2026-06-19 UPDATE: v7 did NOT fix the skel ptr (engine still reads a bad
+# restructured skel -> FK write crash @0x08863198). Re-enabled with a STACK-CHEAP
+# fix_c (no mhfu_log; fires for any bad-magic skel incl. the in-place gmem ptr).
+brute_overlay_hook
+
+# brute_port: pure-C swap+inject. SUPERSEDED by brute_tigrex.lua (Lua build, which
+# dodges the PRX-stack collision). Disabled to avoid double swap/inject.
+# brute_port
 
 # --- disabled --------------------------------------------------------------
 # tigrex_spin   # C baseline; crashes on spin via action_decided ptr-force

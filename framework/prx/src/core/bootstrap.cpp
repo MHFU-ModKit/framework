@@ -14,11 +14,57 @@
 #include <pspkernel.h>
 #include <pspsdk.h>
 #include <pspthreadman.h>
+#include <pspsysmem.h>
 
 #include "mhfu/log.h"
 #include "internal.h"
 
 #define MOD_NAME "mhfu_framework"
+
+/* Linker-supplied bounds of THIS module's loaded image. _ftext = first text
+ * byte (= load base), _end = first byte past .bss. At runtime they resolve to
+ * the actual load addresses. */
+extern "C" char _ftext[];
+extern "C" char _end[];
+
+/* ROOT-CAUSE FIX (RE'd 2026-06-19): PPSSPP's plugin loader places the PRX in
+ * user-partition memory that the kernel's BlockAllocator still considers FREE,
+ * so the game later allocates a thread stack (the big-monster CONSTRUCTION
+ * thread, "user_main" uid≈0x119) whose stack lands INSIDE our PRX. As that
+ * thread recurses, sw ra,(sp) overwrites our import stubs (sceKernelDelayThread
+ * @ base+0x24830) -> the mhfu_deferred thread later jumps to garbage (0x0c000000)
+ * and the game crashes on quest load. Observed: writer pc=0x08860540 sp=0x09d89ff0
+ * inside [_ftext,_end). FIX: at boot, BEFORE the game spawns that thread, reserve
+ * our own image range via sceKernelAllocPartitionMemory(PSP_SMEM_Addr) so the
+ * BlockAllocator marks it used and the construction-thread stack is placed
+ * elsewhere. */
+static SceUID g_self_guard = -1;
+static void reserve_self_memory(void)
+{
+    uint32_t base = ((uint32_t)(uintptr_t)_ftext) & ~0xFFFu;          /* page down */
+    uint32_t end  = (((uint32_t)(uintptr_t)_end) + 0xFFFu) & ~0xFFFu; /* page up   */
+    uint32_t size = end - base;
+    /* Reserve at the exact base of our image. partition 2 = user. */
+    g_self_guard = sceKernelAllocPartitionMemory(
+        PSP_MEMORY_PARTITION_USER, "mhfu_self_guard", PSP_SMEM_Addr, size, (void *)base);
+    if (g_self_guard >= 0) {
+        void *got = sceKernelGetBlockHeadAddr(g_self_guard);
+        mhfu_log("[framework] self-guard reserved [0x%08X,0x%08X) %uKB blk=0x%X got=0x%08X",
+                 base, end, (unsigned)(size / 1024), (unsigned)g_self_guard,
+                 (unsigned)(uintptr_t)got);
+    } else {
+        mhfu_log("[framework] self-guard FAILED rc=0x%08X for [0x%08X,0x%08X) — narrow fallback",
+                 (unsigned)g_self_guard, base, end);
+        /* Fallback: just bracket the observed collision zone (engine stack top
+         * ~0x09D8A000 + our import stubs ~0x09D89CC0). */
+        SceUID b2 = sceKernelAllocPartitionMemory(
+            PSP_MEMORY_PARTITION_USER, "mhfu_zone_guard", PSP_SMEM_Addr,
+            0x4000, (void *)0x09D88000u);
+        mhfu_log("[framework] narrow self-guard [0x09D88000,+0x4000) rc/blk=0x%X",
+                 (unsigned)b2);
+        if (b2 >= 0) g_self_guard = b2;
+    }
+}
 
 PSP_MODULE_INFO(MOD_NAME, 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
@@ -50,6 +96,10 @@ int main(int argc, char *argv[])
     (void)argc; (void)argv;
     mhfu_sentinel_set(0x00, 0xCAFE0001);
     mhfu_log("[framework] %s starting", MOD_NAME);
+
+    /* FIRST: fence off our own image so the game can't allocate a thread stack
+     * inside it (root cause of the quest-load crash — see reserve_self_memory). */
+    reserve_self_memory();
 
     mhfu_region_detect();
     mhfu_hookmgr_init();
