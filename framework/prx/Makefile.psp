@@ -34,7 +34,9 @@ OBJS = $(CORE_OBJS) $(MOD_OBJS)
 
 # include/ = public SDK; src/core/ = internal.h
 INCDIR   = include src/core
-CFLAGS   = -O2 -G0 -Wall -fno-strict-aliasing
+# EXTRA_DEFINES: pass -DMHFU_REALHW to build the real-PSP-hardware variant (inject
+# scratch from the ARK-4-grown user partition instead of the PPSSPP raw xram window).
+CFLAGS   = -O2 -G0 -Wall -fno-strict-aliasing $(EXTRA_DEFINES)
 # Light C++ only: no exceptions / RTTI / threadsafe-static guards, so the
 # objects link with psp-gcc and pull no libstdc++ runtime.
 CXXFLAGS = $(CFLAGS) -std=gnu++17 -fno-exceptions -fno-rtti -fno-threadsafe-statics

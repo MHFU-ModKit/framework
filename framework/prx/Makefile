@@ -11,11 +11,21 @@
 DOCKER_IMG = pspdev/pspdev:latest
 PROJECT_DIR = $(shell pwd)
 
-.PHONY: all clean host-make shell
+.PHONY: all realhw clean host-make shell
 
 all:
 	docker run --rm -v "$(PROJECT_DIR)":/work -w /work $(DOCKER_IMG) \
 	    bash -c "psp-pacman -S --noconfirm pspsdk-bin >/dev/null 2>&1 || true; make -f Makefile.psp"
+
+# Real-PSP-hardware build (allocates inject scratch from the ARK-4-grown user
+# partition instead of the PPSSPP raw extra-RAM window). cleans first so every TU
+# picks up the define, then renames the output to mhfu_framework_realhw.prx.
+realhw:
+	docker run --rm -v "$(PROJECT_DIR)":/work -w /work $(DOCKER_IMG) \
+	    bash -c "psp-pacman -S --noconfirm pspsdk-bin >/dev/null 2>&1 || true; \
+	             make -f Makefile.psp clean >/dev/null 2>&1 || true; \
+	             make -f Makefile.psp EXTRA_DEFINES=-DMHFU_REALHW && \
+	             cp mhfu_framework.prx mhfu_framework_realhw.prx"
 
 clean:
 	rm -f *.o *.elf *.prx *.SFO *.PBP src/*.o src/core/*.o mods/*/mod.o mods/*/*/mod.o

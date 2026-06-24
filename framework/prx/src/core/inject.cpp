@@ -26,6 +26,8 @@
 #include <pspthreadman.h>      /* sceKernelDelayThread */
 #include <string.h>
 #include <stdio.h>             /* snprintf */
+#include <pspsysmem.h>         /* sceKernelAllocPartitionMemory, *FreeMemSize, GetModel (real HW) */
+#include <stdarg.h>            /* realhw_dbg */
 
 #define GETSUB_ADDR    0x088B89B0u   /* get_subresource(pkg, type) — POST-transform (unused) */
 
@@ -65,7 +67,9 @@
  * bigmon_overlay (0x0A000000) and the clone pool (0x0A800000). */
 #define MHFU_INJECT_XRAM_LO   0x0B000000u
 #define MHFU_INJECT_XRAM_HI   0x0C000000u
+#ifndef MHFU_REALHW
 static uint32_t g_xram_bump = MHFU_INJECT_XRAM_LO;
+#endif
 
 #define MHFU_INJECT_MAX   8
 #define MHFU_MAX_SUBS     8
@@ -116,6 +120,31 @@ typedef struct {
 static inject_entry_t g_tab[MHFU_INJECT_MAX];
 static int            g_hook_installed;
 
+/* --- real-hardware diagnostics --------------------------------------------
+ * Appends one line to ms0:/PSP/mhfu_brute_debug.txt so a single run on the
+ * friend's PSP carries enough info to fix the next build (model, free mem, alloc
+ * result, whether the redirect fired). Compiled out on the normal PPSSPP build. */
+#ifdef MHFU_REALHW
+static void realhw_dbg(const char *fmt, ...)
+{
+    char line[224];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line) - 2, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof(line) - 2) n = (int)sizeof(line) - 2;
+    line[n++] = '\n';
+    line[n] = 0;
+    SceUID fd = sceIoOpen("ms0:/PSP/mhfu_brute_debug.txt",
+                          PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+    if (fd >= 0) { sceIoWrite(fd, line, n); sceIoClose(fd); }
+}
+#define RHW_DBG(...) realhw_dbg(__VA_ARGS__)
+#else
+#define RHW_DBG(...) ((void)0)
+#endif
+
 static inline uint32_t rd32(uint32_t a) { return *(volatile uint32_t *)a; }
 static inline int gmem_ok(uint32_t a) { return a >= 0x08000000u && a < 0x0A000000u; }
 
@@ -129,6 +158,46 @@ static inject_entry_t *find_entry(uint32_t file_id)
     return 0;
 }
 
+#ifdef MHFU_REALHW
+/* --- real PSP hardware (ARK-4 "Use Extra Memory: Forced") ------------------
+ * On a real PSP the stock-PPSSPP raw extra-RAM window (0x0B000000) is NOT backed
+ * and a probe write there FAULTS. With ARK-4's "Use Extra Memory -> Forced"
+ * setting the user partition (2) grows from 24 MB to ~52 MB; we allocate the
+ * inject scratch from it as a normal user block (PSP_SMEM_High, away from the
+ * game's low-growing heap). The block is in the user partition => user-accessible,
+ * so the game engine reads our injected PAC directly — no kernel address, no
+ * memory-protection unlock. Diagnostics -> ms0:/PSP/mhfu_brute_debug.txt. */
+#define MHFU_REALHW_MAX_UIDS 16
+static SceUID g_rhw_uids[MHFU_REALHW_MAX_UIDS];
+static int    g_rhw_nuid;
+static int    g_rhw_logged_boot;
+
+static uint32_t xram_alloc(uint32_t n)
+{
+    if (!g_rhw_logged_boot) {
+        g_rhw_logged_boot = 1;
+        /* maxfree > ~24 MB => the ARK-4 "Use Extra Memory" grow is active (a normal
+         * 24 MB user partition never has this much free once the game is up). */
+        RHW_DBG("[realhw] boot maxfree=%uKB totalfree=%uKB (need >24576 for the Brute)",
+                (unsigned)(sceKernelMaxFreeMemSize() / 1024),
+                (unsigned)(sceKernelTotalFreeMemSize() / 1024));
+    }
+    uint32_t maxfree = (uint32_t)sceKernelMaxFreeMemSize();
+    SceUID uid = sceKernelAllocPartitionMemory(2, "mhfu_xram",
+                                               PSP_SMEM_High, n, NULL);
+    if (uid < 0) {
+        RHW_DBG("[realhw] ALLOC FAIL need=%uKB maxfree=%uKB uid=0x%08X -> enable "
+                "ARK-4 'Use Extra Memory: Forced' (PSP-2000/3000/Go only)",
+                (unsigned)(n / 1024), (unsigned)(maxfree / 1024), (unsigned)uid);
+        return 0;
+    }
+    if (g_rhw_nuid < MHFU_REALHW_MAX_UIDS) g_rhw_uids[g_rhw_nuid++] = uid;
+    void *p = sceKernelGetBlockHeadAddr(uid);
+    RHW_DBG("[realhw] ALLOC ok need=%uKB addr=0x%08X maxfree_before=%uKB",
+            (unsigned)(n / 1024), (unsigned)p, (unsigned)(maxfree / 1024));
+    return (uint32_t)p;
+}
+#else
 static int xram_mapped(uint32_t addr)
 {
     volatile uint32_t *p = (volatile uint32_t *)addr;
@@ -145,6 +214,7 @@ static uint32_t xram_alloc(uint32_t n)
     g_xram_bump = a + n;
     return a;
 }
+#endif
 
 /* Parse the edited PAC (in e->buf) into the sub table: u32 count, then
  * count*(u32 off, u32 size); magic = first u32 of each sub. */
@@ -276,9 +346,13 @@ static int try_redirect_pkg(mhfu_anchor_regs_t *regs)
         if (!gmem_ok(a0 + 255)) continue;
         if (memcmp((const void *)a0, (const void *)e->obuf, 256) != 0) continue; /* not our species */
         regs->a0 = e->buf;                 /* -> grown PAC in xram */
-        if (e->redirects == 0)
+        if (e->redirects == 0) {
             mhfu_log("[inject] RELOCATE redirect file=%u a0 0x%08X -> 0x%08X (grown %uB)",
                      (unsigned)e->file_id, (unsigned)a0, (unsigned)e->buf, (unsigned)e->file_size);
+            RHW_DBG("[realhw] redirect FIRED file=%u a0=0x%08X -> 0x%08X grown=%uB",
+                    (unsigned)e->file_id, (unsigned)a0, (unsigned)e->buf,
+                    (unsigned)e->file_size);
+        }
         e->redirects++;
         return 1;
     }
@@ -387,6 +461,9 @@ int mhfu_inject_register_relocate(uint32_t file_id, const char *grown_path,
     mhfu_log("[inject] RELOCATE register file=%u grown=%uB@0x%08X orig=%uB@0x%08X",
              (unsigned)file_id, (unsigned)gsz, (unsigned)e->buf,
              (unsigned)osz, (unsigned)e->obuf);
+    RHW_DBG("[realhw] relocate registered file=%u grown=%uB@0x%08X orig=%uB@0x%08X",
+            (unsigned)file_id, (unsigned)gsz, (unsigned)e->buf,
+            (unsigned)osz, (unsigned)e->obuf);
     return 0;
 }
 
