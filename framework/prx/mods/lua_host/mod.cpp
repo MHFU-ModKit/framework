@@ -66,7 +66,12 @@ extern "C" {
 #include "scripts/_prelude.lua.h"
 
 #define LUA_MODS_DIR "ms0:/PSP/PLUGINS/mhfu_framework/mods"
-static char g_filebuf[48 * 1024];   /* per-file read scratch (BSS, reused) */
+/* Per-file .lua read scratch. Allocated dynamically at init (NOT a .bss array) so
+ * it doesn't inflate the PRX's contiguous load image — that 48 KB mattered for
+ * fitting MHFU's bare 24 MB user partition on real hardware. */
+#define G_FILEBUF_SZ (48 * 1024)
+static char  *g_filebuf;
+static SceUID g_filebuf_uid = -1;
 
 /* ------------------------------------------------------------------ slab
  * A self-contained implicit-free-list allocator over a fixed slab. Lua's
@@ -1538,13 +1543,14 @@ static int load_lua_file(lua_State *L, const char *name)
 {
     char path[160];
     snprintf(path, sizeof(path), "%s/%s", LUA_MODS_DIR, name);
+    if (!g_filebuf) { mhfu_log("[lua_host] no file scratch — skip %s", name); return -1; }
     SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0);
     if (fd < 0) { mhfu_log("[lua_host] open FAILED %s rc=0x%08X", path, (unsigned)fd); return -1; }
-    int n = sceIoRead(fd, g_filebuf, sizeof(g_filebuf) - 1);
+    int n = sceIoRead(fd, g_filebuf, G_FILEBUF_SZ - 1);
     sceIoClose(fd);
     if (n < 0) { mhfu_log("[lua_host] read FAILED %s rc=0x%08X", name, (unsigned)n); return -1; }
-    if (n >= (int)sizeof(g_filebuf) - 1) {
-        mhfu_log("[lua_host] %s too big (>%uB) — skipped", name, (unsigned)sizeof(g_filebuf) - 1);
+    if (n >= (int)(G_FILEBUF_SZ - 1)) {
+        mhfu_log("[lua_host] %s too big (>%uB) — skipped", name, (unsigned)(G_FILEBUF_SZ - 1));
         return -1;
     }
     g_filebuf[n] = 0;
@@ -1812,6 +1818,14 @@ static int lua_host_init(void)
     void *base = sceKernelGetBlockHeadAddr(g_slab_uid);
     unsigned a = ((unsigned)base + 7u) & ~7u;
     slab_init((void *)a, LUA_SLAB_BYTES);
+
+    /* Per-file read scratch (was a 48 KB .bss array; moved off the load image). */
+    g_filebuf_uid = sceKernelAllocPartitionMemory(
+        2 /* PSP_MEMORY_PARTITION_USER */, "mhfu_lua_filebuf",
+        PSP_SMEM_Low, G_FILEBUF_SZ, 0);
+    g_filebuf = (g_filebuf_uid >= 0) ? (char *)sceKernelGetBlockHeadAddr(g_filebuf_uid) : 0;
+    if (!g_filebuf) mhfu_log("[lua_host] filebuf alloc FAILED rc=0x%08X — scripts won't load",
+                             (unsigned)g_filebuf_uid);
 
     if (lua_host_setup() != 0) return -1;
 

@@ -102,6 +102,9 @@ int main(int argc, char *argv[])
     reserve_self_memory();
 
     mhfu_region_detect();
+    /* Pick the inject scratch region now (emulator raw window vs real-HW 4 MB
+     * volatile) — fault-safe, before any model registers. */
+    mhfu_xram_platform_init();
     mhfu_hookmgr_init();
     mhfu_sentinel_set(0x00, 0xCAFE0002);
 

@@ -68,6 +68,11 @@ void mhfu_ai_poll_death(void);
  * MHFU_EVENT_QUEST_TARGETS_BUILDING. Call after mhfu_mods_init_all(). */
 void mhfu_quest_init(void);
 
+/* --- inject (inject.cpp) --- */
+/* Picks the inject scratch region once (emulator raw window vs real-HW 4 MB
+ * volatile). Fault-safe; call early from bootstrap. Idempotent. */
+void mhfu_xram_platform_init(void);
+
 /* --- bootstrap (bootstrap.cpp) --- */
 void mhfu_sentinel_set(uint32_t offset, uint32_t value);
 #define MHFU_SENTINEL_BASE 0x08AEFFE0u

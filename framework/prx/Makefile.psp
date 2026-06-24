@@ -36,11 +36,18 @@ OBJS = $(CORE_OBJS) $(MOD_OBJS)
 INCDIR   = include src/core
 # EXTRA_DEFINES: pass -DMHFU_REALHW to build the real-PSP-hardware variant (inject
 # scratch from the ARK-4-grown user partition instead of the PPSSPP raw xram window).
-CFLAGS   = -O2 -G0 -Wall -fno-strict-aliasing $(EXTRA_DEFINES)
+# -Os + per-function/-data sections + --gc-sections: shrink the LOADED image so the
+# PRX fits MHFU's bare 24 MB user partition (no highmem) on real hardware. This is
+# the only lever that touches the prebuilt liblua.a bulk (drops unused Lua members
+# + functions). `-u module_info` force-keeps the PRX module-info section, which
+# --gc-sections would otherwise strip (-> prxgen "no sceModuleInfo" error). The
+# MHFU_MOD descriptors carry __attribute__((used)) so they survive the GC too.
+CFLAGS   = -Os -G0 -Wall -fno-strict-aliasing -ffunction-sections -fdata-sections $(EXTRA_DEFINES)
 # Light C++ only: no exceptions / RTTI / threadsafe-static guards, so the
 # objects link with psp-gcc and pull no libstdc++ runtime.
 CXXFLAGS = $(CFLAGS) -std=gnu++17 -fno-exceptions -fno-rtti -fno-threadsafe-statics
 ASFLAGS  = $(CFLAGS)
+LDFLAGS  = -Wl,--gc-sections -Wl,-u,module_info
 
 # Export the public API symbols so a future separately-loaded mod PRX
 # (approach B) can import them. Static mods resolve directly and ignore this.

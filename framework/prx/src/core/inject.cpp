@@ -26,7 +26,8 @@
 #include <pspthreadman.h>      /* sceKernelDelayThread */
 #include <string.h>
 #include <stdio.h>             /* snprintf */
-#include <pspsysmem.h>         /* sceKernelAllocPartitionMemory, *FreeMemSize, GetModel (real HW) */
+#include <pspsysmem.h>         /* *FreeMemSize (real HW boot diagnostics) */
+#include <pspsuspend.h>        /* sceKernelVolatileMemTryLock (real HW 4 MB scratch) */
 #include <stdarg.h>            /* realhw_dbg */
 
 #define GETSUB_ADDR    0x088B89B0u   /* get_subresource(pkg, type) — POST-transform (unused) */
@@ -67,9 +68,7 @@
  * bigmon_overlay (0x0A000000) and the clone pool (0x0A800000). */
 #define MHFU_INJECT_XRAM_LO   0x0B000000u
 #define MHFU_INJECT_XRAM_HI   0x0C000000u
-#ifndef MHFU_REALHW
-static uint32_t g_xram_bump = MHFU_INJECT_XRAM_LO;
-#endif
+static uint32_t g_xram_bump = MHFU_INJECT_XRAM_LO;   /* RAW (emulator) mode bump */
 
 #define MHFU_INJECT_MAX   8
 #define MHFU_MAX_SUBS     8
@@ -120,11 +119,10 @@ typedef struct {
 static inject_entry_t g_tab[MHFU_INJECT_MAX];
 static int            g_hook_installed;
 
-/* --- real-hardware diagnostics --------------------------------------------
- * Appends one line to ms0:/PSP/mhfu_brute_debug.txt so a single run on the
- * friend's PSP carries enough info to fix the next build (model, free mem, alloc
- * result, whether the redirect fired). Compiled out on the normal PPSSPP build. */
-#ifdef MHFU_REALHW
+/* --- platform diagnostics --------------------------------------------------
+ * Appends one line to ms0:/PSP/mhfu_brute_debug.txt so a single run on a real PSP
+ * carries enough info to fix the next build (free mem, region pick, alloc result,
+ * whether the redirect fired). Harmless on PPSSPP (writes to its memstick ms0). */
 static void realhw_dbg(const char *fmt, ...)
 {
     char line[224];
@@ -141,9 +139,6 @@ static void realhw_dbg(const char *fmt, ...)
     if (fd >= 0) { sceIoWrite(fd, line, n); sceIoClose(fd); }
 }
 #define RHW_DBG(...) realhw_dbg(__VA_ARGS__)
-#else
-#define RHW_DBG(...) ((void)0)
-#endif
 
 static inline uint32_t rd32(uint32_t a) { return *(volatile uint32_t *)a; }
 static inline int gmem_ok(uint32_t a) { return a >= 0x08000000u && a < 0x0A000000u; }
@@ -158,47 +153,33 @@ static inject_entry_t *find_entry(uint32_t file_id)
     return 0;
 }
 
-#ifdef MHFU_REALHW
-/* --- real PSP hardware (ARK-4 "Use Extra Memory: Forced") ------------------
- * On a real PSP the stock-PPSSPP raw extra-RAM window (0x0B000000) is NOT backed
- * and a probe write there FAULTS. With ARK-4's "Use Extra Memory -> Forced"
- * setting the user partition (2) grows from 24 MB to ~52 MB; we allocate the
- * inject scratch from it as a normal user block (PSP_SMEM_High, away from the
- * game's low-growing heap). The block is in the user partition => user-accessible,
- * so the game engine reads our injected PAC directly — no kernel address, no
- * memory-protection unlock. Diagnostics -> ms0:/PSP/mhfu_brute_debug.txt. */
-#define MHFU_REALHW_MAX_UIDS 16
-static SceUID g_rhw_uids[MHFU_REALHW_MAX_UIDS];
-static int    g_rhw_nuid;
-static int    g_rhw_logged_boot;
+/* --- inject scratch RAM: ONE binary, region picked at bootstrap ------------
+ * Two regions, auto-selected once:
+ *  - PPSSPP (memory=64): the raw flat extra-RAM window [0x0B000000,0x0C000000)
+ *    (32 MB) — the validated emulator path; big mods can spill freely.
+ *  - real PSP hardware: the 4 MB VOLATILE partition (sceKernelVolatileMemTryLock)
+ *    — user-accessible normal RAM, NO partition resize. We deliberately do NOT
+ *    grow the user partition: ARK-4 "Use Extra Memory: Forced" was confirmed
+ *    (2026-06-25) to crash MHFU EU at the boot logo BY ITSELF, no mod loaded
+ *    (Coprocessor-unusable in SceKernelLoadExecThread) — a grown user partition is
+ *    not tolerated by this game's loader. The ~1.6 MB Brute + ~1.2 MB orig key
+ *    (~2.8 MB) fits in 4 MB; held for the session. Works on every model (Phat too).
+ *    TRADE-OFF: while we hold the volatile RAM, MHFU paths that need it (some
+ *    load/savedata/utility dialogs) may block or fail.
+ * DETECTION is fault-safe. The raw-window probe WRITES 0x0B000000, which FAULTS on
+ * real hardware, so we only probe when sceKernelMaxFreeMemSize() reports more free
+ * than a stock 24 MB user partition can ever yield (>32 MB) — true only under
+ * PPSSPP memory=64. On hardware that gate is false, so we never touch the raw
+ * window and take volatile. With this build, ARK "Use Extra Memory" should be
+ * OFF/Auto (NOT Forced). Diagnostics -> ms0:/PSP/mhfu_brute_debug.txt. */
+enum { XR_UNDECIDED = 0, XR_RAW, XR_VOLATILE };
+static int      g_xram_mode;
+static uint32_t g_vol_base, g_vol_size, g_vol_bump;   /* volatile region */
+static int      g_vol_locked;                         /* 0=unattempted 1=ok -1=fail */
 
-static uint32_t xram_alloc(uint32_t n)
-{
-    if (!g_rhw_logged_boot) {
-        g_rhw_logged_boot = 1;
-        /* maxfree > ~24 MB => the ARK-4 "Use Extra Memory" grow is active (a normal
-         * 24 MB user partition never has this much free once the game is up). */
-        RHW_DBG("[realhw] boot maxfree=%uKB totalfree=%uKB (need >24576 for the Brute)",
-                (unsigned)(sceKernelMaxFreeMemSize() / 1024),
-                (unsigned)(sceKernelTotalFreeMemSize() / 1024));
-    }
-    uint32_t maxfree = (uint32_t)sceKernelMaxFreeMemSize();
-    SceUID uid = sceKernelAllocPartitionMemory(2, "mhfu_xram",
-                                               PSP_SMEM_High, n, NULL);
-    if (uid < 0) {
-        RHW_DBG("[realhw] ALLOC FAIL need=%uKB maxfree=%uKB uid=0x%08X -> enable "
-                "ARK-4 'Use Extra Memory: Forced' (PSP-2000/3000/Go only)",
-                (unsigned)(n / 1024), (unsigned)(maxfree / 1024), (unsigned)uid);
-        return 0;
-    }
-    if (g_rhw_nuid < MHFU_REALHW_MAX_UIDS) g_rhw_uids[g_rhw_nuid++] = uid;
-    void *p = sceKernelGetBlockHeadAddr(uid);
-    RHW_DBG("[realhw] ALLOC ok need=%uKB addr=0x%08X maxfree_before=%uKB",
-            (unsigned)(n / 1024), (unsigned)p, (unsigned)(maxfree / 1024));
-    return (uint32_t)p;
-}
-#else
-static int xram_mapped(uint32_t addr)
+/* Probe-write a word. Fault-safe ONLY behind the maxfree gate (never reached on
+ * real hardware); also used per-block in RAW mode where the window is known good. */
+static int xram_raw_probe(uint32_t addr)
 {
     volatile uint32_t *p = (volatile uint32_t *)addr;
     uint32_t save = *p; *p = 0xA5C30F04u;
@@ -206,15 +187,75 @@ static int xram_mapped(uint32_t addr)
     return ok;
 }
 
+/* Decide the inject region once, early (called from bootstrap). Cheap + fault-safe;
+ * does NOT lock volatile (that's deferred to first alloc so we deny the game its
+ * volatile RAM for as short a window as possible). */
+extern "C" void mhfu_xram_platform_init(void)
+{
+    if (g_xram_mode) return;
+    uint32_t maxfree = (uint32_t)sceKernelMaxFreeMemSize();
+    RHW_DBG("[xram] platform decide: maxfree=%uKB totalfree=%uKB",
+            (unsigned)(maxfree / 1024),
+            (unsigned)(sceKernelTotalFreeMemSize() / 1024));
+    if (maxfree > 0x02000000u && xram_raw_probe(MHFU_INJECT_XRAM_LO)) {
+        g_xram_mode = XR_RAW;
+        g_xram_bump = MHFU_INJECT_XRAM_LO;
+        mhfu_log("[inject] xram = RAW window 0x%08X (emulator, %uMB free)",
+                 MHFU_INJECT_XRAM_LO, (unsigned)(maxfree / (1024 * 1024)));
+        RHW_DBG("[xram] mode=RAW 0x%08X (emulator)", MHFU_INJECT_XRAM_LO);
+    } else {
+        g_xram_mode = XR_VOLATILE;   /* lock deferred to first alloc */
+        mhfu_log("[inject] xram = VOLATILE 4MB (hardware-safe; locked on first use)");
+        RHW_DBG("[xram] mode=VOLATILE (hardware; lock deferred)");
+    }
+}
+
+static int volatile_ensure(void)
+{
+    if (g_vol_locked) return g_vol_locked > 0;
+    void *ptr = 0; int size = 0;
+    int rc = sceKernelVolatileMemTryLock(0, &ptr, &size);
+    if (rc < 0 || !ptr || size <= 0) {
+        g_vol_locked = -1;
+        RHW_DBG("[xram] VOLATILE TryLock FAIL rc=0x%08X (MHFU holds it?) -> no Brute",
+                (unsigned)rc);
+        return 0;
+    }
+    g_vol_base = (uint32_t)(uintptr_t)ptr;
+    g_vol_size = (uint32_t)size;
+    g_vol_bump = g_vol_base;
+    g_vol_locked = 1;
+    RHW_DBG("[xram] VOLATILE lock ok base=0x%08X size=%uKB",
+            (unsigned)g_vol_base, (unsigned)(g_vol_size / 1024));
+    return 1;
+}
+
 static uint32_t xram_alloc(uint32_t n)
 {
-    uint32_t a = (g_xram_bump + 15u) & ~15u;
-    if (a + n > MHFU_INJECT_XRAM_HI) return 0;
-    if (!xram_mapped(a)) return 0;
-    g_xram_bump = a + n;
+    if (!g_xram_mode) mhfu_xram_platform_init();
+
+    if (g_xram_mode == XR_RAW) {
+        uint32_t a = (g_xram_bump + 15u) & ~15u;
+        if (a + n > MHFU_INJECT_XRAM_HI) return 0;
+        if (!xram_raw_probe(a)) return 0;
+        g_xram_bump = a + n;
+        return a;
+    }
+    /* XR_VOLATILE */
+    if (!volatile_ensure()) return 0;
+    uint32_t a = (g_vol_bump + 15u) & ~15u;       /* 16 B align */
+    if (a + n > g_vol_base + g_vol_size) {
+        RHW_DBG("[xram] VOLATILE exhausted need=%uKB used=%uKB cap=%uKB",
+                (unsigned)(n / 1024), (unsigned)((g_vol_bump - g_vol_base) / 1024),
+                (unsigned)(g_vol_size / 1024));
+        return 0;
+    }
+    g_vol_bump = a + n;
+    RHW_DBG("[xram] VOLATILE alloc need=%uKB addr=0x%08X (used=%uKB/%uKB)",
+            (unsigned)(n / 1024), (unsigned)a,
+            (unsigned)((g_vol_bump - g_vol_base) / 1024), (unsigned)(g_vol_size / 1024));
     return a;
 }
-#endif
 
 /* Parse the edited PAC (in e->buf) into the sub table: u32 count, then
  * count*(u32 off, u32 size); magic = first u32 of each sub. */
