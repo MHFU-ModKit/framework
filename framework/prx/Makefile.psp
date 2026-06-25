@@ -42,18 +42,22 @@ CFLAGS   = -Os -G0 -Wall -fno-strict-aliasing $(EXTRA_DEFINES)
 CXXFLAGS = $(CFLAGS) -std=gnu++17 -fno-exceptions -fno-rtti -fno-threadsafe-statics
 ASFLAGS  = $(CFLAGS)
 
-# Link order: sce stubs, then -llua -lm -lc (Lua references libm/libc to its
-# right). build_prx.mak appends -lpspdebug -lpspdisplay -lpspge -lpspctrl.
-LIBS = -lpspsdk -lpspuser -lpspnet -lpspnet_apctl -llua -lm -lc
+# ★ THE REAL-PSP LOAD FIX: prxexports.o is pspsdk's default syslib export object
+# (exports module_start + module_info via a .lib.ent table). build_prx.mak — UNLIKE
+# build.mak — does NOT auto-link any export object, so without this the PRX ships an
+# EMPTY export table and real PSP firmware REJECTS it ("could not be started
+# 0x800200D9", before any code runs). Confirmed by diffing a working psplink PRX: it
+# has a 16 B .lib.ent where ours had none. PPSSPP scans for module_info directly and
+# loaded ours anyway, which masked the bug for a long time. It must come first (it's
+# an object whose module_start/module_info refs resolve from our own objects).
+# Then sce stubs, then -llua -lm -lc (Lua references libm/libc to its right).
+# build_prx.mak appends -lpspdebug -lpspdisplay -lpspge -lpspctrl.
+LIBS = $(PSPSDK)/lib/prxexports.o -lpspsdk -lpspuser -lpspnet -lpspnet_apctl -llua -lm -lc
 
-# build_prx.mak (NOT build.mak) — links with -nostartfiles (NO crt0). We therefore
-# define module_start DIRECTLY (bootstrap.cpp) and spawn our own thread; the plugin
-# does NOT auto-create a main thread or grab a default heap at module-start. That
-# crt0/main() machinery is exactly what fails to load on MHFU's bare 24 MB user
-# partition ("could not be started 0x800200D9", before any code runs). This is the
-# psplink loader pattern, which loads on the same hardware. (No PRX_EXPORTS: the
-# mhfu_* API was only for a future separate mod PRX; static mods don't need it, and
-# prxgen still auto-exports module_start/module_stop/module_info.)
+# build_prx.mak (NOT build.mak) — links with -nostartfiles (NO crt0). We define
+# module_start DIRECTLY (bootstrap.cpp) and spawn our own thread (a PPSSPP-parity
+# fix from the crt0/main() pattern). The mandatory export above is the separate,
+# real-hardware fix.
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build_prx.mak
 

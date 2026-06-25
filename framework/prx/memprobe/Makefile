@@ -10,7 +10,11 @@ CFLAGS   = -Os -G0 -Wall
 CXXFLAGS = $(CFLAGS)
 ASFLAGS  = $(CFLAGS)
 
-LIBS = -lpspsdk -lpspuser
+# prxexports.o (first) = the MANDATORY syslib export (module_start/module_info via
+# .lib.ent). build_prx.mak does NOT auto-link it (build.mak does), so without it the
+# PRX has an empty export table and real PSP firmware rejects it (0x800200D9) even
+# though PPSSPP loads it. THE real-PSP load fix.
+LIBS = $(PSPSDK)/lib/prxexports.o -lpspsdk -lpspuser
 
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build_prx.mak
