@@ -16,6 +16,10 @@ PROJECT_DIR = $(shell pwd)
 all:
 	docker run --rm -v "$(PROJECT_DIR)":/work -w /work $(DOCKER_IMG) \
 	    bash -c "psp-pacman -S --noconfirm pspsdk-bin >/dev/null 2>&1 || true; make -f Makefile.psp"
+	@# Real-PSP fix part 2: clear EF_MIPS_ABI_EABI32 from e_flags (psp-prxgen copies
+	@# it verbatim; old firmware/PRO CFW reject it -> 0x800200D9). Host-side (the
+	@# pspdev image has no python). See tools/patch_prx_eflags.py + Makefile.psp.
+	python3 tools/patch_prx_eflags.py mhfu_framework.prx
 
 # Real-PSP-hardware build (allocates inject scratch from the ARK-4-grown user
 # partition instead of the PPSSPP raw extra-RAM window). cleans first so every TU

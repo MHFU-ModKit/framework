@@ -57,6 +57,29 @@ LIBS = -lpspsdk -lpspuser -lpspnet -lpspnet_apctl -llua -lm -lc
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build_prx.mak
 
+# Real-PSP fix (two parts): the modern pspdev toolchain (GCC 15+, binutils 2.44)
+# produces a PRX that old PSP firmware / PRO CFW loadcore rejects with 0x800200D9
+# before any code runs (PPSSPP is lenient and loads it; real firmware is not).
+#   (1) e_flags carries EF_MIPS_ABI_EABI32 (0x3000) — psp-prxgen copies e_flags
+#       verbatim, and an EABI ABI flag is "unsupported" to old loadcore. This is
+#       the PRIMARY cause. Cleared post-build by tools/patch_prx_eflags.py (a 4-byte
+#       header edit; run by the host-side wrapper Makefile after psp-prxgen).
+#   (2) the ALLOC'd .MIPS.abiflags / .reginfo sections — discarded here via the
+#       linker script (belt-and-suspenders; old loaders predate these).
+# linkfile_nohw.lds = pspsdk's linkfile.prx + that one extra DISCARD line. NOTE the
+# .lds extension (NOT .prx): `make clean` does `rm -f *.prx` and would delete the
+# script mid-build if it were named .prx. Post-prxgen psp-objcopy on the .prx wipes
+# the PT_LOAD program headers, so the linker-script + header-patch combo is the
+# clean path.
+#
+# We rebuild LDFLAGS from scratch (matching what build_prx.mak produces) so we
+# control the -T flag precisely and avoid a duplicate-script error.
+# -Wl,-G,0 is also required: the prebuilt liblua.a in pspdev images >= 2025-06
+# was compiled with small-data enabled; without a matching GP threshold of 0 the
+# linker emits R_MIPS_GPREL16 overflow errors when linking our large PRX.
+LIBDIR_FLAGS := $(addprefix -L,$(LIBDIR))
+override LDFLAGS := $(LIBDIR_FLAGS) -Wl,-q,-T$(CURDIR)/linkfile_nohw.lds -nostartfiles -Wl,-zmax-page-size=128 -Wl,-G,0
+
 # Lua scripts embedded into lua_host. Source of truth = the .lua files; the
 # generated .lua.h are committed so the Docker build needs no python. After
 # editing a .lua, regenerate on the HOST with `make -f Makefile.psp embed`.
