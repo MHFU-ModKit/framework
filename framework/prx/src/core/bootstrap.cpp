@@ -66,8 +66,12 @@ static void reserve_self_memory(void)
     }
 }
 
-PSP_MODULE_INFO(MOD_NAME, 0, 1, 0);
-PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
+PSP_MODULE_INFO(MOD_NAME, 0, 1, 1);
+PSP_MAIN_THREAD_ATTR(0);
+/* Bound the newlib heap (Lua runs on its own 64 KB slab, not this heap). With the
+ * module_start-direct build (build_prx.mak, -nostartfiles) there is no crt0 heap
+ * grab, but keep this as a hard cap for any incidental newlib malloc. */
+PSP_HEAP_SIZE_KB(256);
 
 /* Sentinel cells in a quiet RAM region for host-debugger verification
  * even when log I/O NIDs are unsupported. Layout (u32s from base):
@@ -91,9 +95,13 @@ static void start_thread(const char *name, int (*entry)(SceSize, void *))
     }
 }
 
-int main(int argc, char *argv[])
+/* Real work, on our OWN thread (see module_start). Was main(); converted to the
+ * psplink loader pattern so the crt0 main()/heap machinery never runs at load — that
+ * machinery is what fails on MHFU's bare 24 MB partition (0x800200D9, before any
+ * log). build_prx.mak (-nostartfiles) drops the crt0 entirely. */
+static int framework_main(SceSize args, void *argp)
 {
-    (void)argc; (void)argv;
+    (void)args; (void)argp;
     mhfu_sentinel_set(0x00, 0xCAFE0001);
     mhfu_log("[framework] %s starting", MOD_NAME);
 
@@ -129,6 +137,23 @@ int main(int argc, char *argv[])
     for (;;) sceKernelDelayThread(1000 * 1000);
     return 0;
 }
+
+/* PRX entry (psplink loader pattern). The kernel calls this on the loader thread;
+ * we spawn our own thread (explicit 256 KB stack for the Lua VM setup) and return
+ * immediately, so no crt0 main()/heap reservation runs at load. */
+extern "C" int module_start(SceSize args, void *argp)
+{
+    SceUID th = sceKernelCreateThread("mhfu_framework", framework_main, 0x18,
+                                      0x40000, THREAD_ATTR_USER, NULL);
+    if (th >= 0) {
+        sceKernelStartThread(th, args, argp);
+        return 0;
+    }
+    return th;
+}
+
+/* newlib references _exit; we never exit, provide a stub. */
+extern "C" void _exit(int status) { (void)status; for (;;) sceKernelDelayThread(1000000); }
 
 extern "C" int module_stop(SceSize args, void *argp)
 {

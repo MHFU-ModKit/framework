@@ -1,28 +1,24 @@
 /*
- * mhfu_memprobe.prx — tiny diagnostic plugin (no libc printf -> a few KB).
+ * mhfu_memprobe.prx — tiny diagnostic plugin.
  *
- * Purpose: the full mhfu_framework.prx fails to load on real hardware with
- * 0x800200D9 (MEMBLOCK_ALLOC_FAILED) — out of room in MHFU's bare 24 MB user
- * partition. Before shrinking further (a risky custom Lua rebuild) we need the
- * ACTUAL free-memory budget. This plugin is a few KB — it loads if any plugin can —
- * and logs the free partition size to ms0:/PSP/mhfu_memprobe.txt every 2 s for ~1
- * minute: at the menu AND once a Giadrome quest is loaded (when the Brute allocates).
+ * Logs MHFU's free partition RAM to ms0:/PSP/mhfu_memprobe.txt every 2 s.
  *
- * Install: point game.txt at THIS prx (instead of mhfu_framework.prx), boot MHFU,
- * reach a Giadrome quest, then read ms0:/PSP/mhfu_memprobe.txt.
- *   - Lines present -> plugin loading works; the lowest maxfree is the budget.
- *   - File ABSENT  -> plugin loading itself is misconfigured (game.txt / ARK toggle),
- *     NOT a size problem.
+ * IMPORTANT (2026-06-25): built like psplink's loader — a user-mode plugin that
+ * defines module_start DIRECTLY and spawns its own thread, rather than using the
+ * pspsdk main() pattern. The main() pattern makes the crt0 auto-create a main
+ * thread + full newlib init at load, which FAILS on MHFU's bare 24 MB partition
+ * ("could not be started 0x800200D9", before any code runs). psplink's pattern
+ * loads fine on the same hardware, so we mirror it.
  */
 #include <pspkernel.h>
 #include <pspsysmem.h>
 #include <pspiofilemgr.h>
 #include <pspthreadman.h>
 
-PSP_MODULE_INFO("mhfu_memprobe", 0, 1, 0);
-PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
+PSP_MODULE_INFO("mhfu_memprobe", 0, 1, 1);
+PSP_MAIN_THREAD_ATTR(0);
 
-/* tiny unsigned -> decimal (avoids pulling newlib printf, which is ~140 KB) */
+/* tiny unsigned -> decimal (avoids pulling newlib printf) */
 static char *u2d(char *p, unsigned v)
 {
     char tmp[12]; int i = 0;
@@ -33,9 +29,9 @@ static char *u2d(char *p, unsigned v)
 }
 static char *puts_(char *p, const char *s) { while (*s) *p++ = *s++; return p; }
 
-int main(int argc, char *argv[])
+static int probe_thread(SceSize args, void *argp)
 {
-    (void)argc; (void)argv;
+    (void)args; (void)argp;
     int i;
     for (i = 0; i < 30; i++) {
         char line[128];
@@ -55,4 +51,16 @@ int main(int argc, char *argv[])
     return 0;
 }
 
+/* psplink pattern: own thread with an explicit stack, return immediately. */
+int module_start(SceSize args, void *argp)
+{
+    SceUID th = sceKernelCreateThread("mhfu_memprobe", probe_thread, 0x20,
+                                      0x2000, 0, NULL);
+    if (th >= 0) sceKernelStartThread(th, args, argp);
+    return 0;
+}
+
 int module_stop(SceSize args, void *argp) { (void)args; (void)argp; return 0; }
+
+/* newlib references this; provide a stub (we never exit). */
+void _exit(int status) { (void)status; }

@@ -1,14 +1,16 @@
-# Tiny diagnostic PRX — logs free partition memory to ms0. Build via the pspdev
-# Docker image (same as the framework). Produces mhfu_memprobe.prx (a few KB).
+# Tiny diagnostic PRX. Uses build_prx.mak (like psplink) — that links with
+# -nostartfiles (NO crt0), so we define module_start directly and the plugin does
+# NOT auto-create a main thread / grab a default heap at load. The crt0/main()
+# pattern (build.mak + prxspecs) is what fails to load on MHFU's bare 24 MB
+# partition (0x800200D9). Build via the pspdev Docker image.
 TARGET = mhfu_memprobe
 OBJS   = main.o
 
-CFLAGS   = -Os -G0 -Wall -ffunction-sections -fdata-sections
+CFLAGS   = -Os -G0 -Wall
 CXXFLAGS = $(CFLAGS)
 ASFLAGS  = $(CFLAGS)
-LDFLAGS  = -Wl,--gc-sections -Wl,-u,module_info
 
-BUILD_PRX = 1
+LIBS = -lpspsdk -lpspuser
 
 PSPSDK = $(shell psp-config --pspsdk-path)
-include $(PSPSDK)/lib/build.mak
+include $(PSPSDK)/lib/build_prx.mak
