@@ -115,6 +115,71 @@ inside the game process, never touches the CFW plugin loader → sidesteps all o
 **User REJECTED this** (doesn't want a modified-ISO / modified game). We pursue the plugin
 route instead.
 
+## 7. Extra RAM on real hardware — the exhaustive search (2026-06-26)
+
+The Brute's full moveset (and any monster with no native analog) needs >1.2 MB of
+*user-readable* scratch the engine can read its model from. We mapped the real PSP's RAM
+and tried every supported door. **All HITL on the user's own PSP (Slim, model=1, PRO-C2
+6.20).** Kernel query probe `framework/prx/memprobe/diag/v_partprobe.c`
+(`sceKernelQueryMemoryPartitionInfo`, read-only — safe even for kernel partitions; an
+earlier alloc-based v1 froze the kernel allocating from partition 5).
+
+**The partition map (decisive):**
+
+| Part | Start | Size | attr | Segment |
+|------|-------|------|------|---------|
+| 2 / 6 | `0x08800000` | 24 MB | `0x0F` user | Main user partition (game + XMB) |
+| 5 | `0x08400000` | 4 MB | `0x0F` user | **Volatile partition** — the only spare *user-readable* RAM |
+| 1 / 3 / 4 | `0x88000000` | 3+3+1 MB | `0x0C` kern | Kernel partitions |
+| 9 | `0x8A000000` | 24 MB | `0x0C` kern | **Extra RAM (Slim) — kernel-only** |
+| 8 / 12 / 11 | `0x8B800000`+ | 4 MB ea | `0x0C` kern | Extra RAM pieces — kernel-only |
+
+`attr 0x0F` = user-accessible, `0x0C` = kernel-only; `0x08…` = user virtual segment,
+`0x88…/0x8A…` = kernel segment. **The Slim's extra 32 MB exists but is entirely
+kernel-mapped** (`0x8A000000`), so the user-mode game engine cannot read it as configured.
+A partition-2 `PSP_SMEM_High` alloc lands at `0x09FA1C00` — top of the 24 MB, *not* the
+extra RAM. Without a remap, the only spare user-readable RAM is the **4 MB volatile**.
+
+**Every supported remap breaks MHFU EU:**
+
+| Mechanism | Result (HITL) |
+|-----------|---------------|
+| Grow partition 2 (PRO Recovery "Remove RAM restrictions" / `ForceHighMemory` MAX) | MHFU **hard-crashes the PSP** at boot (powers off). MHFU can't run with a resized p2. |
+| Size separate p8 (`sctrlHENSetMemory(24, 8)`, p2 stays 24) | returns rc=0, but **no live effect** (the partition map is byte-identical before/after — `sctrlHENSetMemory` is deferred-to-next-loadexec only); the deferred apply **freezes the next loadexec**; and **merely calling it poisons this session's exit** — the probe reset it to `(24,0)` and the HOME-exit *still* froze. |
+| Raw memory-protection remap of `0x0A000000` | off-limits (security constraint) **and** would crash MHFU like the p2 grow. |
+
+`ForceHighMemory` enum (`systemctrl_se.h`) = `{OFF, STABLE, MAX}`; PRO-C2 6.20 exposes it
+as a single on/off ("Remove RAM restrictions") = the aggressive grow → crash. No gentle
+STABLE on this CFW.
+
+**THE TEARDOWN INSIGHT + the launcher test (current, UNTESTED):** every freeze was a
+`loadexec` issued while **MHFU itself was tearing down** (self-reload from inside MHFU, the
+HOME-exit) with p8 pending. MHFU's *teardown*-with-p8 freezes; a *fresh boot* with p8 (p2
+untouched) might not. So the only untested configuration = apply p8 from a **clean launcher
+app**, then loadexec MHFU so MHFU only ever fresh-boots with p8. Built:
+`framework/prx/himem_launcher/` — a homebrew EBOOT (user-mode, `libpspsystemctrl_user`):
+`sctrlHENSetMemory(24,8)` → `sctrlSESetUmdFile(<ms0:/ISO/*.iso>)` →
+`sctrlKernelLoadExecVSHDisc("disc0:/PSP_GAME/SYSDIR/EBOOT.BIN", &param{key="game"})`. Run it
+from the XMB; `game.txt` = `mhfu_partprobe.prx` reports MHFU's live map. If a partition
+appears USER-mapped at `0x0A000000` → the extra-RAM path is open and the launcher is the
+production boot path. If kernel-only / MHFU crashes → extra RAM is a dead end for MHFU EU.
+`sctrlHENSetMemory` fails (-1) from vsh, so we MUST loadexec from the launcher (not route
+through the XMB). Failure is recoverable by a plain **power-cycle** (runtime setting clears
+on cold boot; no auto-loaded plugin → no Recovery needed).
+
+**THE ZERO-RISK FALLBACK (works today):** the Brute fits the **native 1.2 MB slot** without
+any extra RAM — swap the bloated anim sub[3] (his 77-clip moveset, the *only* reason the PAC
+exceeds 1.2 MB) for the native Tigrex anim → `tmp/brute_tigrex_v59_nativeanim.bin` (1198288 B
+≤ 1216512 native slot) → **same-size in-place inject** (`mhfu_inject_register`,
+`USE_RELOCATE=false`). Renders + textured + animated (native Tigrex motion) + damages, on
+every PSP model, no `sctrlHENSetMemory`, no XMB risk. The *general* real-HW technique for any
+ported monster: splice the model+textures into a native slot, drive with the swapped native
+monster's skeleton+anim. Only a *custom* moveset needs the extra RAM we can't get.
+
+Test tools (all `framework/prx/memprobe/diag/`): `v_partprobe` (safe query map),
+`v_p8test`/`v_p8test2` (self-reload / manual-relaunch p8 apply — both froze),
+`v_p8live` (set + live re-query, proved deferred-only).
+
 ## Key build/tooling facts
 
 - Builds in Docker `pspdev/pspdev:latest`. `make` (framework) / `make` in `memprobe/`.

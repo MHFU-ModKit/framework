@@ -112,8 +112,18 @@ typedef struct {
      * the transform reads OUR larger PMO and builds a larger decoded draw buffer —
      * the only no-disk path that can exceed the raw buffer's fixed heap block. */
     int            relocate;
-    uint32_t       orig_size;     /* size of obuf (original PAC) for the 256B match */
+    uint32_t       orig_size;     /* size of the ORIGINAL PAC (for the 256B match) */
     uint32_t       redirects;     /* diagnostic: # of a0 redirects performed */
+    /* Lazy VOLATILE staging (real HW): on hardware we must NOT stage the big PACs (and
+     * thus NOT lock the 4 MB volatile partition) at registration — holding volatile
+     * starved the savedata utility and froze "loading saves from memory card" at
+     * character select. Instead we keep the orig's 256-byte header here for matching,
+     * and stage the grown PAC into volatile only when the Brute model actually loads in
+     * a quest (stage_relocate(), from the get_subresource match). PPSSPP RAW mode (no
+     * volatile to conflict with) still stages eagerly at registration. */
+    char           orig_path[160];
+    uint8_t        orig_hdr[256];
+    int            staged;        /* grown PAC loaded into xram (buf valid)? */
 } inject_entry_t;
 
 static inject_entry_t g_tab[MHFU_INJECT_MAX];
@@ -145,6 +155,8 @@ static inline int gmem_ok(uint32_t a) { return a >= 0x08000000u && a < 0x0A00000
 
 static void arm_model_setup_hook(void);        /* defined below (game-thread detour) */
 static int  install_model_setup_hook(void);
+static int  stage_relocate(inject_entry_t *e); /* lazy: stage grown PAC -> xram (locks
+                                                * volatile on real HW), on first match */
 
 static inject_entry_t *find_entry(uint32_t file_id)
 {
@@ -176,6 +188,7 @@ enum { XR_UNDECIDED = 0, XR_RAW, XR_VOLATILE };
 static int      g_xram_mode;
 static uint32_t g_vol_base, g_vol_size, g_vol_bump;   /* volatile region */
 static int      g_vol_locked;                         /* 0=unattempted 1=ok -1=fail */
+static SceUID   g_part_uid = -1;   /* grown-partition-2 block (real HW, memgrow VSH) */
 
 /* Probe-write a word. Fault-safe ONLY behind the maxfree gate (never reached on
  * real hardware); also used per-block in RAW mode where the window is known good. */
@@ -241,7 +254,29 @@ static uint32_t xram_alloc(uint32_t n)
         g_xram_bump = a + n;
         return a;
     }
-    /* XR_VOLATILE */
+    /* XR_VOLATILE mode (real HW). PREFER the GROWN user partition: the memgrow VSH
+     * plugin (sctrlHENSetMemory) extended partition 2 into the extra RAM, so a
+     * PSP_SMEM_High block lands at the partition top = the extra RAM, clear of MHFU's
+     * heap (bottom) and USER-accessible (partition 2 is user RAM) — the engine reads
+     * our model directly, no kernel addresses, no contention with the savedata/streaming
+     * volatile partition (which TryLock-failed 0x802B0200 at section load). Only when
+     * the grow didn't apply (Phat / plugin not set) do we fall back to the 4 MB volatile
+     * partition. One Brute alloc, so try the partition once (g_part_uid < 0). */
+    if (g_part_uid < 0) {
+        SceUID uid = sceKernelAllocPartitionMemory(2, "mhfu_brute", PSP_SMEM_High, n, 0);
+        if (uid >= 0) {
+            uint32_t pa = (uint32_t)sceKernelGetBlockHeadAddr(uid);
+            g_part_uid = uid;
+            mhfu_log("[inject] xram = USER-PART(grown) @0x%08X (%uKB)",
+                     (unsigned)pa, (unsigned)(n / 1024));
+            RHW_DBG("[xram] USER-PART(grown) alloc need=%uKB addr=0x%08X uid=0x%08X",
+                    (unsigned)(n / 1024), (unsigned)pa, (unsigned)uid);
+            return pa;
+        }
+        RHW_DBG("[xram] USER-PART alloc FAIL need=%uKB maxfree=%uKB -> volatile fallback",
+                (unsigned)(n / 1024), (unsigned)(sceKernelMaxFreeMemSize() / 1024));
+    }
+    /* XR_VOLATILE fallback */
     if (!volatile_ensure()) return 0;
     uint32_t a = (g_vol_bump + 15u) & ~15u;       /* 16 B align */
     if (a + n > g_vol_base + g_vol_size) {
@@ -380,12 +415,17 @@ static int try_overwrite_buffer(uint32_t buf)
 static int try_redirect_pkg(mhfu_anchor_regs_t *regs)
 {
     uint32_t a0 = regs->a0;
-    if (!gmem_ok(a0)) return 0;
+    if (!gmem_ok(a0) || !gmem_ok(a0 + 255)) return 0;
     for (int i = 0; i < MHFU_INJECT_MAX; i++) {
         inject_entry_t *e = &g_tab[i];
-        if (!e->used || !e->relocate || !e->buf || !e->obuf || e->orig_size < 0x40) continue;
-        if (!gmem_ok(a0 + 255)) continue;
-        if (memcmp((const void *)a0, (const void *)e->obuf, 256) != 0) continue; /* not our species */
+        if (!e->used || !e->relocate || e->orig_size < 0x40) continue;
+        /* Match against the stored ORIGINAL header (256 B in user RAM — no xram/volatile
+         * needed just to recognize the engine's raw buffer). */
+        if (memcmp((const void *)a0, e->orig_hdr, 256) != 0) continue; /* not our species */
+        /* It's ours and we're in-quest at the model load -> NOW stage the grown PAC into
+         * volatile (locks it here, the moment it's really needed). PPSSPP RAW staged it
+         * at registration so e->buf is already set and this is a no-op. */
+        if (!e->buf && !stage_relocate(e)) continue;   /* stage failed -> let engine use native */
         regs->a0 = e->buf;                 /* -> grown PAC in xram */
         if (e->redirects == 0) {
             mhfu_log("[inject] RELOCATE redirect file=%u a0 0x%08X -> 0x%08X (grown %uB)",
@@ -466,9 +506,39 @@ static uint32_t load_pac_to_xram(const char *path, uint32_t *out_sz)
     return b;
 }
 
+/* Deferred staging of the grown PAC into xram. On real HW (VOLATILE) this is the point
+ * the 4 MB volatile partition is finally locked — driven from try_redirect_pkg, i.e. the
+ * instant the Brute model loads in a quest. On PPSSPP (RAW) it's called eagerly at
+ * registration (no volatile, nothing to defer). Idempotent: returns 1 if buf is staged. */
+static int stage_relocate(inject_entry_t *e)
+{
+    if (e->buf) return 1;
+    if (e->staged) return 0;          /* already attempted and failed — don't retry-spam */
+    e->staged = 1;
+    uint32_t gsz = 0;
+    e->buf = load_pac_to_xram(e->path, &gsz);   /* VOLATILE: volatile_ensure() locks here */
+    if (!e->buf) {
+        mhfu_log("[inject] reloc grown stage FAILED %s", e->path);
+        RHW_DBG("[realhw] relocate STAGE FAILED file=%u (volatile lock/read?) -> native",
+                (unsigned)e->file_id);
+        return 0;
+    }
+    e->file_size = gsz;        /* grown size */
+    e->buf_cap   = (gsz + 0xFFFu) & ~0xFFFu;
+    parse_subs(e);             /* parse the GROWN sub table (for diagnostics) */
+    mhfu_log("[inject] RELOCATE staged file=%u grown=%uB@0x%08X",
+             (unsigned)e->file_id, (unsigned)gsz, (unsigned)e->buf);
+    RHW_DBG("[realhw] relocate STAGED (in-quest) file=%u grown=%uB@0x%08X",
+            (unsigned)e->file_id, (unsigned)gsz, (unsigned)e->buf);
+    return 1;
+}
+
 /* RELOCATE registration (Phase 5 topology-grow): grown_path = the BIGGER edited PAC,
  * orig_path = the ORIGINAL (un-grown) PAC used to recognize the engine's raw buffer.
- * Both are loaded into xram now; at get_subresource we redirect a0 -> grown. */
+ * We keep only the orig's 256-byte header (user RAM) for matching; the grown PAC is
+ * staged into xram lazily at the get_subresource match. On RAW (PPSSPP) we stage it
+ * immediately (the proven path); on VOLATILE (real HW) we defer so the volatile
+ * partition stays free for the game's savedata/utility paths until a Brute quest. */
 int mhfu_inject_register_relocate(uint32_t file_id, const char *grown_path,
                                   const char *orig_path)
 {
@@ -483,28 +553,41 @@ int mhfu_inject_register_relocate(uint32_t file_id, const char *grown_path,
     e->used = 1;
     e->file_id = file_id;
     e->relocate = 1;
-    snprintf(e->path, sizeof(e->path), "%s", grown_path);
+    snprintf(e->path,      sizeof(e->path),      "%s", grown_path);
+    snprintf(e->orig_path, sizeof(e->orig_path), "%s", orig_path);
 
-    uint32_t gsz = 0, osz = 0;
-    e->buf  = load_pac_to_xram(grown_path, &gsz);
-    e->obuf = load_pac_to_xram(orig_path,  &osz);
-    if (!e->buf || !e->obuf) { e->used = 0; mhfu_log("[inject] reloc load FAILED"); return -3; }
-    e->file_size = gsz;        /* grown size */
-    e->buf_cap   = (gsz + 0xFFFu) & ~0xFFFu;
-    e->orig_size = osz;
-    parse_subs(e);             /* parse the GROWN sub table (for diagnostics) */
+    /* Read only the orig's 256-byte header + its size — enough to recognize the engine's
+     * raw buffer at get_subresource. No xram, no volatile lock. */
+    SceUID ofd = sceIoOpen(orig_path, PSP_O_RDONLY, 0);
+    if (ofd < 0) { e->used = 0; mhfu_log("[inject] reloc orig open FAILED %s", orig_path); return -3; }
+    int hrd = sceIoRead(ofd, e->orig_hdr, (int)sizeof(e->orig_hdr));
+    SceOff osz = sceIoLseek(ofd, 0, PSP_SEEK_END);
+    sceIoClose(ofd);
+    if (hrd != (int)sizeof(e->orig_hdr) || osz < 0x40) {
+        e->used = 0; mhfu_log("[inject] reloc orig header short %s", orig_path); return -3;
+    }
+    e->orig_size = (uint32_t)osz;
 
     if (!g_hook_installed) {
         int rc = mhfu_install_trampoline(GETSUB_ADDR, (uint32_t)&mhfu_dispatch_get_subresource);
         g_hook_installed = (rc == 0);
         mhfu_log("[inject] get_subresource trampoline @0x%08X rc=%d", GETSUB_ADDR, rc);
     }
-    mhfu_log("[inject] RELOCATE register file=%u grown=%uB@0x%08X orig=%uB@0x%08X",
-             (unsigned)file_id, (unsigned)gsz, (unsigned)e->buf,
-             (unsigned)osz, (unsigned)e->obuf);
-    RHW_DBG("[realhw] relocate registered file=%u grown=%uB@0x%08X orig=%uB@0x%08X",
-            (unsigned)file_id, (unsigned)gsz, (unsigned)e->buf,
-            (unsigned)osz, (unsigned)e->obuf);
+
+    /* Decide region now (cheap, fault-safe). RAW (emulator) -> stage eagerly, proven.
+     * VOLATILE (hardware) -> defer staging to the first in-quest match (stage_relocate). */
+    if (!g_xram_mode) mhfu_xram_platform_init();
+    if (g_xram_mode == XR_VOLATILE) {
+        mhfu_log("[inject] RELOCATE register (lazy/volatile) file=%u grown=%s orig=%s (%uB)",
+                 (unsigned)file_id, grown_path, orig_path, (unsigned)osz);
+        RHW_DBG("[realhw] relocate REGISTERED (lazy) file=%u grown=%s orig_size=%uB"
+                " — volatile deferred to quest", (unsigned)file_id, grown_path, (unsigned)osz);
+        return 0;
+    }
+    /* RAW: stage now (no volatile to conflict with). */
+    if (!stage_relocate(e)) { e->used = 0; mhfu_log("[inject] reloc eager stage FAILED"); return -3; }
+    mhfu_log("[inject] RELOCATE register file=%u grown=%uB@0x%08X orig=%uB",
+             (unsigned)file_id, (unsigned)e->file_size, (unsigned)e->buf, (unsigned)osz);
     return 0;
 }
 

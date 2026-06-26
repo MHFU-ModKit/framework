@@ -23,15 +23,39 @@
 #include <pspsysmem.h>
 #include <pspiofilemgr.h>
 #include <pspthreadman.h>
+#include <pspsdk.h>   /* pspSdkSetK1 — clear the user-permission gate so a KERNEL
+                         thread may call the ForUser sceKernelLoadModule syscall
+                         (else 0x80020149 ILLEGAL_PERM_CALL). */
 
-PSP_MODULE_INFO("mhfu_boot", 0, 1, 1);
+/* KERNEL module: proven on real HW (2026-06-26) that the USER partition is FULL at
+ * the boot plugin-load hook (even a 2.8 KB user PRX OOMs 0x800200D9), but the KERNEL
+ * partition has room (usbhostfs 16KB + our kprobe both loaded). A kernel module loads
+ * here; it then waits until in-game (where the user partition has a stable ~2.18 MB
+ * free) and sceKernelLoadModule's the USER-mode framework into that space. */
+PSP_MODULE_INFO("mhfu_boot", PSP_MODULE_KERNEL, 1, 1);
 PSP_MAIN_THREAD_ATTR(0);
 
 #define FRAMEWORK_NAME "mhfu_framework.prx"
 #define FALLBACK_PATH  "ms0:/PSP/PLUGINS/mhfu_framework/" FRAMEWORK_NAME
-/* Need a contiguous block for the framework's ~439 KB image + module-manager
- * overhead; gate the load on >=512 KB free (with margin). */
-#define LOAD_THRESHOLD 0x80000u
+/* WHEN to load the framework. NOT on free memory (the kernel-lib sceKernelMaxFreeMemSize
+ * returns an error 0x8002013A from a kernel thread), and NOT in-area: the framework
+ * installs its engine hooks — the Giadrome->Tigrex buildTargets swap — via a JIT-cold
+ * "quiet gate" that only opens while screen_state is a TITLE/MENU (0x04/0x01). If we
+ * load the framework in the VILLAGE (17), every menu has already passed, the quiet gate
+ * never opens, and the swap hook is queued-but-never-installed (the map-paint tick still
+ * runs, so the mod LOOKS alive — but no swap; HW-confirmed 2026-06-26). So load at a
+ * TITLE/MENU, the same JIT-cold window the quiet gate needs. Loading this early is safe
+ * now that volatile is locked LAZILY (only at the in-quest model load) — it no longer
+ * touches the savedata path that the old eager-volatile load froze. */
+#define MHFU_SCREEN_STATE 0x08A8CA48u   /* u8 screen-state oracle */
+#define MHFU_SCR_MENU     1             /* main menu (also the brief zone-load flag) */
+#define MHFU_SCR_TITLE    4             /* title screen */
+/* Fallback: load anyway this many seconds past the settle if no menu is seen (e.g. a
+ * future build moves the cell). Harmless — lazy volatile makes any load point safe. */
+#define LOAD_FALLBACK_S   60
+/* First ms0 I/O must wait out the boot/loadexec disc read (the fault window was the
+ * first ~2 s; kprobe proved I/O at 20 s is safe). */
+#define BOOT_SETTLE_US (15 * 1000 * 1000)
 
 /* tiny libc-free helpers (keeps this PRX a few KB, pulls no newlib) */
 static unsigned slen(const char *s) { unsigned n = 0; while (s[n]) n++; return n; }
@@ -82,30 +106,37 @@ static void build_path(SceSize args, void *argp)
 static int boot_thread(SceSize args, void *argp)
 {
     build_path(args, argp);
+    /* Wait out the boot/loadexec disc read before ANY ms0 I/O (kernel-thread safe). */
+    sceKernelDelayThread(BOOT_SETTLE_US);
     log_path("[boot] framework=", g_path);
-    log_kv("[boot] start maxfree=", (unsigned)sceKernelMaxFreeMemSize());
 
     int i;
-    for (i = 0; i < 60; i++) {
-        unsigned mf = (unsigned)sceKernelMaxFreeMemSize();
-        if (mf >= LOAD_THRESHOLD) {
+    for (i = 0; i < 600; i++) {   /* up to ~10 min, 1 s poll */
+        unsigned char scr = *(volatile unsigned char *)MHFU_SCREEN_STATE;
+        int quiet = (scr == MHFU_SCR_MENU || scr == MHFU_SCR_TITLE);
+        if (quiet || i >= LOAD_FALLBACK_S) {
+            log_kv(quiet ? "[boot] quiet menu load, screen_state="
+                         : "[boot] fallback load, screen_state=", scr);
+            /* Clear K1 around the load (harmless; the kernel ModuleMgrForKernel path
+             * has no permission gate, but keep it for the kernel-space path pointer). */
+            unsigned int k1 = pspSdkSetK1(0);
             SceUID mod = sceKernelLoadModule(g_path, 0, NULL);
             if (mod >= 0) {
-                log_kv("[boot] loadmodule OK at maxfree=", mf);
                 int st = sceKernelStartModule(mod, args, argp, NULL, NULL);
+                pspSdkSetK1(k1);
+                log_kv("[boot] loadmodule OK modid=", (unsigned)mod);
                 log_kv("[boot] startmodule rc=", (unsigned)st);
                 log_msg("[boot] framework loaded — done");
                 return 0;
             }
-            log_kv("[boot] loadmodule FAILED, maxfree was=", mf);
-            log_kv("[boot]   rc=", (unsigned)mod);
-        } else {
-            log_kv("[boot] waiting maxfree=", mf);
+            pspSdkSetK1(k1);
+            log_kv("[boot] loadmodule FAILED rc=", (unsigned)mod);
+            return 0;   /* a real load failure won't fix itself — don't retry-spam */
         }
+        if ((i % 5) == 0) log_kv("[boot] waiting for menu, screen_state=", scr);
         sceKernelDelayThread(1000 * 1000);  /* 1 s */
     }
-    log_msg("[boot] GAVE UP after 60s — partition 2 never had a 512KB block "
-            "(=> absolute capacity, not timing; the framework must shrink)");
+    log_msg("[boot] GAVE UP — never reached in-area (screen_state never == 17)");
     return 0;
 }
 
