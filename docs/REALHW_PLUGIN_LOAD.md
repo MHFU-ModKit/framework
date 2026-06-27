@@ -291,6 +291,36 @@ the run. (The §7 v59-native-anim fallback stays for the zero-extra-RAM case.)
 (once, at first village = post-savedata, before any depart) + `mhfu_vobs_flush()` (ms0-gated
 ring drain); `registry.cpp` `mhfu_dispatch_quest_beginning` calls the (now-disabled) recon arm.
 
+## 10. Screen capture — record the real PSP screen (no capture card, 2026-06-28)
+
+Capture the live game (e.g. the Brute) from real hardware without an AV-out capture
+card. Subsystem: `framework/prx/src/core/capture.cpp` (a private lazy thread grabs the
+framebuffer via `sceDisplayGetFrameBuf`, downscales, streams length-prefixed records:
+`u32 'PSPF' | frame | w | h | fmt | bpp | len | payload`). Lua bindings `mhfu.capture(on
+[,scale,interval,path])` / `mhfu.capture_status()`; driven from `brute_tigrex.lua`
+(auto-start in-quest). Host tool: `tools/psp_capture/` (Python + ffmpeg → PNG/mp4).
+
+- **Two targets.** `ms0:/…` = write to the Memory Stick (no USB) — **the working path**.
+  `host0:/…` = live over psplink usbhostfs.
+- **Live-over-USB is BLOCKED on this setup.** PSP side works end-to-end (`usbhostfs.prx`
+  loaded via a capture GAME.TXT; the framework does the bring-up itself —
+  `sceUsbStart(PSP_USBBUS_DRIVERNAME)` + `sceUsbStart("USBHostFSDriver")` +
+  `sceUsbActivate(0x1C9)`, all rc=0). But the Mac↔PSP handshake never completes:
+  `host0:` `io_open` returns -1 because `usb_connected()` is false. `usbhostfs_pc` on
+  macOS **must run as root** (CLI binaries can't hold a USB entitlement → `libusb_claim`
+  fails) — and even as root it stayed "waiting for device": **PRO CFW does not present
+  the hostfs USB gadget (`054C:01C9`) during a retail MHFU run.** `usbhostfs.prx` ALONE
+  is sufficient (psplink.prx not needed); the wall is the CFW reserving USB.
+- **ms0 flow (proven, shipped a 56 s / 2.1 MB mp4):** play → **RETREAT** from the quest
+  (NOT the HOME button — HOME kills the game so the capture fd never `sceIoClose`s and
+  the FAT chain isn't flushed past ~44 MB → truncated/unreadable file) → USB
+  mass-storage → `psp-capture --from-file "/Volumes/NO NAME/PSP/cap/stream.bin" --mp4
+  out.mp4`. macOS reads the FAT volume in blocks (`dd bs=1m`) — a single large `read()`
+  throws EINVAL. MHFU framebuffer format is **5551** (→ ffmpeg `bgr555le`), not 565.
+- **Currently DISABLED** in the shipped build (`brute_tigrex.lua` `CAPTURE_ENABLED =
+  false` → zero capture code runs); all code retained. Re-enable: set it `true`.
+- Full detail: `tools/psp_capture/README.md`, memory `realhw-usb-screen-capture`.
+
 ## Key build/tooling facts
 
 - Builds in Docker `pspdev/pspdev:latest`. `make` (framework) / `make` in `memprobe/`.

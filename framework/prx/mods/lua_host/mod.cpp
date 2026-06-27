@@ -641,6 +641,40 @@ static int lb_buttons(lua_State *L)
     return 3;
 }
 
+/* --- USB screen capture (capture.cpp) ---
+ * mhfu.capture(on [, scale [, interval_ms [, path]]]) -> running:bool
+ *   on=true starts streaming the framebuffer to host0:/cap/stream.bin (psplink
+ *   usbhostfs). scale 1=full 2=half(default), interval_ms ~grab period (66≈15fps).
+ *   Capture runs on its own thread — an absent USB host never blocks the game.
+ * mhfu.capture_status() -> active:bool, frames:int, kb:int, last_err:int */
+extern "C" int  mhfu_capture_set(int on);
+extern "C" int  mhfu_capture_status(int *frames, int *kb, int *err);
+extern "C" void mhfu_capture_configure(int scale, int interval_ms, const char *path);
+
+static int lb_capture(lua_State *L)
+{
+    int on = lua_toboolean(L, 1);
+    if (on && !lua_isnoneornil(L, 2)) {
+        int scale = (int)luaL_optinteger(L, 2, 2);
+        int iv    = (int)luaL_optinteger(L, 3, 66);
+        const char *path = luaL_optstring(L, 4, 0);
+        mhfu_capture_configure(scale, iv, path);
+    }
+    lua_pushboolean(L, mhfu_capture_set(on));
+    return 1;
+}
+
+static int lb_capture_status(lua_State *L)
+{
+    int f = 0, kb = 0, err = 0;
+    int active = mhfu_capture_status(&f, &kb, &err);
+    lua_pushboolean(L, active);
+    lua_pushinteger(L, f);
+    lua_pushinteger(L, kb);
+    lua_pushinteger(L, err);
+    return 4;
+}
+
 /* ===========================================================================
  * Freecam / cam-tick override engine  (orbit-input override)
  *
@@ -1430,6 +1464,8 @@ static const luaL_Reg k_mhfu_api[] = {
     { "combat_register_all",  lb_combat_register_all },
     { "clones_set",       lb_clones_set },
     { "buttons",          lb_buttons },
+    { "capture",          lb_capture },
+    { "capture_status",   lb_capture_status },
     { "freecam",          lb_freecam },
     { "freecam_active",   lb_freecam_active },
     { "cam_snap_disable", lb_cam_snap_disable },

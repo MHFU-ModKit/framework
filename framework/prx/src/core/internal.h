@@ -100,6 +100,16 @@ void mhfu_inject_xram_recon_tick(uint8_t scr);
 void mhfu_vobs_install(void);
 void mhfu_vobs_flush(void);
 
+/* --- capture (capture.cpp) --- */
+/* Low-fps framebuffer screen capture. Streams records to a target path: ms0:
+ * (write to the Memory Stick, pull via USB mass-storage after) or host0: (live
+ * over psplink usbhostfs). Lazy: nothing is allocated/spawned until
+ * mhfu_capture_set(1); all I/O runs on a private thread so the game never blocks.
+ * Disabled in the shipped build via brute_tigrex.lua's CAPTURE_ENABLED flag. */
+int  mhfu_capture_set(int on);                                    /* 1=start 0=stop; returns running */
+int  mhfu_capture_status(int *frames, int *kb, int *err);         /* returns active(0/1) */
+void mhfu_capture_configure(int scale, int interval_ms, const char *path); /* locked while active */
+
 /* --- bootstrap (bootstrap.cpp) --- */
 void mhfu_sentinel_set(uint32_t offset, uint32_t value);
 #define MHFU_SENTINEL_BASE 0x08AEFFE0u
