@@ -1,35 +1,45 @@
 /*
- * mhfu_himem_launcher — homebrew EBOOT launched from the XMB (PSP/GAME).
+ * mhfu_himem_launcher — KERNEL-mode homebrew EBOOT launched from the XMB (PSP/GAME).
  *
- * THE IDEA (user's): every freeze we hit was a `loadexec` issued while MHFU was the
- * one tearing down (self-reload, HOME-exit) with the p8 partition pending. This
- * launcher flips that: it sizes the SEPARATE p8 partition (sctrlHENSetMemory(24,N),
- * partition 2 stays 24 MB so MHFU's own RAM is untouched), then loadexecs the MHFU
- * ISO directly — so MHFU only ever experiences a FRESH BOOT with p8; the *launcher*
- * tears down, not MHFU. A query plugin (game.txt) reports the map on MHFU's side.
+ * GOAL: size the SEPARATE p8 partition (sctrlHENSetMemory(24,N) — partition 2 stays
+ * 24 MB so MHFU's own RAM is untouched), then boot the MHFU ISO directly, so MHFU only
+ * ever experiences a FRESH BOOT with p8 (the launcher tears down, not MHFU — MHFU's
+ * teardown-with-p8 is what froze). A query plugin (game.txt) reports MHFU's live map.
  *
- * sctrlHENSetMemory fails (-1) from vsh, so we must NOT route through the XMB — the
- * launcher must do the disc loadexec itself.
+ * v1 failed 0x80010087: it used sctrlSESetUmdFile (records the path only) — the ISO
+ * filesystem was never MOUNTED, so MHFU booted with no readable disc0. v2 tried KERNEL
+ * mode too and failed to LOAD (0x8002013C LIBRARY_NOTFOUND — build.mak auto-links user
+ * display/net libs whose imports don't resolve in a kernel module). v3 = back to
+ * USER mode (which loads + runs fine; the CFW user stubs syscall into the same kernel
+ * code) + the REAL fix: sctrlSESetDiscType + sctrlSEMountUmdFromFile, then
+ * sctrlKernelLoadExecVSHDisc.
  *
- * SAFE FAILURE: if no ISO is found we just exit to the XMB (no loadexec). If the
- * loadexec wedges, a plain power-cycle clears the runtime memory setting (no plugin
- * is auto-loaded by this path, so no Recovery needed). Log: ms0:/PSP/mhfu_launcher.txt
+ * SET_P8 (default 1): build with -DSET_P8=0 (or flip the default) for the ISO-launch
+ * isolation variant — confirms MHFU boots via the launcher before testing p8.
+ *
+ * SAFE FAILURE: no ISO -> exit to XMB, no loadexec. A wedge clears on a power-cycle
+ * (runtime memory setting, nothing auto-loads). Log: ms0:/PSP/mhfu_launcher.txt
  */
 #include <pspkernel.h>
 #include <pspiofilemgr.h>
 #include <pspthreadman.h>
 #include <systemctrl.h>
-#include <systemctrl_se.h>          /* sctrlSESetUmdFile */
+#include <systemctrl_se.h>          /* sctrlSESetDiscType, sctrlSEMountUmdFromFile */
 #include <psploadexec_kernel.h>     /* SceKernelLoadExecVSHParam */
 #include <string.h>
 
 PSP_MODULE_INFO("MHFUHIMEM", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
 
-#define P8_MB       8
-#define DISC_EBOOT  "disc0:/PSP_GAME/SYSDIR/EBOOT.BIN"
-#define ISO_DIR     "ms0:/ISO"
-#define LOGF        "ms0:/PSP/mhfu_launcher.txt"
+#ifndef SET_P8
+#define SET_P8 1
+#endif
+
+#define P8_MB             8
+#define DISC_EBOOT        "disc0:/PSP_GAME/SYSDIR/EBOOT.BIN"
+#define ISO_DIR           "ms0:/ISO"
+#define LOGF              "ms0:/PSP/mhfu_launcher.txt"
+#define ISO_DISC_GAME     0x10      /* ISO_DISC_TYPE_GAME */
 
 static void logp(const char *s){
     SceUID fd=sceIoOpen(LOGF, PSP_O_WRONLY|PSP_O_CREAT|PSP_O_APPEND, 0777);
@@ -41,7 +51,7 @@ static void logkv(const char *s, unsigned v){
     int j; for(j=28;j>=0;j-=4) b[i++]=h[(v>>j)&0xF]; b[i]=0; logp(b);
 }
 
-/* find the first *.iso / *.cso in ms0:/ISO -> out = "ms0:/ISO/<name>" */
+/* first *.iso / *.cso in ms0:/ISO -> out = "ms0:/ISO/<name>" */
 static int find_iso(char *out, int outsz){
     SceUID d=sceIoDopen(ISO_DIR);
     if(d<0){ logkv("sceIoDopen(ms0:/ISO) failed rc=", (unsigned)d); return 0; }
@@ -69,7 +79,7 @@ static int find_iso(char *out, int outsz){
 int main(int argc, char *argv[]){
     (void)argc;(void)argv;
     sceKernelDelayThread(500*1000);
-    logp("=== mhfu_himem_launcher ===");
+    logp("=== mhfu_himem_launcher v2 (kernel-mode + mount) ===");
 
     char iso[256];
     if(!find_iso(iso, sizeof(iso))){
@@ -80,12 +90,18 @@ int main(int argc, char *argv[]){
     }
     logp(iso);
 
+#if SET_P8
     int rc = sctrlHENSetMemory(24, P8_MB);     /* p2 stays 24, size separate p8 */
     logkv("sctrlHENSetMemory(24,8) rc=", (unsigned)rc);
+#else
+    logp("SET_P8=0 — NOT sizing p8 (ISO-launch isolation test)");
+#endif
 
-    sctrlSESetUmdFile(iso);                     /* mount this ISO as disc0 on next boot */
-    logp("set umd file; loadexec disc0 EBOOT ...");
-    sceKernelDelayThread(1*1000*1000);          /* flush log before teardown */
+    sctrlSESetDiscType(ISO_DISC_GAME);                 /* tell the system: GAME ISO */
+    int mrc = sctrlSEMountUmdFromFile(iso, 0, 1);      /* MOUNT the ISO filesystem as disc0 */
+    logkv("sctrlSEMountUmdFromFile rc=", (unsigned)mrc);
+    logp("loadexec disc0 EBOOT ...");
+    sceKernelDelayThread(1*1000*1000);                 /* flush log before teardown */
 
     struct SceKernelLoadExecVSHParam param;
     memset(&param,0,sizeof(param));
@@ -97,7 +113,9 @@ int main(int argc, char *argv[]){
 
     /* only reached if the loadexec failed */
     logp("!! loadexec returned — failed; resetting + exit to XMB");
+#if SET_P8
     sctrlHENSetMemory(24, 0);
+#endif
     sceKernelDelayThread(800*1000);
     sctrlKernelExitVSH(NULL);
     return 0;

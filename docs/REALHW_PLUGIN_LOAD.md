@@ -180,6 +180,41 @@ Test tools (all `framework/prx/memprobe/diag/`): `v_partprobe` (safe query map),
 `v_p8test`/`v_p8test2` (self-reload / manual-relaunch p8 apply — both froze),
 `v_p8live` (set + live re-query, proved deferred-only).
 
+## 8. Character-select freeze — a self-inflicted regression, reverted (2026-06-27)
+
+**Symptom.** While chasing the volatile "squat alongside the game" + ms0-safety work, real
+HW began freezing on the **main-menu → Continue → character-select** transition (right as the
+SAVEDATA "reading memory stick" utility inits), *before* the savestate slots appear. Boot log
+showed `framework loaded — done` at the menu, then a freeze; `framework.log` empty (never
+reached gameplay). Reproduced on every attempt, identical spot.
+
+**Two leading theories — BOTH RULED OUT by HITL:**
+- **Footprint / savedata RAM contention.** Split the framework init in two — phase 1 (menu):
+  only the VM lock + a tiny waiter thread; phase 2 (first village, `screen_state==22`): the
+  heavy Lua VM/slab/filebuf/threads + ms0 script reads. This removed ~240 KB of USER-partition
+  allocation and all ms0 activity from the character-select window. **Still froze** ⇒ not
+  footprint, not menu-time ms0 contention.
+- **Bootstrap load-timing / partition-state-at-load.** Reverted the bootstrap to the
+  known-good **first-flicker** gate (load at the first TITLE/MENU). Boot log confirmed it
+  loaded at `screen_state=4` (TITLE, earliest possible). **Still froze** ⇒ not load timing.
+
+**Conclusion.** The culprit is a **framework SOURCE change this session** — the
+`mhfu_ms0_io_safe()` ms0-gating (added to `log.cpp`, `registry.cpp` spawn-poll,
+`lua_host` worker, `inject.cpp` tick) is the prime suspect: it is the only change present in
+*every* frozen build and the only one touching the menu/character-select window. The paradox:
+static analysis shows it only *reduces* framework activity there (the working baseline did
+*more* — ungated logging + ungated spawn-poll + ungated `sceIoGetstat` — and was fine), so the
+mechanism is unresolved. Environmental causes (MS card, CFW state) are not fully excluded.
+
+**Action taken.** Reverted the framework **and** bootstrap to commit `58737dd`, rebuilt,
+redeployed — and HITL-confirmed the working baseline (boot → save-select → Giadrome quest →
+native Tigrex + swap). The split-init *idea* (defer Lua VM/slab/threads + ms0 to the village,
+keep only JIT-cold hook queuing at the menu; `mhfu_quest_init` must then queue the buildTargets
+swap wrapper UNCONDITIONALLY since there's no menu between the village and the quest) is sound
+and **saved** in `tmp/split-init-saved/` (force-tracked: the full diff patch + the two key
+files + README). To root-cause: re-introduce the session's changes **one at a time on HW**,
+testing character-select after each — start with the ms0-gating.
+
 ## Key build/tooling facts
 
 - Builds in Docker `pspdev/pspdev:latest`. `make` (framework) / `make` in `memprobe/`.

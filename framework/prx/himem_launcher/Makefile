@@ -8,7 +8,8 @@ CFLAGS   = -Os -G0 -Wall
 CXXFLAGS = $(CFLAGS)
 ASFLAGS  = $(CFLAGS)
 
-# user-mode CFW stubs (sctrlHENSetMemory / sctrlSESetUmdFile / sctrlKernelLoadExecVSHDisc)
+# user-mode CFW stubs — sctrlSEMountUmdFromFile/LoadExecVSHDisc work from user mode
+# (they syscall into the kernel CFW). User EBOOT loads fine; kernel EBOOT didn't.
 LIBS = -lpspsystemctrl_user
 
 EXTRA_TARGETS   = EBOOT.PBP
