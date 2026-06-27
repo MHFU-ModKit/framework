@@ -4,11 +4,17 @@
 #include <stdio.h>
 
 #include "mhfu/log.h"
+#include "mhfu/memory.h"   /* mhfu_ms0_io_safe — never touch ms0 during savedata */
 
 static SceUID g_log_fd = -1;
 
 extern "C" void mhfu_log(const char *fmt, ...)
 {
+    /* Suppress ALL ms0 access (open included) unless in active gameplay (17/22).
+     * Writing the Memory Stick while the SAVEDATA utility loads/saves freezes the PSP
+     * (shared non-reentrant MS driver). Logging is diagnostic-only, so dropping
+     * boot/menu lines is harmless; the in-quest/village lines we analyze still write. */
+    if (!mhfu_ms0_io_safe()) return;
     char buf[256];
     va_list ap;
     va_start(ap, fmt);

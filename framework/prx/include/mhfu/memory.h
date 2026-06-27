@@ -16,6 +16,10 @@ extern "C" {
 
 /* Named cells (resolved through the active region table). */
 uint8_t  mhfu_get_screen_state(void);     /* 0x08A8CA48; 17 = in quest area */
+/* 1 only during active gameplay (screen_state 17 in-quest or 22 village). Gate ALL
+ * framework Memory Stick I/O on this so we never race the SAVEDATA utility (which
+ * borrows the non-reentrant MS driver at character-select / save dialogs -> freeze). */
+int      mhfu_ms0_io_safe(void);
 uint16_t mhfu_get_area_index(void);        /* 0x08B0C7DC; visible map section */
 uint32_t mhfu_get_quest_timer(void);       /* 0x09A05DD0; frames @ 30 Hz */
 uint32_t mhfu_get_player_hp(void);

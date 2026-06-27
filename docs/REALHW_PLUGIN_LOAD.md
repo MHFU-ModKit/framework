@@ -215,6 +215,18 @@ and **saved** in `tmp/split-init-saved/` (force-tracked: the full diff patch + t
 files + README). To root-cause: re-introduce the session's changes **one at a time on HW**,
 testing character-select after each — start with the ms0-gating.
 
+**BISECT (2026-06-27, in progress).** The session delta over `58737dd` splits into 6 groups:
+**A** ms0-gating (`mhfu_ms0_io_safe` + its gates in log/registry/lua_host/inject), **B** volatile
+recon (inject.cpp xram functions, `g_xram_lock_enabled=0`), **C** `install.cpp` village-gated
+volatile poll, **D** `registry.cpp` quest-begin `arm_prelock`, **E** split-init (lua_host
+phase1/phase2), **F** quest unconditional buildTargets. Re-applied on the clean baseline one
+group at a time:
+- **A alone → PASS (HITL).** Char-select survived, loaded into the Giadrome quest. **ms0-gating
+  is EXONERATED** — overturns the §8 "prime suspect" verdict. (The paradox is resolved: A really
+  is inert/safer, as static analysis said.)
+- Next: **B+C** (volatile recon + village poll — the from-boot continuous additions, and the
+  behavioral delta of the first frozen "recon" build over A). Then D, E, F.
+
 ## Key build/tooling facts
 
 - Builds in Docker `pspdev/pspdev:latest`. `make` (framework) / `make` in `memprobe/`.

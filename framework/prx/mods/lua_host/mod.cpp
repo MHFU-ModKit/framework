@@ -1662,6 +1662,11 @@ static void prime_tracked(void)
  * attempt so a file with a compile error doesn't reload-spin every poll. */
 static void hot_reload_scan(void)
 {
+    /* CONTINUOUS ms0 I/O (Dopen/Dread/Getstat/Open). Skip entirely unless in active
+     * gameplay (17/22): scanning the Memory Stick while the SAVEDATA utility loads
+     * your save (boot character-select) or saves (mid-game) races the non-reentrant
+     * MS driver and FREEZES the PSP — the intermittent character-select hang. */
+    if (!mhfu_ms0_io_safe()) return;
     SceUID d = sceIoDopen(LUA_MODS_DIR);
     if (d < 0) return;
     int reloaded = 0;
@@ -1766,6 +1771,11 @@ static int lua_host_setup(void)
 static void call_tick(void)
 {
     if (!g_have_tick) return;
+    /* mhfu_tick runs mod logic that READS and WRITES game memory (e.g. the paintball
+     * cheat write). Only fire it during active gameplay (17/22) — running it at the
+     * main-menu -> character-select transition, while the SAVEDATA utility initialises,
+     * is what froze the save load. Mod ticks are meaningless outside gameplay anyway. */
+    if (!mhfu_ms0_io_safe()) return;
     if (!lua_enter()) return;
     lua_getglobal(g_L, "mhfu_tick");
     if (lua_pcall(g_L, 0, 0, 0) != LUA_OK) {

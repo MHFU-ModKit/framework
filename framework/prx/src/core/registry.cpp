@@ -156,6 +156,11 @@ extern "C" int mhfu_monster_spawn_poll_thread(SceSize args, void *argp)
     (void)args; (void)argp;
     for (;;) {
         sceKernelDelayThread(200 * 1000);   /* 5 Hz */
+        /* Only scan the registry + fire spawn/death during active gameplay (17/22).
+         * Reading/dispatching at the main-menu -> character-select transition (where
+         * the SAVEDATA utility is initialising) is what froze the save load — the
+         * framework must be inert against game memory until we're actually in-game. */
+        if (!mhfu_ms0_io_safe()) continue;
         for (int slot = 1; slot < MHFU_ENTITY_REGISTRY_SLOTS; slot++) {
             uint32_t cur  = mhfu_entity_at(slot);
             uint32_t prev = g_last_entity_ptrs[slot];

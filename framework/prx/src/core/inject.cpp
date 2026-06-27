@@ -16,6 +16,7 @@
  */
 #include "mhfu/inject.h"
 #include "mhfu/log.h"
+#include "mhfu/memory.h"       /* mhfu_ms0_io_safe — never touch ms0 during savedata */
 #include "mhfu/mips.h"         /* mips_* encoders for the game-thread detour */
 #include "mhfu/ai.h"           /* mhfu_on_ai_overlay_loaded (JIT-cold install window) */
 #include "mhfu/events.h"       /* MHFU_EVENT_MAP_SECTION_ENTERED repatch */
@@ -135,6 +136,10 @@ static int            g_hook_installed;
  * whether the redirect fired). Harmless on PPSSPP (writes to its memstick ms0). */
 static void realhw_dbg(const char *fmt, ...)
 {
+    /* Per-call open/write/close on ms0 — never during the savedata window (freezes the
+     * non-reentrant MS driver). Only the in-quest/village diagnostics survive, which is
+     * exactly where the usage probe + redirect lines we care about are written. */
+    if (!mhfu_ms0_io_safe()) return;
     char line[224];
     va_list ap;
     va_start(ap, fmt);
@@ -725,6 +730,10 @@ void mhfu_inject_burst(void)
 
 void mhfu_inject_tick(void)
 {
+    /* Per-tick sceIoGetstat below is ms0 I/O — skip it outside active gameplay so it
+     * can't race the savedata utility (relocate entries already skip it; this also
+     * covers any non-relocate mod). */
+    if (!mhfu_ms0_io_safe()) return;
     /* Keep each edited PAC fresh in xram; reload when the memstick file changes. */
     for (int i = 0; i < MHFU_INJECT_MAX; i++) {
         inject_entry_t *e = &g_tab[i];

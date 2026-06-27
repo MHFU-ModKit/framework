@@ -38,6 +38,19 @@ uint8_t mhfu_get_screen_state(void)
     const mhfu_region_addrs_t *r = mhfu_region();
     return r ? *(volatile uint8_t *)r->cell_screen_state : 0;
 }
+
+/* Is it safe for the framework to touch the Memory Stick right now? Only during
+ * active gameplay — screen_state 17 (in a quest) or 22 (village). In every other
+ * state (boot, title, menus, character-select, the "loading saves from memory card"
+ * screen, and mid-game save dialogs) the system SAVEDATA utility may be reading or
+ * writing the Memory Stick; the PSP's MS driver is not reentrant, so our concurrent
+ * I/O (log writes, the lua hot-reload scan) intermittently FREEZES the save load.
+ * Gate all framework ms0 I/O on this. (RAM hook-patching is unaffected — only ms0.) */
+int mhfu_ms0_io_safe(void)
+{
+    uint8_t s = mhfu_get_screen_state();
+    return (s == 17 || s == 22);
+}
 uint16_t mhfu_get_area_index(void)
 {
     const mhfu_region_addrs_t *r = mhfu_region();
