@@ -49,6 +49,38 @@ extern "C" int mhfu_deferred_poll_thread(SceSize args, void *argp)
     for (;;) {
         sceKernelDelayThread(100 * 1000);   /* 10 Hz */
         uint8_t scr = mhfu_get_screen_state();
+
+        /* Real-HW volatile activity is DEFERRED until we've reached the village at least
+         * once (scr=22). Before the village, the savedata utility borrows the 4 MB
+         * volatile partition at character-select; touching it there froze the load. */
+        static int g_village_seen = 0;
+        if (scr == 22) g_village_seen = 1;
+        if (g_village_seen) {
+            /* OBSERVE hook: repoint the game's volatile Lock/Unlock import stubs (once,
+             * here at the village = post-savedata, before any quest depart) and drain the
+             * pass-through call log (ms0-gated). Real-HW only; PPSSPP no-op. */
+            mhfu_vobs_install();
+            mhfu_vobs_flush();
+            /* lock/stage driver — no-op in the recon build (lock path disabled): prelock
+             * early-returns on !g_prelock_armed, release on g_vol_locked<=0. release on
+             * the quest-exit edge. */
+            mhfu_inject_xram_prelock();
+            {
+                static uint8_t s_prev_scr = 0xFF;
+                if (s_prev_scr == 17 && scr != 17) mhfu_inject_xram_release();
+                s_prev_scr = scr;
+            }
+            /* Volatile lock-HOLD recon (real HW): flushes the quest-depart acquire log,
+             * probes village free/busy, heartbeats while held, releases save-safely.
+             * acquire itself fires from mhfu_dispatch_quest_beginning. PPSSPP no-op. */
+            mhfu_inject_xram_recon_tick(scr);
+            /* NOTE: the read-only volatile USAGE probes (mhfu_inject_xram_usage_baseline /
+             * _scan) are REMOVED — they raw-READ the 4 MB volatile partition (0x08400000)
+             * WITHOUT holding its lock, which faults during the savedata/character-select
+             * window and froze the boot (HW bisect 2026-06-27). They were diagnostic-only
+             * (squat-feasibility measurement) and are not on the Brute-load path. */
+        }
+
         if (scr != 0x01 && scr != 0x04) continue;   /* MENU / TITLE only */
         for (int i = 0; i < MAX_DEFERRED; i++) {
             deferred_t *d = &g_deferred[i];

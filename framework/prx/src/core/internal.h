@@ -72,6 +72,33 @@ void mhfu_quest_init(void);
 /* Picks the inject scratch region once (emulator raw window vs real-HW 4 MB
  * volatile). Fault-safe; call early from bootstrap. Idempotent. */
 void mhfu_xram_platform_init(void);
+/* Real-HW 4 MB-volatile early-prelock driver. arm = at quest depart (immediate
+ * first lock+stage attempt before streaming); prelock = retry each 10 Hz tick
+ * until staged (returns 1 when done); release = on quest exit, unlock volatile so
+ * the post-quest save isn't frozen + re-stage next quest. All no-ops on PPSSPP RAW. */
+void mhfu_inject_xram_arm_prelock(void);
+int  mhfu_inject_xram_prelock(void);
+void mhfu_inject_xram_release(void);
+/* Diagnostic: probe whether volatile is grabbable in the current game state
+ * (TryLock + immediate Unlock); logs FREE/BUSY per screen+area. */
+void mhfu_inject_xram_probe_avail(uint8_t scr, uint16_t area);
+/* Diagnostic (read-only): measure how much of the 4 MB volatile the game uses during
+ * a quest. baseline = capture in village (scr=22); scan = compare in-quest (scr=17). */
+void mhfu_inject_xram_usage_baseline(void);
+void mhfu_inject_xram_usage_scan(void);
+/* RECON (real HW): pure 4 MB-volatile lock-HOLD feasibility test (NO Brute staging).
+ * arm = acquire+hold at quest depart (engine quest-commit thread; cheap TryLock only);
+ * tick = poll-thread driver (log flush + non-holding village probe + held heartbeat +
+ * save-safe release). Settles Scenario 1 (game doesn't need volatile in-quest -> squat
+ * viable) vs Scenario 2. No-op on PPSSPP RAW. */
+void mhfu_inject_xram_recon_arm(void);
+void mhfu_inject_xram_recon_tick(uint8_t scr);
+/* OBSERVE hook (real HW): repoint the game's blocking sceKernelVolatileMemLock /
+ * Unlock import stubs to pass-through C wrappers that log every call (when/size/rc/
+ * lifecycle) via a ring drained by the poll. install = once at first village; flush =
+ * every poll tick (ms0-gated). Pure observation, zero behavior change. PPSSPP no-op. */
+void mhfu_vobs_install(void);
+void mhfu_vobs_flush(void);
 
 /* --- bootstrap (bootstrap.cpp) --- */
 void mhfu_sentinel_set(uint32_t offset, uint32_t value);

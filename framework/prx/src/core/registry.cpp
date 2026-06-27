@@ -96,6 +96,11 @@ extern "C" void mhfu_dispatch_quest_beginning(const mhfu_anchor_regs_t *regs)
     /* fire once on the 0 -> non-zero transition (quest commit) */
     if (prev != 0 || cur == 0) return;
 
+    /* Real-HW volatile lock-hold RECON: grab the 4 MB volatile at the earliest
+     * in-quest-flow point (quest commit, before section streaming), held across the
+     * load, released save-safely by the poll. Cheap non-blocking TryLock; PPSSPP no-op. */
+    mhfu_inject_xram_recon_arm();
+
     mhfu_event_ctx_t ctx;
     fill_regs(&ctx, MHFU_EVENT_QUEST_BEGINNING, cur, regs);
     mhfu_registry_fire(MHFU_EVENT_QUEST_BEGINNING, &ctx);

@@ -18,6 +18,7 @@
 #include "mhfu/log.h"
 #include "mhfu/memory.h"       /* mhfu_ms0_io_safe — never touch ms0 during savedata */
 #include "mhfu/mips.h"         /* mips_* encoders for the game-thread detour */
+#include "mhfu/hooks.h"        /* mhfu_patch_word — repoint the volatile import stubs */
 #include "mhfu/ai.h"           /* mhfu_on_ai_overlay_loaded (JIT-cold install window) */
 #include "mhfu/events.h"       /* MHFU_EVENT_MAP_SECTION_ENTERED repatch */
 #include "internal.h"          /* mhfu_anchor_regs_t, cave_alloc, flush_caches */
@@ -193,7 +194,13 @@ enum { XR_UNDECIDED = 0, XR_RAW, XR_VOLATILE };
 static int      g_xram_mode;
 static uint32_t g_vol_base, g_vol_size, g_vol_bump;   /* volatile region */
 static int      g_vol_locked;                         /* 0=unattempted 1=ok -1=fail */
-static SceUID   g_part_uid = -1;   /* grown-partition-2 block (real HW, memgrow VSH) */
+/* Early-prelock arming (real HW): set on quest depart so the volatile lock+stage is
+ * attempted BEFORE section streaming grabs volatile; cleared on quest exit (release). */
+static int      g_prelock_armed;
+/* Master switch for the volatile LOCK path. 0 = recon build: never lock volatile (so the
+ * read-only usage probe measures the GAME's true in-quest usage). Flip to 1 for the
+ * squat/lock action build. Keeps lock attempts out of the usage measurement. */
+static int      g_xram_lock_enabled = 0;
 
 /* Probe-write a word. Fault-safe ONLY behind the maxfree gate (never reached on
  * real hardware); also used per-block in RAW mode where the window is known good. */
@@ -228,15 +235,21 @@ extern "C" void mhfu_xram_platform_init(void)
     }
 }
 
+/* Lock the 4 MB volatile partition. RETRY-CAPABLE: only a SUCCESS is cached
+ * (g_vol_locked == 1 short-circuits). A failure (the game holds volatile — e.g.
+ * mid section-streaming) leaves g_vol_locked == -1 but does NOT permanently block:
+ * the next call re-attempts TryLock. This is what lets the early-prelock driver
+ * keep retrying through a quest depart until it catches a free-volatile window. */
 static int volatile_ensure(void)
 {
-    if (g_vol_locked) return g_vol_locked > 0;
+    if (g_vol_locked > 0) return 1;
     void *ptr = 0; int size = 0;
     int rc = sceKernelVolatileMemTryLock(0, &ptr, &size);
     if (rc < 0 || !ptr || size <= 0) {
-        g_vol_locked = -1;
-        RHW_DBG("[xram] VOLATILE TryLock FAIL rc=0x%08X (MHFU holds it?) -> no Brute",
-                (unsigned)rc);
+        if (g_vol_locked != -1)
+            RHW_DBG("[xram] VOLATILE TryLock busy rc=0x%08X (game holds it) -> retry",
+                    (unsigned)rc);
+        g_vol_locked = -1;            /* last attempt failed; retry next call */
         return 0;
     }
     g_vol_base = (uint32_t)(uintptr_t)ptr;
@@ -259,29 +272,13 @@ static uint32_t xram_alloc(uint32_t n)
         g_xram_bump = a + n;
         return a;
     }
-    /* XR_VOLATILE mode (real HW). PREFER the GROWN user partition: the memgrow VSH
-     * plugin (sctrlHENSetMemory) extended partition 2 into the extra RAM, so a
-     * PSP_SMEM_High block lands at the partition top = the extra RAM, clear of MHFU's
-     * heap (bottom) and USER-accessible (partition 2 is user RAM) — the engine reads
-     * our model directly, no kernel addresses, no contention with the savedata/streaming
-     * volatile partition (which TryLock-failed 0x802B0200 at section load). Only when
-     * the grow didn't apply (Phat / plugin not set) do we fall back to the 4 MB volatile
-     * partition. One Brute alloc, so try the partition once (g_part_uid < 0). */
-    if (g_part_uid < 0) {
-        SceUID uid = sceKernelAllocPartitionMemory(2, "mhfu_brute", PSP_SMEM_High, n, 0);
-        if (uid >= 0) {
-            uint32_t pa = (uint32_t)sceKernelGetBlockHeadAddr(uid);
-            g_part_uid = uid;
-            mhfu_log("[inject] xram = USER-PART(grown) @0x%08X (%uKB)",
-                     (unsigned)pa, (unsigned)(n / 1024));
-            RHW_DBG("[xram] USER-PART(grown) alloc need=%uKB addr=0x%08X uid=0x%08X",
-                    (unsigned)(n / 1024), (unsigned)pa, (unsigned)uid);
-            return pa;
-        }
-        RHW_DBG("[xram] USER-PART alloc FAIL need=%uKB maxfree=%uKB -> volatile fallback",
-                (unsigned)(n / 1024), (unsigned)(sceKernelMaxFreeMemSize() / 1024));
-    }
-    /* XR_VOLATILE fallback */
+    /* XR_VOLATILE mode (real HW) = the 4 MB volatile partition (0x08400000), a SEPARATE
+     * user-accessible region — never the game's own 24 MB heap. (The old memgrow/grown-
+     * partition-2 attempt is removed: a PSP_SMEM_High alloc from partition 2 lands INSIDE
+     * MHFU's live heap, eating its ~2.2 MB in-game free -> mid-quest OOM. The volatile pivot
+     * leaves the game heap untouched and is reclaimed on quest exit.) volatile_ensure()
+     * is retry-capable, so a busy lock (game mid-streaming) just fails this alloc; the
+     * early-prelock driver retries on the next 10 Hz tick until it catches a free window. */
     if (!volatile_ensure()) return 0;
     uint32_t a = (g_vol_bump + 15u) & ~15u;       /* 16 B align */
     if (a + n > g_vol_base + g_vol_size) {
@@ -295,6 +292,466 @@ static uint32_t xram_alloc(uint32_t n)
             (unsigned)(n / 1024), (unsigned)a,
             (unsigned)((g_vol_bump - g_vol_base) / 1024), (unsigned)(g_vol_size / 1024));
     return a;
+}
+
+/* --- real-HW volatile early-prelock / release (the 4 MB-volatile pivot) -----
+ * On real hardware the engine grabs the 4 MB volatile partition DURING section
+ * streaming, so the lazy "lock at the model-load get_subresource seam" raced and
+ * TryLock-failed 0x802B0200. Instead we lock+stage EARLY: armed at quest depart
+ * (quest_beginning, before streaming), retried each 10 Hz tick until a free-volatile
+ * window is caught, and RELEASED on quest exit so the post-quest save isn't frozen.
+ * All three are no-ops on PPSSPP RAW mode (no volatile, staged eagerly). */
+
+/* Try to lock volatile + stage every relocate PAC now. Armed-gated (set by
+ * mhfu_inject_xram_arm_prelock at quest depart). Returns 1 when everything that
+ * needs staging is staged (or there's nothing to do); 0 means "volatile busy,
+ * retry me next tick". Cheap when busy: only a TryLock, no 1.6 MB read. */
+/* Volatile-availability probe (diagnostic). On each game-state change the poll calls
+ * this to TEST whether the 4 MB volatile partition is grabbable in THIS state, then
+ * immediately unlocks on success so the game is never denied. Maps the free-window:
+ * we need to know if volatile is ever free in the steady-state village (streaming
+ * done) vs. only busy during the quest-depart load. Logs to ms0:/PSP/mhfu_brute_debug.txt. */
+extern "C" void mhfu_inject_xram_probe_avail(uint8_t scr, uint16_t area)
+{
+    if (!g_xram_mode) mhfu_xram_platform_init();
+    if (g_xram_mode != XR_VOLATILE) return;            /* PPSSPP RAW: N/A */
+    if (g_vol_locked > 0) {                            /* we already hold it (mid-quest) */
+        RHW_DBG("[vprobe] scr=%u area=%u: WE hold volatile", (unsigned)scr, (unsigned)area);
+        return;
+    }
+    void *ptr = 0; int size = 0;
+    int rc = sceKernelVolatileMemTryLock(0, &ptr, &size);
+    if (rc >= 0 && ptr && size > 0) {
+        sceKernelVolatileMemUnlock(0);                 /* give it right back */
+        RHW_DBG("[vprobe] scr=%u area=%u: volatile FREE base=0x%08X size=%uKB",
+                (unsigned)scr, (unsigned)area, (unsigned)(uintptr_t)ptr,
+                (unsigned)(size / 1024));
+    } else {
+        RHW_DBG("[vprobe] scr=%u area=%u: volatile BUSY rc=0x%08X",
+                (unsigned)scr, (unsigned)area, (unsigned)rc);
+    }
+}
+
+/* --- read-only volatile USAGE probe (squat feasibility, Option A) -----------
+ * The state map shows volatile is the game's per-QUEST scratch (free in village
+ * scr=22, busy in-quest scr=17). To squat our Brute in the unused part, measure how
+ * much the game touches: snapshot per-64KB-block checksums in the village (pre-quest
+ * baseline), then compare in-quest -> the highest CHANGED block = the game's usage
+ * high-water; everything above it is a free tail we could squat in. STRICTLY
+ * read-only: never writes the game's locked region, so zero risk. */
+#define VOL_BASE 0x08400000u
+#define VOL_END  0x08800000u
+#define VOL_BLK  0x10000u      /* 64 KB */
+#define VOL_NBLK 64u           /* (VOL_END-VOL_BASE)/VOL_BLK */
+static uint32_t g_vol_csum[VOL_NBLK];
+static int      g_vol_have_base;
+
+static uint32_t vol_blk_csum(uint32_t base)
+{
+    uint32_t s = 0;
+    for (uint32_t o = 0; o < VOL_BLK; o += 0x800)        /* 32 samples / 64 KB */
+        s = s * 131u + *(volatile uint32_t *)(base + o);
+    return s;
+}
+
+/* Capture the pre-quest baseline. Call in the village (scr=22) where volatile is
+ * free and holds the about-to-depart state. Cheap (2K reads); refreshes each call. */
+extern "C" void mhfu_inject_xram_usage_baseline(void)
+{
+    for (uint32_t b = 0; b < VOL_NBLK; b++)
+        g_vol_csum[b] = vol_blk_csum(VOL_BASE + b * VOL_BLK);
+    g_vol_have_base = 1;
+}
+
+/* In-quest: which blocks did the game change vs. the village baseline. Logs the
+ * usage high-water + free-tail size whenever it grows. Call ~1 Hz while scr=17. */
+extern "C" void mhfu_inject_xram_usage_scan(void)
+{
+    if (!g_vol_have_base) return;
+    int hi = -1, nchg = 0;
+    for (uint32_t b = 0; b < VOL_NBLK; b++) {
+        if (vol_blk_csum(VOL_BASE + b * VOL_BLK) != g_vol_csum[b]) { hi = (int)b; nchg++; }
+    }
+    static int s_hi = -2, s_n = -1;
+    if (hi == s_hi && nchg == s_n) return;               /* unchanged -> quiet */
+    s_hi = hi; s_n = nchg;
+    uint32_t top = (hi >= 0) ? VOL_BASE + (uint32_t)(hi + 1) * VOL_BLK : VOL_BASE;
+    RHW_DBG("[vusage] game-used<=0x%08X (%d/%u blk=%uKB) FREE-TAIL 0x%08X+ = %uKB %s",
+            (unsigned)top, nchg, (unsigned)VOL_NBLK, (unsigned)((top - VOL_BASE) / 1024),
+            (unsigned)top, (unsigned)((VOL_END - top) / 1024),
+            ((VOL_END - top) >= 0x199000u) ? "(>=1.6MB OK)" : "(<1.6MB)");
+}
+
+extern "C" int mhfu_inject_xram_prelock(void)
+{
+    if (!g_prelock_armed) return 1;
+    if (!g_xram_mode) mhfu_xram_platform_init();
+    if (g_xram_mode != XR_VOLATILE) return 1;     /* RAW (emulator): nothing to prelock */
+    /* Throttle staging retries to ~1 Hz (poll is 10 Hz): a busy lock just retries, and
+     * hammering it every 100 ms floods the log with STAGE FAILED. 1 Hz still catches a
+     * free window fast. */
+    static uint32_t s_throttle = 0;
+    if ((s_throttle++ % 10) != 0) return 0;
+    int all = 1;
+    for (int i = 0; i < MHFU_INJECT_MAX; i++) {
+        inject_entry_t *e = &g_tab[i];
+        if (!e->used || !e->relocate || e->buf) continue;  /* already staged */
+        e->staged = 0;                              /* clear the don't-retry guard */
+        if (!stage_relocate(e)) all = 0;            /* volatile busy -> try again next tick */
+    }
+    return all;
+}
+
+/* Arm early-prelock at quest depart. Runs on the engine's quest-commit thread, so it
+ * does ONLY the cheap non-blocking TryLock — claiming the 4 MB volatile at the earliest
+ * point, before the loading screen starts streaming and grabs it. The heavy 1.6 MB stage
+ * READ is deferred to the 10 Hz poll thread (mhfu_inject_xram_prelock), keeping file I/O
+ * off the touchy engine construction path. If this TryLock loses the race (volatile
+ * already busy), the poll retries the lock each tick until it frees. */
+extern "C" void mhfu_inject_xram_arm_prelock(void)
+{
+    if (!g_xram_lock_enabled) { RHW_DBG("[xram] arm skipped (lock disabled — recon build)"); return; }
+    if (g_prelock_armed) return;
+    g_prelock_armed = 1;
+    if (!g_xram_mode) mhfu_xram_platform_init();
+    if (g_xram_mode == XR_VOLATILE) volatile_ensure();   /* cheap claim; no read here */
+    RHW_DBG("[xram] prelock ARMED (quest depart); vol_locked=%d", g_vol_locked);
+}
+
+/* Release volatile on quest exit. The staged Brute PACs LIVE in volatile, so they
+ * are invalidated here (buf=0) and re-staged on the next quest's prelock. Frees the
+ * 4 MB so the post-quest reward save / savedata utility doesn't freeze. No-op unless
+ * we actually hold volatile. */
+extern "C" void mhfu_inject_xram_release(void)
+{
+    g_prelock_armed = 0;
+    if (g_xram_mode != XR_VOLATILE || g_vol_locked <= 0) return;
+    for (int i = 0; i < MHFU_INJECT_MAX; i++) {
+        inject_entry_t *e = &g_tab[i];
+        if (e->used && e->relocate) {              /* its buf was in volatile -> gone now */
+            e->buf = 0; e->buf_cap = 0; e->staged = 0; e->redirects = 0;
+        }
+    }
+    g_vol_base = g_vol_size = g_vol_bump = 0;
+    sceKernelVolatileMemUnlock(0);
+    g_vol_locked = 0;
+    RHW_DBG("[xram] VOLATILE released (quest exit) -> save-safe; re-stage next quest");
+    mhfu_log("[inject] volatile released on quest exit (save-safe)");
+}
+
+/* --- Volatile RECON: quest-depart lock-hold feasibility test ----------------
+ * A PURE lock-hold experiment (NO Brute staging) to settle the one open unknown:
+ * does MHFU itself need the 4 MB volatile partition DURING an in-quest section
+ * load? (Scenario 1 = no -> we can squat our Brute there; Scenario 2 = yes ->
+ * the whole-partition mutex makes squatting impossible without an interposer.)
+ *
+ * Method: acquire volatile at QUEST DEPART (mhfu_dispatch_quest_beginning — the
+ * quest-timer 0->nonzero commit, the earliest in-quest-flow point: past savedata,
+ * before section streaming), HOLD it across the load, and observe the (native)
+ * model load via the poll heartbeat:
+ *   - section loads fine while we hold -> Scenario 1 (squat viable).
+ *   - section freezes/fails           -> Scenario 2 (need the lock-API interposer).
+ * A non-holding village probe (scr=22, TryLock+instant Unlock) separately maps
+ * whether volatile is free at idle.
+ *
+ * SAVE-SAFETY (the freeze class we keep hitting): we acquire ONLY on the positive
+ * quest-depart event (never at menu/char-select/village-idle), and RELEASE on the
+ * EARLIEST of quest-area exit (17->!17), quest-timer clear, or title/menu (scr 1/4)
+ * -> the lock is never held into a savedata window. The acquire runs on the engine
+ * quest-commit thread, so it does ONLY the cheap non-blocking TryLock there (NO ms0
+ * I/O); the 10 Hz poll flushes the log. No-op on PPSSPP RAW. Toggle g_recon_enabled. */
+static int      g_recon_enabled = 0;       /* OBSERVE build: lock-HOLD recon OFF (it would
+                                            * deadlock the game's blocking Lock = freeze);
+                                            * the vobs pass-through hook below does the work */
+static int      g_recon_held;              /* we currently hold volatile (the test) */
+static uint32_t g_recon_base, g_recon_size;
+static int      g_recon_arm_log;           /* 0 none / 1 acquired / 2 busy (poll flushes) */
+static uint32_t g_recon_arm_rc;
+
+/* Quest-depart acquire (engine quest-commit thread): cheap non-blocking TryLock + HOLD.
+ * No ms0 I/O here (wrong thread / unsafe screen-state) — result is logged by the poll. */
+extern "C" void mhfu_inject_xram_recon_arm(void)
+{
+    if (!g_recon_enabled || g_recon_held) return;
+    if (!g_xram_mode) mhfu_xram_platform_init();
+    if (g_xram_mode != XR_VOLATILE) return;            /* PPSSPP RAW: no volatile */
+    void *ptr = 0; int size = 0;
+    int rc = sceKernelVolatileMemTryLock(0, &ptr, &size);
+    if (rc >= 0 && ptr && size > 0) {
+        g_recon_held = 1;
+        g_recon_base = (uint32_t)(uintptr_t)ptr;
+        g_recon_size = (uint32_t)size;
+        g_recon_arm_log = 1;
+    } else {
+        g_recon_arm_log = 2;
+        g_recon_arm_rc  = (uint32_t)rc;
+    }
+}
+
+/* Poll-thread driver (10 Hz): flush the acquire result, non-holding village probe,
+ * save-safe release, and a held-heartbeat that proves the section loaded while held. */
+extern "C" void mhfu_inject_xram_recon_tick(uint8_t scr)
+{
+    if (!g_recon_enabled) return;
+    if (!g_xram_mode) mhfu_xram_platform_init();
+    if (g_xram_mode != XR_VOLATILE) return;            /* PPSSPP RAW: N/A */
+
+    static uint8_t  s_prev     = 0xFF;
+    static uint32_t s_beat     = 0;
+    static uint32_t s_vprobe   = 0;
+    static int      s_in_quest = 0;     /* reached in-quest (scr=17) while holding */
+    static uint32_t s_hold_tk  = 0;     /* ticks held (abort-timeout guard)        */
+    static int      s_rel_log  = 0;     /* pending release reason: 1 exit 2 menu 3 timeout */
+
+    /* (1) DURABLE acquire-result log: only clear g_recon_arm_log once we actually wrote
+     * it (ms0-safe = scr 17/22). The acquire happens during the depart LOAD (scr not
+     * 17/22) where ms0 I/O is gated off, so we must hold the result until scr=17. */
+    if (g_recon_arm_log && mhfu_ms0_io_safe()) {
+        if (g_recon_arm_log == 1)
+            RHW_DBG("[recon] ACQUIRED volatile at quest-depart base=0x%08X size=%uKB -> HELD into load",
+                    (unsigned)g_recon_base, (unsigned)(g_recon_size / 1024));
+        else
+            RHW_DBG("[recon] quest-depart TryLock BUSY rc=0x%08X (already held at depart = Scenario 2?)",
+                    (unsigned)g_recon_arm_rc);
+        g_recon_arm_log = 0;
+    }
+
+    /* (2) HOLD ACROSS THE WHOLE LOAD; SAVE-SAFE release on the earliest of:
+     *   - quest-area exit (ONLY after we actually reached the quest — so the depart
+     *     loading screen, which is also !=17, does NOT trigger it), OR
+     *   - title/menu (scr 1/4), OR
+     *   - abort timeout (committed but never reached the quest within ~15 s).
+     * The old quest_timer==0 release is REMOVED: the timer is 0 during the depart
+     * loading screen, so it was dropping the lock mid-load (the exact window to hold). */
+    if (g_recon_held) {
+        s_hold_tk++;
+        if (scr == 17 && !s_in_quest) {     /* first in-quest tick while holding */
+            s_in_quest = 1;
+            RHW_DBG("[recon] HELD volatile across load INTO quest (scr=17) area=%u "
+                    "-> Scenario 1 (game did NOT need volatile to load the section)",
+                    (unsigned)mhfu_get_area_index());
+        }
+        int leaving = (s_in_quest && s_prev == 17 && scr != 17);
+        int at_menu = (scr == 0x01 || scr == 0x04);
+        int timeout = (!s_in_quest && s_hold_tk > 150);    /* ~15 s @ 10 Hz */
+        if (leaving || at_menu || timeout) {
+            sceKernelVolatileMemUnlock(0);
+            g_recon_held = 0;
+            s_rel_log = leaving ? 1 : (at_menu ? 2 : 3);
+            s_in_quest = 0; s_hold_tk = 0;
+            g_recon_base = g_recon_size = 0;
+        }
+    }
+    if (s_rel_log && mhfu_ms0_io_safe()) {     /* durable release-reason log */
+        RHW_DBG("[recon] RELEASED volatile (%s) -> save-safe",
+                s_rel_log == 1 ? "quest-exit" : (s_rel_log == 2 ? "menu" : "abort-timeout"));
+        s_rel_log = 0;
+    }
+
+    /* non-holding village(22) probe: is volatile free at idle? (TryLock + instant Unlock) */
+    if (!g_recon_held && scr == 22 && (s_vprobe++ % 20) == 0) {
+        void *ptr = 0; int size = 0;
+        int rc = sceKernelVolatileMemTryLock(0, &ptr, &size);
+        if (rc >= 0 && ptr && size > 0) {
+            sceKernelVolatileMemUnlock(0);
+            RHW_DBG("[recon] village(22): volatile FREE base=0x%08X size=%uKB",
+                    (unsigned)(uintptr_t)ptr, (unsigned)(size / 1024));
+        } else {
+            RHW_DBG("[recon] village(22): volatile BUSY rc=0x%08X", (unsigned)rc);
+        }
+    }
+
+    /* held-heartbeat (~1 Hz). RHW_DBG is ms0-gated to scr 17/22, so the FIRST line
+     * after acquire prints once we reach in-quest scr=17 = the section loaded into
+     * the quest WHILE we held volatile = Scenario 1 confirmed for this run. */
+    if (g_recon_held && (s_beat++ % 10) == 0)
+        RHW_DBG("[recon] HOLDING volatile scr=%u area=%u base=0x%08X (load survived)",
+                (unsigned)scr, (unsigned)mhfu_get_area_index(), (unsigned)g_recon_base);
+
+    s_prev = scr;
+}
+
+/* --- Volatile lock-API OBSERVE hook (real HW) -------------------------------
+ * MHFU EU imports the BLOCKING sceKernelVolatileMemLock @ import stub 0x0890E0B0
+ * and sceKernelVolatileMemUnlock @ 0x0890E0B8 (it does NOT use TryLock). We repoint
+ * each stub to a same-ABI C wrapper that calls the REAL function (pure pass-through
+ * — zero behavior change), records the call into a small SPSC ring, and returns v0
+ * to the game caller (the game's $ra is preserved across our `j`, so a normal return
+ * lands back in the game). The poll thread drains the ring to the log ONLY when
+ * ms0-safe (scr 17/22), so Lock/Unlock that happen during the depart LOAD (ms0-unsafe)
+ * are still captured. Answers: when/how often the game locks, the (ptr,size) it gets
+ * back, whether it ever unlocks mid-quest, and the full lock lifecycle. Real-HW only
+ * (XR_VOLATILE); on PPSSPP RAW it is never installed. */
+#define VOBS_LOCK_STUB   0x0890E0B0u
+#define VOBS_UNLOCK_STUB 0x0890E0B8u
+
+typedef struct { uint8_t kind; uint8_t scr; uint16_t area;
+                 uint32_t a0, ptr, size; int32_t rc; uint32_t seq; } vobs_evt_t;
+#define VOBS_RING 32
+static vobs_evt_t        g_vobs_ring[VOBS_RING];
+static volatile uint32_t g_vobs_head, g_vobs_tail;   /* game thread pushes, poll drains */
+static uint32_t          g_vobs_seq;
+static int               g_vobs_installed;
+
+static void vobs_push(uint8_t kind, uint32_t a0, uint32_t ptr, uint32_t size, int rc)
+{
+    uint32_t h = g_vobs_head;
+    vobs_evt_t *e = &g_vobs_ring[h % VOBS_RING];
+    e->kind = kind; e->a0 = a0; e->ptr = ptr; e->size = size; e->rc = rc;
+    e->scr = mhfu_get_screen_state(); e->area = mhfu_get_area_index(); e->seq = ++g_vobs_seq;
+    g_vobs_head = h + 1;                              /* publish after fill */
+}
+
+/* --- Volatile INTERPOSER ("proxy"): carve a private slice from the game's lock -----
+ * vobs proved the game locks the whole 4 MB once at quest depart and never unlocks it.
+ * So in the Lock wrapper, AFTER the real Lock returns (partition mapped, lock held, on
+ * the game's thread = the ONLY provably-safe window to touch volatile), we stage every
+ * relocate PAC (the Brute) into the TOP of the partition, then hand the game a REDUCED
+ * size so it streams into the BOTTOM. The existing get_subresource redirect then points
+ * the engine at our Brute (e->buf now lives in volatile-top). Every byte of OUR volatile
+ * access is confined to this held window — no unlocked reads/writes anywhere. If the game
+ * ignores the reduced size and uses the top, the Brute renders garbled / the load fails
+ * (recoverable — don't save) = the precondition-1 verdict. Toggle g_proxy_enabled. */
+static int      g_proxy_enabled = 1;
+static uint32_t g_proxy_reserved;       /* bytes carved off the top (0 = transparent) */
+static int      g_proxy_done;           /* relocate PACs placed into volatile-top      */
+
+/* Read a grown PAC file into [dst, dst+cap). Returns the file size, 0 on any failure.
+ * Runs on the game thread inside the held Lock window, BEFORE the game streams the
+ * section (so no contention with the game's own load reads). */
+static uint32_t proxy_read_pac(const char *path, uint32_t dst, uint32_t cap)
+{
+    SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd < 0) { RHW_DBG("[proxy] open FAILED %s rc=0x%08X", path, (unsigned)fd); return 0; }
+    SceOff sz = sceIoLseek(fd, 0, PSP_SEEK_END);
+    sceIoLseek(fd, 0, PSP_SEEK_SET);
+    uint32_t fsz = (uint32_t)sz;
+    if (fsz < 0x40 || fsz > cap) {
+        sceIoClose(fd);
+        RHW_DBG("[proxy] %s size=%uB > cap=%uB -> skip", path, (unsigned)fsz, (unsigned)cap);
+        return 0;
+    }
+    int rd = sceIoRead(fd, (void *)dst, (int)fsz);
+    sceIoClose(fd);
+    if (rd != (int)fsz) { RHW_DBG("[proxy] read short rc=0x%08X", (unsigned)rd); return 0; }
+    sceKernelDcacheWritebackRange((void *)dst, fsz);
+    return fsz;
+}
+
+/* Stage all un-staged relocate entries into the TOP of the held partition; set e->buf
+ * so the get_subresource redirect uses volatile-top. Returns the reserve size (bytes
+ * carved off the top), 0 if nothing staged (-> caller stays transparent). */
+static uint32_t proxy_stage(uint32_t lock_base, uint32_t lock_size)
+{
+    if (!g_proxy_enabled || g_proxy_done) return g_proxy_reserved;
+    uint32_t reserve = 0;                          /* pass 1: sum grown sizes (16 KB-aligned) */
+    for (int i = 0; i < MHFU_INJECT_MAX; i++) {
+        inject_entry_t *e = &g_tab[i];
+        if (!e->used || !e->relocate || e->buf) continue;
+        SceUID fd = sceIoOpen(e->path, PSP_O_RDONLY, 0);
+        if (fd < 0) continue;
+        uint32_t fsz = (uint32_t)sceIoLseek(fd, 0, PSP_SEEK_END);
+        sceIoClose(fd);
+        reserve += (fsz + 0x3FFFu) & ~0x3FFFu;
+    }
+    if (reserve == 0) return 0;
+    if (reserve > lock_size / 2) {                 /* refuse to take more than half the partition */
+        RHW_DBG("[proxy] reserve=%uKB too big for %uKB -> stay transparent",
+                (unsigned)(reserve / 1024), (unsigned)(lock_size / 1024));
+        g_proxy_done = 1;                          /* don't re-attempt; native fallback */
+        return 0;
+    }
+    uint32_t bump = lock_base + lock_size - reserve;   /* pass 2: place into the TOP slice */
+    RHW_DBG("[proxy] reserve=%uKB top=[0x%08X,0x%08X) game gets [0x%08X,0x%08X)",
+            (unsigned)(reserve / 1024), (unsigned)bump, (unsigned)(lock_base + lock_size),
+            (unsigned)lock_base, (unsigned)bump);
+    for (int i = 0; i < MHFU_INJECT_MAX; i++) {
+        inject_entry_t *e = &g_tab[i];
+        if (!e->used || !e->relocate || e->buf) continue;
+        uint32_t cap = (lock_base + lock_size) - bump;
+        uint32_t fsz = proxy_read_pac(e->path, bump, cap);
+        if (!fsz) continue;
+        e->buf = bump; e->buf_cap = (fsz + 0x3FFFu) & ~0x3FFFu;
+        e->file_size = fsz; e->staged = 1;
+        RHW_DBG("[proxy] staged file=%u grown=%uB @0x%08X (volatile top)",
+                (unsigned)e->file_id, (unsigned)fsz, (unsigned)bump);
+        bump += e->buf_cap;
+    }
+    g_proxy_reserved = reserve;
+    g_proxy_done = 1;
+    return reserve;
+}
+
+/* Repointed-stub landing pads: same ABI as the originals, so `return` (jr $ra) goes
+ * straight back to the game caller with v0. Run on the GAME thread, possibly mid-load
+ * (ms0-unsafe) -> NO logging here, only a cheap ring push (proxy_stage uses RHW_DBG,
+ * which self-gates on ms0 safety). */
+extern "C" int mhfu_vobs_lock(int unk, void **pptr, int *psize)
+{
+    int rc = sceKernelVolatileMemLock(unk, pptr, psize);     /* REAL, blocking — we hold 4 MB */
+    if (rc >= 0 && pptr && psize) {
+        uint32_t base = (uint32_t)(uintptr_t)*pptr;
+        uint32_t full = (uint32_t)*psize;
+        uint32_t reserve = proxy_stage(base, full);          /* place Brute in the TOP */
+        if (reserve) {
+            *psize = full - reserve;                         /* hand the game the BOTTOM only */
+            vobs_push(3, (uint32_t)unk, base, *psize, rc);   /* kind 3 = SHRUNK */
+        } else {
+            vobs_push(1, (uint32_t)unk, base, full, rc);     /* transparent (nothing to stage) */
+        }
+    } else {
+        vobs_push(1, (uint32_t)unk, 0, 0, rc);
+    }
+    return rc;
+}
+extern "C" int mhfu_vobs_unlock(int unk)
+{
+    int rc = sceKernelVolatileMemUnlock(unk);
+    vobs_push(2, (uint32_t)unk, 0, 0, rc);
+    return rc;
+}
+
+/* Repoint the two import stubs. Real-HW only; idempotent. Patch the delay-slot word
+ * (the resolved `syscall N`) to NOP first, then the jump, so the stub is never left as
+ * `j wrapper` + stale `syscall`. mhfu_patch_word flushes the caches. */
+extern "C" void mhfu_vobs_install(void)
+{
+    if (g_vobs_installed) return;
+    if (!g_xram_mode) mhfu_xram_platform_init();
+    if (g_xram_mode != XR_VOLATILE) return;           /* PPSSPP RAW: never hook */
+    mhfu_patch_word(VOBS_LOCK_STUB   + 4, MIPS_NOP, "vobs");
+    mhfu_patch_word(VOBS_LOCK_STUB,       mips_j((uint32_t)(uintptr_t)&mhfu_vobs_lock),   "vobs");
+    mhfu_patch_word(VOBS_UNLOCK_STUB + 4, MIPS_NOP, "vobs");
+    mhfu_patch_word(VOBS_UNLOCK_STUB,     mips_j((uint32_t)(uintptr_t)&mhfu_vobs_unlock), "vobs");
+    g_vobs_installed = 1;
+    RHW_DBG("[vobs] installed: Lock stub 0x%08X -> 0x%08X, Unlock stub 0x%08X -> 0x%08X",
+            (unsigned)VOBS_LOCK_STUB,   (unsigned)(uintptr_t)&mhfu_vobs_lock,
+            (unsigned)VOBS_UNLOCK_STUB, (unsigned)(uintptr_t)&mhfu_vobs_unlock);
+}
+
+/* Drain the observe ring to the log. Poll thread; ms0-gated so events buffered during
+ * a load flush once we reach scr 17/22 (never lose them to the ms0 gate). */
+extern "C" void mhfu_vobs_flush(void)
+{
+    if (!g_vobs_installed || !mhfu_ms0_io_safe()) return;
+    while (g_vobs_tail != g_vobs_head) {
+        vobs_evt_t *e = &g_vobs_ring[g_vobs_tail % VOBS_RING];
+        if (e->kind == 1)
+            RHW_DBG("[vobs] #%u LOCK(unk=%u) -> rc=0x%08X ptr=0x%08X size=%uKB @scr=%u area=%u",
+                    (unsigned)e->seq, (unsigned)e->a0, (unsigned)e->rc, (unsigned)e->ptr,
+                    (unsigned)(e->size / 1024), (unsigned)e->scr, (unsigned)e->area);
+        else if (e->kind == 3)
+            RHW_DBG("[vobs] #%u LOCK SHRUNK(unk=%u) -> game gets base=0x%08X size=%uKB "
+                    "(we reserved %uKB top) @scr=%u area=%u",
+                    (unsigned)e->seq, (unsigned)e->a0, (unsigned)e->ptr,
+                    (unsigned)(e->size / 1024), (unsigned)(g_proxy_reserved / 1024),
+                    (unsigned)e->scr, (unsigned)e->area);
+        else
+            RHW_DBG("[vobs] #%u UNLOCK(unk=%u) -> rc=0x%08X @scr=%u area=%u",
+                    (unsigned)e->seq, (unsigned)e->a0, (unsigned)e->rc,
+                    (unsigned)e->scr, (unsigned)e->area);
+        g_vobs_tail++;
+    }
 }
 
 /* Parse the edited PAC (in e->buf) into the sub table: u32 count, then

@@ -117,6 +117,11 @@ route instead.
 
 ## 7. Extra RAM on real hardware — the exhaustive search (2026-06-26)
 
+> **SUPERSEDED by §9 (2026-06-27).** The "no spare user-readable RAM but the 4 MB volatile,
+> and every remap breaks MHFU" finding below is all still true — but we no longer need a
+> *spare* partition: §9's interposer **shares the game's own session-long volatile lock**, so
+> the 4 MB volatile *is* our extra RAM. Read §7 for the RAM map; §9 for the working solution.
+
 The Brute's full moveset (and any monster with no native analog) needs >1.2 MB of
 *user-readable* scratch the engine can read its model from. We mapped the real PSP's RAM
 and tried every supported door. **All HITL on the user's own PSP (Slim, model=1, PRO-C2
@@ -226,6 +231,65 @@ group at a time:
   is inert/safer, as static analysis said.)
 - Next: **B+C** (volatile recon + village poll — the from-boot continuous additions, and the
   behavioral delta of the first frozen "recon" build over A). Then D, E, F.
+
+## 9. EXTRA RAM SOLVED — the volatile INTERPOSER ("proxy") — BIG MONSTER ON REAL HW (2026-06-27)
+
+**HITL-PROVEN: the authentic 1.58 MB custom-moveset Brute Tigrex renders on the real PSP**
+(Slim, PRO-C2 6.20, MHFU EU). This RETIRES §7's "extra RAM exhaustively closed" verdict — we
+don't need a *spare* user partition; we **share the game's own volatile lock**.
+
+**The recon chain that cracked it (each a HW build, log → `ms0:/PSP/mhfu_brute_debug.txt`):**
+1. **Village `TryLock` probe** → volatile is **FREE** in the village (`0x08400000`, 4096 KB).
+2. **Quest-depart `TryLock`** → **BUSY `0x802B0200`** (the game already holds it) = the game
+   uses volatile for the quest load (the old §7 `0x802B0200` wall, now explained, not feared).
+3. **Observe hook** (repoint the game's lock-API import stubs to pass-through wrappers that
+   log every call): captured exactly **one `LOCK(unk=0) → ptr=0x08400000 size=4096KB @scr=32`
+   and NEVER an `UNLOCK`** — through the quest, a retreat, a **post-quest SAVE**, and the
+   return to the village. ⇒ **the game locks the WHOLE 4 MB once at the first quest depart and
+   holds it for the entire session.** And the **save worked while the game held volatile** ⇒
+   the post-quest savedata utility does **not** need the volatile partition.
+
+**The import stubs (EU `ULES01213`), found by parsing `BOOT.BIN`'s `sceSuspendForUser` import
+table** (entry `@0x0890E788`, funcCount=3, nidtab `0x0890EDB0`, stubtab `0x0890E0A8`):
+- `sceKernelVolatileMemLock`   NID `0x3E0271D3` → **stub `0x0890E0B0`** (BLOCKING; the game
+  uses this, NOT `TryLock`).
+- `sceKernelVolatileMemUnlock` NID `0xA569E425` → **stub `0x0890E0B8`**.
+- (idx0 = `sceKernelPowerLock` `0x090CCB3F`, irrelevant.) New screen-state **`scr=32`** = the
+  quest-depart/load transition (where the lock fires).
+
+**The interposer mechanism** (`inject.cpp`, `mhfu_vobs_*` + `proxy_stage`): repoint each stub
+to a same-ABI C wrapper (`j wrapper; nop` — the game's `jal stub` preserves `$ra`, so the
+wrapper's `return`/`jr $ra` lands back in the game with `v0`). The **Lock** wrapper:
+1. calls the **real** `sceKernelVolatileMemLock` → we hold the full 4 MB, **mapped**;
+2. **stages the 1.58 MB Brute into the TOP** of the partition (`proxy_read_pac` — a plain
+   `sceIoRead` of the grown PAC, on the game thread, *before* the game streams the section →
+   no race);
+3. returns the game a **reduced size** so it streams into the **bottom** only.
+
+The existing `get_subresource` redirect (`try_redirect_pkg`) then points the engine at
+`e->buf`, which now lives in volatile-top → the engine reformats OUR Brute from there.
+**Every byte of our volatile access is confined to this one held window** — no unlocked
+reads/writes anywhere (that is exactly what froze us: volatile is only MAPPED while *someone*
+holds the lock; unlocked it is reclaimed by the kernel → a read faults).
+
+**The proven result (this session's log):**
+```
+[vobs] installed: Lock stub 0x0890E0B0 -> 0x09DB6AA8, Unlock stub 0x0890E0B8 -> 0x09DB6DE8
+[vobs] #1 LOCK SHRUNK(unk=0) -> game gets base=0x08400000 size=2512KB (we reserved 1584KB top) @scr=32 area=3
+```
+Split = **2512 KB game / 1584 KB Brute** (= 4096 KB). `framework.log` clincher: the live
+entity's `pmo=0x086772A0` (inside our top slice `[0x08674000, 0x08800000)`) vs `0x094B1F80`
+in the failed runs — the engine sourced the model from volatile-top. **The game RESPECTED the
+reduced size** (precondition 1 holds: its real footprint fit in 2.4 MB, our top survived
+intact). The general real-HW path for *any* custom-moveset / no-native-analog monster: the
+interposer carves the slice from the game's session-long volatile lock; no `sctrlHENSetMemory`,
+no partition resize, no XMB risk, every PSP model. `tmp/realhw_interposer_success.log` archives
+the run. (The §7 v59-native-anim fallback stays for the zero-extra-RAM case.)
+
+**Toggle `g_proxy_enabled` (inject.cpp); recon left in (`g_recon_*`, off via
+`g_recon_enabled=0`) for re-measuring.** Wired: `install.cpp` poll calls `mhfu_vobs_install()`
+(once, at first village = post-savedata, before any depart) + `mhfu_vobs_flush()` (ms0-gated
+ring drain); `registry.cpp` `mhfu_dispatch_quest_beginning` calls the (now-disabled) recon arm.
 
 ## Key build/tooling facts
 
