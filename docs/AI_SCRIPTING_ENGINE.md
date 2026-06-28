@@ -1040,13 +1040,38 @@ side-systems untouched), moves + spins sustained. Reference mod:
 
 ## Descriptor table = the move "database" (no names)
 
-`entity+0x640` → base ptr (`0x09D5A580`; remap `0x09BD38F0`). 8-byte rows
-indexed by `a1`: `+0` action-id byte, `+1` slot/body-part kind, `+3` remap idx,
-`+4` param (→`+0x32C`), `+6` param (→`+0x334` mode). **Binary only** — MHFU
-ships no human-readable AI-move strings. The `<SPECIES>_ACTION_*` /
-`TIGREX_VT8_INPUT_*` names are hand-authored by observing forced actions. Next:
-dump the table + force-cycle `a1` via `on_bigmonster_action` to enumerate +
-name a species' full moveset.
+`entity+0x640` → base ptr (`0x09D5A580` = `em75.ovl`/`file_06108 + 0x40440`;
+remap `0x09BD38F0` when `entity+0x638` bit 0 set). 8-byte rows indexed by `a1`
+(`base + a1*8`).
+
+**LIVE-VERIFIED layout (2026-06-28, full table dumped off the running Brute):**
+the Tigrex table is **123 rows** (a1 `0x00..0x7A`; at a1=123 the `b0` self-index
+ramp restarts → the next block). Each row:
+
+| byte | meaning |
+|------|---------|
+| b0 | `= a1` (self-index ramp, verified 0x00..0x7A) |
+| b1 | category: `0xFF` normal (121 rows) / `0x01` (only a1 24,25) |
+| b2–b5 | `0x00` |
+| b6,b7 | two small even params (0,2,4,6,8,10,16) — purpose TBD (not the clip) |
+
+**The clip slot is NOT stored in the row — it is DERIVED from `a1`:** the applied
+per-slot input is `a1 + 0x3E8` (live `entity+0x324` = 1005 ⇒ a1 5), resolved by
+vt[8] `0x08865254` → clip ptr in the `entity+0x1AC` table. So **to reach a clip you
+just force its `a1`** (no row authoring); the row only needs to *exist* with a valid
+category.
+
+**Consequence for porting:** the table has **123 action rows ≥ the ~100 clip slots**
+in a big-mon anim pack, so on the Tigrex host **every clip is reachable by forcing
+some `a1` 0..122 — no descriptor injection is needed to make a ported moveset
+accessible to Lua AI scripting.** Descriptor injection only matters for (a) a host
+with fewer rows than your clips, or (b) custom **hitboxes** (NOT in this row — separate
+data, see hitzone RE). **Binary only** — no human-readable move strings; the
+`<SPECIES>_ACTION_*` names are hand-authored by watching forced actions.
+
+Tooling: `anim table <slot>` dumps this table live; `anim sweep <slot> [lo hi]`
+force-cycles `a1` via `on_bigmonster_action` and logs the resulting clip ptr to build
+the `a1 → clip` map (`src/mhfu_bot/cli/commands/moveset.py`).
 
 ## Auto-paint map cheat (locate a roaming monster)
 

@@ -85,7 +85,7 @@ end
 -- is alphabetical, so "cli_bridge" wraps "brute_tigrex" naturally; if brute_tigrex
 -- is later hot-reloaded it reclaims mhfu_tick — re-save cli_bridge.lua to re-wrap.
 if not _G.__cli_bridge_installed then
-  _G.__cli_bridge_prev_tick = rawget(_G, "mhfu_tick")
+  _G.__cli_bridge_prev_tick = _G.mhfu_tick   -- sandbox has no rawget; plain read is fine
   _G.__cli_bridge_installed = true
   function mhfu_tick()
     local p = _G.__cli_bridge_prev_tick
