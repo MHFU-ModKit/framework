@@ -158,8 +158,30 @@ typedef struct {
     uint8_t  _pad[3];
 } mhfu_bigmonster_death_ctx_t;
 
+/* on_bigmonster_damaged — observe event derived from the per-slot HP tracker
+ * on the 5 Hz monster poll. Fires when a big monster's HP DROPS between poll
+ * ticks (a player weapon hit, a trap tick, etc.). Because it is poll-derived
+ * it coalesces multiple hits inside one ~200 ms tick into a single `amount`
+ * and is NOT frame-accurate: do not use it to suppress the engine's own
+ * hit-reaction (the engine dispatches the flinch through the action executor,
+ * so intercept THAT with on_bigmonster_action). Use this to let a mod REACT to
+ * being hit — re-assert a forced action, change behaviour, count chip damage,
+ * trigger a custom move, etc. Observe-only (no override). Zero engine detours:
+ * it reuses the same HP edge-tracker that drives on_bigmonster_death. */
+typedef struct {
+    uint32_t entity_ptr;
+    int      slot;          /* entity-registry slot 1..20            */
+    uint8_t  monster_type;
+    uint8_t  _pad[3];
+    uint16_t hp;            /* HP after the drop (entity+0x2E4)       */
+    uint16_t prev_hp;       /* HP at the previous poll tick           */
+    uint16_t amount;        /* prev_hp - hp, always > 0 when fired    */
+    uint16_t _pad2;
+} mhfu_bigmonster_damage_ctx_t;
+
 typedef void (*mhfu_bigmonster_spawn_cb_t)(const mhfu_bigmonster_spawn_ctx_t *ctx);
 typedef void (*mhfu_bigmonster_death_cb_t)(const mhfu_bigmonster_death_ctx_t *ctx);
+typedef void (*mhfu_bigmonster_damage_cb_t)(const mhfu_bigmonster_damage_ctx_t *ctx);
 
 /* Context for on_bigmonster_action — the COHERENT action-selection seam.
  * Hook = entry detour on the big-monster action EXECUTOR (overlay
@@ -256,6 +278,8 @@ mhfu_hook_rc_t mhfu_on_bigmonster_spawn(
     mhfu_bigmonster_spawn_cb_t cb, int priority);
 mhfu_hook_rc_t mhfu_on_bigmonster_death(
     mhfu_bigmonster_death_cb_t cb, int priority);
+mhfu_hook_rc_t mhfu_on_bigmonster_damaged(
+    mhfu_bigmonster_damage_cb_t cb, int priority);
 
 mhfu_hook_rc_t mhfu_off_bigmonster_slot_picked   (mhfu_slot_picked_override_cb_t cb);
 mhfu_hook_rc_t mhfu_off_bigmonster_action_input  (mhfu_action_input_override_cb_t cb);
@@ -263,6 +287,7 @@ mhfu_hook_rc_t mhfu_off_bigmonster_action_decided(mhfu_action_override_cb_t cb);
 mhfu_hook_rc_t mhfu_off_bigmonster_ai_step      (mhfu_ai_step_cb_t        cb);
 mhfu_hook_rc_t mhfu_off_bigmonster_spawn        (mhfu_bigmonster_spawn_cb_t cb);
 mhfu_hook_rc_t mhfu_off_bigmonster_death        (mhfu_bigmonster_death_cb_t cb);
+mhfu_hook_rc_t mhfu_off_bigmonster_damaged      (mhfu_bigmonster_damage_cb_t cb);
 
 /* ---- action-ptr cache (tigrex-style pointer resolution) ----------------
  *

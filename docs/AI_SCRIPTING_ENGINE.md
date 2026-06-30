@@ -479,8 +479,15 @@ Slot 0's root-motion delta is mirrored to `entity+0x40/0x44/0x48`
 |-------|-----------|------|-------|
 | `on_bigmonster_action_decided` | vt[8] = `0x08865254` swap (Section 22 pattern) | sync override, $v0 mutable | behavioral pick |
 | `on_bigmonster_ai_step`        | enter `z_un_08865648` (per-frame per-entity) | observe-only | tick |
+| `on_bigmonster_damaged` (2026-06-30) | 5 Hz monster-poll HP-drop edge (reuses `g_last_hp[]`) | observe-only | poll |
 
-The two hooks are EBOOT-resident. Section 26 JIT bypass (install at
+`on_bigmonster_damaged` (lua `mhfu.on_bigmonster_damaged(ent,type,amount,hp,slot)`) fires
+when a big monster TAKES damage — poll-derived (coalesces multi-hits per 200 ms, NOT
+frame-accurate; zero new engine detours). Use it to REACT to being hit (re-assert a forced
+action, trigger a custom move). For frame-accurate flinch SUPPRESSION intercept
+`on_bigmonster_action` instead (the engine dispatches the hit-reaction through the executor).
+
+The two action hooks are EBOOT-resident. Section 26 JIT bypass (install at
 TITLE/MENU before first quest tick) applies to `0x08865648`. vt[8] swap
 is JIT-immune (data lookup).
 

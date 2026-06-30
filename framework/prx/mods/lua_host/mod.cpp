@@ -1087,6 +1087,7 @@ static int lb_action_ptr_for(lua_State *L)
 static int g_inst_quest   = 0;          /* C trampoline installed?         */
 static int g_inst_spawn   = 0;
 static int g_inst_death   = 0;
+static int g_inst_damaged = 0;
 static int g_inst_overlay = 0;
 static int g_inst_slot    = 0;
 static int g_inst_input   = 0;
@@ -1096,6 +1097,7 @@ static int g_inst_action  = 0;
 static int r_quest   = LUA_NOREF;       /* registry ref to the Lua handler */
 static int r_spawn   = LUA_NOREF;
 static int r_death   = LUA_NOREF;
+static int r_damaged = LUA_NOREF;
 static int r_overlay = LUA_NOREF;
 static int r_slot    = LUA_NOREF;
 static int r_input   = LUA_NOREF;
@@ -1366,6 +1368,26 @@ static void tramp_death(const mhfu_bigmonster_death_ctx_t *ctx)
     lua_leave();
 }
 
+/* on_bigmonster_damaged fires from the 5 Hz monster poll thread (same context
+ * as spawn/death), so it calls lua_enter() directly. Lua signature:
+ *   function(entity_ptr, monster_type, amount, hp, slot) end           */
+static void tramp_damaged(const mhfu_bigmonster_damage_ctx_t *ctx)
+{
+    if (r_damaged == LUA_NOREF || !lua_enter()) return;
+    lua_State *L = g_L;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, r_damaged);
+    lua_pushinteger(L, (lua_Integer)ctx->entity_ptr);
+    lua_pushinteger(L, ctx->monster_type);
+    lua_pushinteger(L, ctx->amount);
+    lua_pushinteger(L, ctx->hp);
+    lua_pushinteger(L, ctx->slot);
+    if (lua_pcall(L, 5, 0, 0) != LUA_OK) {
+        mhfu_log("[lua_host] damaged err: %s", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_leave();
+}
+
 /* quest_targets_building fires on the engine's quest-load (game) thread, so it
  * marshals to the exec thread like the other game-thread callbacks. */
 static void tramp_quest(const void *vctx)
@@ -1400,6 +1422,13 @@ static int lb_on_death(lua_State *L)
     store_ref(L, &r_death);
     int prio = (int)luaL_optinteger(L, 2, 0);
     if (!g_inst_death) { mhfu_on_bigmonster_death(tramp_death, prio); g_inst_death = 1; }
+    return 0;
+}
+static int lb_on_damaged(lua_State *L)
+{
+    store_ref(L, &r_damaged);
+    int prio = (int)luaL_optinteger(L, 2, 0);
+    if (!g_inst_damaged) { mhfu_on_bigmonster_damaged(tramp_damaged, prio); g_inst_damaged = 1; }
     return 0;
 }
 static int lb_on_overlay(lua_State *L)
@@ -1515,6 +1544,7 @@ static const luaL_Reg k_mhfu_api[] = {
     { "on_quest_targets_building",  lb_on_quest },
     { "on_bigmonster_spawn",        lb_on_spawn },
     { "on_bigmonster_death",        lb_on_death },
+    { "on_bigmonster_damaged",      lb_on_damaged },
     { "on_ai_overlay_loaded",       lb_on_overlay },
     { "on_bigmonster_slot_picked",  lb_on_slot },
     { "on_bigmonster_action_input", lb_on_input },

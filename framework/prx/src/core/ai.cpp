@@ -182,6 +182,7 @@ typedef struct { mhfu_action_override_cb_t cb; int priority; } action_entry_t;
 typedef struct { mhfu_ai_step_cb_t         cb; int priority; } step_entry_t;
 typedef struct { mhfu_bigmonster_spawn_cb_t cb; int priority; } bmspawn_entry_t;
 typedef struct { mhfu_bigmonster_death_cb_t cb; int priority; } bmdeath_entry_t;
+typedef struct { mhfu_bigmonster_damage_cb_t cb; int priority; } bmdamage_entry_t;
 typedef struct { mhfu_action_sel_override_cb_t cb; int priority; } actionsel_entry_t;
 
 static overlay_entry_t g_overlay_chain[MAX_HANDLERS];
@@ -198,6 +199,8 @@ static bmspawn_entry_t g_bmspawn_chain[MAX_HANDLERS];
 static int             g_bmspawn_n = 0;
 static bmdeath_entry_t g_bmdeath_chain[MAX_HANDLERS];
 static int             g_bmdeath_n = 0;
+static bmdamage_entry_t g_bmdamage_chain[MAX_HANDLERS];
+static int              g_bmdamage_n = 0;
 static actionsel_entry_t g_actionsel_chain[MAX_HANDLERS];
 static int               g_actionsel_n = 0;
 
@@ -1115,6 +1118,20 @@ extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_death(mhfu_bigmonster_death_cb_t c
     CHAIN_REMOVE(g_bmdeath_chain, g_bmdeath_n, cb);
 }
 
+extern "C" mhfu_hook_rc_t mhfu_on_bigmonster_damaged(
+    mhfu_bigmonster_damage_cb_t cb, int priority)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    CHAIN_INSERT(g_bmdamage_chain, g_bmdamage_n, MAX_HANDLERS, cb, priority);
+    return MHFU_HOOK_OK;
+}
+
+extern "C" mhfu_hook_rc_t mhfu_off_bigmonster_damaged(mhfu_bigmonster_damage_cb_t cb)
+{
+    if (!cb) return MHFU_HOOK_BADARG;
+    CHAIN_REMOVE(g_bmdamage_chain, g_bmdamage_n, cb);
+}
+
 /* Called by registry.cpp on the existing monster_spawned event when a
  * new entity ptr appears in a registry slot. We filter big-monster and
  * fan out our chain.  Also seeds the HP tracker. */
@@ -1137,10 +1154,11 @@ extern "C" void mhfu_ai_on_monster_spawn(int slot, uint32_t entity, uint8_t type
 }
 
 /* Run from the monster-spawn poll thread (alongside the slot-ptr walk):
- * for each big-monster slot, watch HP > 0 -> 0 edge. */
+ * for each big-monster slot, watch the HP edge — a DROP fires on_damaged,
+ * the HP>0 -> 0 transition fires on_death. */
 extern "C" void mhfu_ai_poll_death(void)
 {
-    if (g_bmdeath_n == 0) return;
+    if (g_bmdeath_n == 0 && g_bmdamage_n == 0) return;
     for (int slot = 1; slot < MHFU_ENTITY_REGISTRY_SLOTS; slot++) {
         if (!g_was_big[slot]) continue;
         uint32_t e = mhfu_entity_at(slot);
@@ -1148,7 +1166,24 @@ extern "C" void mhfu_ai_poll_death(void)
         uint16_t hp = mhfu_entity_hp(e);
         uint16_t prev = g_last_hp[slot];
         g_last_hp[slot] = hp;
-        if (prev > 0 && hp == 0) {
+
+        /* Damage edge: HP dropped since the last poll tick. Reported before the
+         * death edge so the killing blow is also delivered as damage. Guarded by
+         * hp < prev so a rage/heal HP rise never fires it. */
+        if (g_bmdamage_n != 0 && hp < prev) {
+            mhfu_bigmonster_damage_ctx_t d;
+            d.entity_ptr   = e;
+            d.slot         = slot;
+            d.monster_type = mhfu_entity_type(e);
+            d._pad[0] = d._pad[1] = d._pad[2] = 0;
+            d.hp       = hp;
+            d.prev_hp  = prev;
+            d.amount   = (uint16_t)(prev - hp);
+            d._pad2    = 0;
+            for (int i = 0; i < g_bmdamage_n; i++) g_bmdamage_chain[i].cb(&d);
+        }
+
+        if (g_bmdeath_n != 0 && prev > 0 && hp == 0) {
             mhfu_bigmonster_death_ctx_t c;
             c.entity_ptr   = e;
             c.slot         = slot;
