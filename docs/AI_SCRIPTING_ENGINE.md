@@ -1196,3 +1196,63 @@ practical mod work.
 
 Reference mod: `framework/prx/mods/experimental/ai_demo/mod.cpp`.
 
+---
+
+## §33 — Big-monster COMBAT-LATCH / notice→aggressive escalation (2026-07-01)
+
+RE'd why a **species-swapped** big monster (Giadrome→Tigrex; native model via
+`brute_tigrex.lua CAPTURE_NATIVE=true`) roar-loops and never fights, using the fork's
+slot-7 **native** Tigrex (charges ~6 s after load) as the working reference. This is the
+layer ABOVE the action executor — the high-level AI state machine that decides to ENTER
+combat.
+
+**Brain state machine (Tigrex, overlay `0x09D26xxx`):**
+- **Outer AI state = `entity+0x299` (u8, 0..0x21).** The per-frame brain driver
+  `0x09D33EA0` reads it, bounds-checks (`sltiu at,v1,0x22`), and `jr`s through the jump
+  table **`0x09D626F0`** (`[base + state*4]`, `jr v1` @`0x09D33ECC`) to that state's
+  handler. Native and swap were BOTH `+0x299=4` → same handler → the divergence is a data
+  flag, not the dispatch.
+- **Inner brain phase = `entity+0x1D5` (u8).** Each state-handler sub-switches on it.
+- **State-4 handler `0x09D26648` = roar→charge:** phase 0 fires the **ROAR** through the
+  action executor `0x09AC5228` with **a1=0x36**, sets `+0x523=1`; phase 1 waits for the
+  roar anim (`+0x76A` tracker); phase 2 → **escalation gate** → `+0x1D5=3` (`sb`
+  @`0x09D2675C`) + `jal 0x09D26158` (**combat-enter**: sets `+0x4B5=1`, dispatches
+  `entity->vt[0x88]`) → the monster charges.
+
+**THE ESCALATION GATE = `entity+0xBC` bit 0.** The phase-2 path (`0x09D26744`):
+`lhu +0xBC; andi 1; bne !=0 → skip`; it writes `+0x1D5=3` only when **bit0 == 0**.
+`+0xBC` is a **fast-toggling per-frame flag**. On the **native** it reaches 0 often at
+brain 2 → escalates reliably. On the **swap** it is stuck at **1 in 44/45 brain-2
+frames** → the escalation almost never fires → the monster loops roar↔notice forever
+(`+0x1D5` oscillates 1↔2, never 3; `+0x4B5` never sets).
+
+**Proven:** force-clearing the swap's `+0xBC &= ~1` at high rate DID fire combat-enter
+(`+0x4B5` reached 1), but the engine **re-sets bit0 every frame**, so the clears race it →
+on-screen the monster "wiggles, completes no animation." Force-poking confirms the gate
+but is not a clean fix — there is a per-frame WRITER of `+0xBC` bit0 whose condition holds
+on the swap but clears on the native (lead: **roar-completion**; the roar tracker `+0x76A`
+differed native-vs-swap, and brain phase 1 waits on it → the swap's roar never "completes"
+→ bit0 never clears).
+
+**Retractions / corollaries:** the ROAR itself dispatches through the executor
+`0x09AC5228` (a1=0x36), so a swap showing "0 executor calls" via the framework detour =
+the **detour was dead on that instance** (JIT-wiped), NOT the executor being absent.
+Target also differs (native→player `+0x2F4=0x090B3440`; swap→cat `0x090BDC40`) but forcing
+target never helped → symptom, not cause.
+
+**Open / next:** write-BP `+0xBC` on the swap to find the per-frame bit0 SETTER + its
+condition (why perpetually "not ready" on the swap); compare to native. That points to
+either a real fix (satisfy roar-completion / the missing wiring) or confirms it's
+spawn-time combat wiring → the native add-target/relocate spawn path.
+
+**Key cells:** gate `+0xBC` bit0, brain `+0x1D5`, outer state `+0x299`, combat-enter flag
+`+0x4B5`, roar tracker `+0x76A`. **Code:** dispatcher `0x09D33EA0` (tbl `0x09D626F0`),
+handler `0x09D26648`, escalate write `0x09D2675C`, combat-enter `0x09D26158`,
+roar-via-executor `0x09AC5228 a1=0x36`.
+
+**Tooling note:** the fork's debugger **`savestate.load` command did NOT reload** here
+(no-op). Reliable reload = relaunch `--state slot7` (`lifecycle.launch_ppsspp(state=)`),
+which loads the slot DIRECTLY (fast, no full boot). Native slot 7 = `ULES01213_1.01_6.ppst`
+(area 109); charges ~6 s after in-area then dies to an Anteka → basecamp (reload to see it
+again). Full narrative → memory `swap-bigmon-combat-latch-gate` (sessions 3/3b/3c).
+
