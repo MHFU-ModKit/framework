@@ -1256,3 +1256,83 @@ which loads the slot DIRECTLY (fast, no full boot). Native slot 7 = `ULES01213_1
 (area 109); charges ~6 s after in-area then dies to an Anteka → basecamp (reload to see it
 again). Full narrative → memory `swap-bigmon-combat-latch-gate` (sessions 3/3b/3c).
 
+### §33b — UPDATE (2026-07-01, session 4): `+0xBC` is a SYMPTOM; combat-enter IS reached but resolves to RE-ALERT
+
+The write-BP on `+0xBC` **supersedes the "gate = `+0xBC` bit0" framing above.** bit0 is
+honest animation state, and the escalation is NOT actually stuck — it fires and lands in
+the wrong place.
+
+- **`+0xBC` bit0 = "root-bone clip still playing this frame."** Per-frame SETTER =
+  **`0x088639B0`** in the EBOOT anim/clip interpolator (`0x08863xxx`), NOT the overlay
+  brain: `sh v0,0x3C(s1)` with `s1 = ent+0x80` (root-bone clip state; `+0x3C(s1) =
+  ent+0xBC`). It **unconditionally ORs bit0** whenever the clip has not passed its end —
+  gate `0x088638E0 c.le (phase+speed), clip_end`; when past end it takes the **clear path**
+  (`0x08863A40`/`0x08863A68`: `andi 0xFFFE; sh`). Clip-state fields at `ent+0x80`: `+0x10`
+  phase, `+0x14` speed, `+0x18` loop-restart, `+0x1C` end, `+0x3C`(=`+0xBC`) flags (bit0
+  playing / bit1 loop / bit2 set on the roar). So bit0 clears cleanly at every clip's end;
+  the swap just cycles roar(end=292)→short→short→roar, and bit0 only clears during the
+  short clips while `+0x1D5`==1, never mid-roar while `+0x1D5`==2 → the `+0x1D5==2 &&
+  bit0==0` coincidence the gate needs never happens. (A cat hit flinch-interrupts the roar
+  → bit0 clears at a catchable moment → brief engage — HITL-confirmed.)
+- **combat-enter `0x09D26158` IS reached** (stack-walk at a `+0x299` write-BP, live nested
+  chain): `driver 0x09D33F1C → state-4 handler (ret 0x09D2676C) → combat-enter (ret
+  0x09D261A4; jalr vt[0x88] @0x09D2619C) → combat_step vt[0x88] 0x09D3D608 → overlay
+  dispatch 0x09D3D79C (idx = s2&0xFFFF into table 0x09D62D68; idx 0 → 0x09D3D7C8) →
+  0x09D3C8D8 (action-dispatch on a1) → 0x09AC8690 → enter_state2 0x09AC87E8 → set_ai_state
+  0x09AC8818(state=2)`. So the swap's virtual "combat step" **resolves to
+  `enter_state2(state=2)` = RE-ALERT** (resets `+0x1D5=0`, sets `+0x4B7=1`) → the roar→charge
+  phase machine restarts → the loop. combat-enter passes **mode a2=2** (its `v0==2` branch
+  `0x09D26184`); mode 2 → dispatch idx 0 → action-id switch default → the state-2 path.
+- **`set_ai_state 0x09AC8818(a0, a1→+0x298, a2→+0x299)`** is the generic AI-state setter:
+  writes `+0x298`/`+0x299`, zeroes `+0x1D5/6/7`, calls `z_un_08865cb8`. Wrapper
+  `enter_state2 0x09AC87E8` clears `+0x769`, sets `+0x4B7=1`. (The §33 "`+0x4B5=1` =
+  combat-enter" is imprecise — the reached path sets `+0x4B7`; `+0x4B5` stayed 0.)
+- **Swap targets the CAT** (`+0x2F4=0x090BDC40`, `+0x542=1`), not the player
+  (`0x090B3440`). vtable = `0x089BB69C`, `vt[0x88]=0x09D3D608`.
+
+**Refined root:** the escalation FIRES but its `vt[0x88]` combat-step resolves to re-alert
+because the mode/action combat-enter passes (=2) — and/or the target being the cat — selects
+the "return to alert" dispatch branch. `+0xBC` is downstream coupling, not the lever (poking
+it races the clip writer → "wiggle"). **Next (HITL + fork):** capture the same chain on the
+native slot-7 Tigrex and diff (a) combat-enter's mode arg (`0x09D2617x`), (b) dispatch idx
+`s2&0xFFFF` (table `0x09D62D68`), (c) `+0x2F4` target — the differing one is why native
+charges. Still points to **Path 2 (native add-target/relocate spawn wires real combat)** as
+the fix. **New code addrs:** clip-flag setter `0x088639B0` (+0xBC), clip state `ent+0x80`,
+combat_step `0x09D3D608`, dispatcher `0x09D3D79C` + table `0x09D62D68`, action-dispatch
+`0x09D3C8D8`, enter_state2 `0x09AC87E8`, set_ai_state `0x09AC8818`. Full narrative → memory
+`swap-bigmon-combat-latch-gate` (session 4).
+
+### §33c — ✅ SOLVED (2026-07-01, sessions 4d–4f, HITL): use the ADD path, not a bare SWAP
+
+The combat-latch problem is not a gate to poke — it's that a **bare emId SWAP reuses the
+quest's single, incompletely-provisioned target group**, so the monster can posture (roar/
+notice) but never commits. A natively-**ADDED** monster gets a **fresh target GROUP + its own
+manager + full provisioning** (`buildTargets → mgr_ctor → provision_driver → resource_reg`),
+and **that fights + deals damage.**
+
+- **API:** `mhfu_quest_add_monster(quest, id[, x, z])` (Lua `mhfu.quest_add_monster`) in a
+  `QUEST_TARGETS_BUILDING` subscriber — appends a list-A node + splits the new monster into
+  `target[1]` (group 1) + bumps `Quest+0x67C=2`. Same-family = resident overlay, no relocation.
+- **Proven (native Tigrex quest):** add a 2nd Tigrex → BOTH the native and the added one deal
+  real damage to the player (killed twice; combat states 8–22 targeting the player). The bare
+  swap deals 0.
+- **General path for a different-family quest (Giadrome→Brute), shipped in
+  `mods/lua_host/scripts/dup_test.lua`:** the one AI-overlay slot follows the emId + the
+  add-forge is disarmed, so a bare different-family add has no overlay → **REPLACE**
+  Giadrome→Tigrex first (overlay+node0 = Tigrex), **ADD** a 2nd Tigrex (same family now → the
+  fighter), **suppress the primary** (teleport off-map + clear the visible bit). Ride the
+  **Brute v63 model inject** (`inject_relocate 6185`) on top → the ported Brute renders,
+  animates with his own moveset, engages, and kills. No crash from inject+replace+add.
+- **Visibility fix:** the added fighter spawns in the intro section, not the player's; forcing
+  `+0x29A` at the 2 Hz `mhfu_tick` can't hold (the engine re-derives the section tracker from
+  POSITION each frame). A **one-time physical relocate** into the player's section STICKS (the
+  engine then maintains it) AND kicks it from idle into combat.
+- **Gotchas:** (1) forcing a specific action via `on_bigmonster_action` SETS the freeze gate
+  `+0x4B8` (0x100|0x10000) faster than a 2 Hz clear → the monster freezes ("stuck standing") —
+  let natural combat run instead. (2) `cli_bridge.lua` hooks `on_bigmonster_action` at priority
+  90; a lower-priority force loses the chain. (3) **hitbox↔anim DESYNC:** v63 ships the Brute's
+  OWN clips but the Tigrex overlay drives the actions/hitbox timing → an attack hitbox can be
+  active during a non-attack pose ("killed by touching him"); ship **v58 (Tigrex-rig retarget)**
+  for synced hitboxes, **v63** for authentic moves. **Timer freeze:** hold `0x09A05DD0` +
+  `0x09A050F8` (~2 Hz). Full detail → memory `swap-bigmon-combat-latch-gate` (§4d–4f).
+
