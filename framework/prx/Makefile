@@ -14,7 +14,8 @@ PROJECT_DIR = $(shell pwd)
 .PHONY: all realhw clean host-make shell
 
 all:
-	docker run --rm -v "$(PROJECT_DIR)":/work -w /work $(DOCKER_IMG) \
+	docker run --rm --user "$(shell id -u):$(shell id -g)" \
+	    -v "$(PROJECT_DIR)":/work -w /work $(DOCKER_IMG) \
 	    bash -c "psp-pacman -S --noconfirm pspsdk-bin >/dev/null 2>&1 || true; make -f Makefile.psp"
 	@# Real-PSP fix part 2: clear EF_MIPS_ABI_EABI32 from e_flags (psp-prxgen copies
 	@# it verbatim; old firmware/PRO CFW reject it -> 0x800200D9). Host-side (the
@@ -25,7 +26,8 @@ all:
 # partition instead of the PPSSPP raw extra-RAM window). cleans first so every TU
 # picks up the define, then renames the output to mhfu_framework_realhw.prx.
 realhw:
-	docker run --rm -v "$(PROJECT_DIR)":/work -w /work $(DOCKER_IMG) \
+	docker run --rm --user "$(shell id -u):$(shell id -g)" \
+	    -v "$(PROJECT_DIR)":/work -w /work $(DOCKER_IMG) \
 	    bash -c "psp-pacman -S --noconfirm pspsdk-bin >/dev/null 2>&1 || true; \
 	             make -f Makefile.psp clean >/dev/null 2>&1 || true; \
 	             make -f Makefile.psp EXTRA_DEFINES=-DMHFU_REALHW && \

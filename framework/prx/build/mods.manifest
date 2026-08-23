@@ -29,7 +29,11 @@ lua_host
 # 2026-06-19 UPDATE: v7 did NOT fix the skel ptr (engine still reads a bad
 # restructured skel -> FK write crash @0x08863198). Re-enabled with a STACK-CHEAP
 # fix_c (no mhfu_log; fires for any bad-magic skel incl. the in-place gmem ptr).
-# brute_overlay_hook  # TEMP OFF: native-Tigrex capture (no joint-fix corruption)
+# ON since 2026-08-23: the Brute ships via the RELOCATE inject (its PAC is a
+# different size from native file_06185), and that path needs the frame-free
+# joint-fix to correct the mis-computed skeleton pointer into the xram copy.
+# Verified damaging in-game with it enabled; it is inert when no inject is armed.
+brute_overlay_hook
 
 # brute_port: pure-C swap+inject. SUPERSEDED by brute_tigrex.lua (Lua build, which
 # dodges the PRX-stack collision). Disabled to avoid double swap/inject.

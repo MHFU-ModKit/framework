@@ -1219,6 +1219,15 @@ combat.
   @`0x09D2675C`) + `jal 0x09D26158` (**combat-enter**: sets `+0x4B5=1`, dispatches
   `entity->vt[0x88]`) → the monster charges.
 
+> ⛔ **RETRACTED 2026-08-23 — "on the swap `+0xBC` bit0 is stuck at 1" does not reproduce.**
+> A clean Giadrome→Tigrex swap cycles `+0x299` through 2→3→11→4→5→8, `+0x1D5` reaches 3 and
+> `+0xBC` bit0 clears — it escalates normally, charges, and kills the hunter (51/52/11 damage,
+> measured with every small monster pinned at HP 0). The 2026-07-01 capture was taken with the
+> Brute asset inject on and with per-tick maintenance writes to the monster; both are since
+> shown to be the actual cause. **The gate mechanism below is correct and stays** — it is only
+> the "the swap is stuck here" observation that is withdrawn. → `docs/BRUTE_TIGREX_PORT.md`
+> §2026-08-23.
+
 **THE ESCALATION GATE = `entity+0xBC` bit 0.** The phase-2 path (`0x09D26744`):
 `lhu +0xBC; andi 1; bne !=0 → skip`; it writes `+0x1D5=3` only when **bit0 == 0**.
 `+0xBC` is a **fast-toggling per-frame flag**. On the **native** it reaches 0 often at
