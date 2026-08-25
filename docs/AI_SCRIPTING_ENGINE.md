@@ -1543,25 +1543,39 @@ mechanism.
   `--states` for `(main,sub)` -> handler -> animation ids. Verified to run on em01,
   em20, em40 as well as em75.
 
-### 33h. Coverage across the 17 big monsters
+### 33h. Coverage — all 17 big monsters, same structure (corrected 2026-08-25)
 
-Every one of the 17 `em*.ovl` overlays reads `+0x298`/`+0x299` (19–44 load sites each),
-so the two-channel model is **universal, not a Tigrex quirk**. But only the larger
-movesets got compiled into jump tables; ~10 of the 17 dispatch with if/else chains, and
-`em_moveset.py --states` says so explicitly instead of reporting "not found":
+**Every one of the 17 `em*.ovl` overlays has the identical action tick**: a
+`switch(entity+0x298)` over **exactly 8 main states**, each fanning out into a
+`switch(entity+0x299)` of per-action handlers. 1658 `(main,sub)` rows in total.
 
-| overlay | action tick | (main,sub) rows |
-|---|---|---|
-| em75 (Tigrex) | `0x09D36A08` | 231 |
-| em01 | `0x09D2A508` | 142 |
-| em54 | `0x09D2C380` | 135 |
-| em15 / em17 | `0x09D1AF60` / `0x09D1D1D0` | 107 each |
-| em33 | `0x09D1E278` | 72 |
-| em82 | `0x09D1C208` | 36 |
-| em02, em07, em14, em20, em21, em40, em55, em58, em59, em83 | if/else form | extractor TODO |
+| overlay | action tick | rows | overlay | action tick | rows |
+|---|---|---|---|---|---|
+| em75 (Tigrex) | `0x09D36A08` | 231 | em33 | `0x09D1E278` | 72 |
+| em20 | `0x09D1B438` | 156 | em21 | `0x09D1D230` | 69 |
+| em01 | `0x09D2A508` | 142 | em59 | `0x09D251F0` | 65 |
+| em54 | `0x09D2C380` | 135 | em02 | `0x09D1E5B0` | 62 |
+| em82 | `0x09D1C208` | 117 | em58 | `0x09D204A0` | 58 |
+| em15 | `0x09D1AF60` | 107 | em55 | `0x09D1E4A8` | 49 |
+| em17 | `0x09D1D1D0` | 107 | em07 | `0x09D1E298` | 19 |
+| em83 | `0x09D1D618` | 91 | em40 | `0x09D1B4D8` | 88 |
+| em14 | `0x09D1E3A0` | 90 | | | |
 
-All seven table-form overlays report **exactly 8 main states**, which is a good
-independent check that the `switch(+0x298)` reading is right.
+⚠️ **The earlier claim that ~10 overlays "dispatch with if/else chains" was wrong** —
+they never did. `switch_of()` recognised a jump-table base only when the `%lo`
+immediate was `> 0x1000`, which is true of em75 (`addiu a1, a1, 11088`) and false of
+em02 (`addiu a1, a1, 1688`). Ten overlays therefore reported "no action tick" while
+containing the exact same code shape. **Never filter an address by the size of its low
+half** — test where the computed address *lands* (here: inside `.data`). Fixed by
+resolving `lui`+`addiu` per register and range-checking the result; `want_key=0x298`
+was added at the same time so the species switch in the same function is not mistaken
+for the action dispatch.
+
+The tick is also reachable structurally rather than by pattern: **every monster vtable
+has slot 8 = `0x08865254`** (the shared action picker), and **slot 31 (+0x7C) is the
+species AI entry**. 38 tables carry that signature; the 17 whose slot 31 points into the
+em-overlay range are the big monsters, the rest point into `game_task` — which is the
+small-monster/EBOOT AI split, independently confirmed.
 
 ---
 
