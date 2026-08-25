@@ -1345,3 +1345,47 @@ and **that fights + deals damage.**
   for synced hitboxes, **v63** for authentic moves. **Timer freeze:** hold `0x09A05DD0` +
   `0x09A050F8` (~2 Hz). Full detail → memory `swap-bigmon-combat-latch-gate` (§4d–4f).
 
+---
+
+## Effects and hitboxes are bound to the ACTION ID, not to the clip (2026-08-25)
+
+Measured on the ported Brute, in-game, by forcing one id on two builds of the same monster and
+filming both (`tools/anim_capture.sh <pac> 51`):
+
+* `brute_tigrex_v64_nativeanim` — Brute mesh over the PRISTINE native skeleton/anim. `a1=51`
+  plays the Tigrex **roar**; the hunter covers his ears.
+* `brute_tigrex_v67_hostslots` — fully ported P3rd clips. `a1=51` plays the Brute's **rock
+  throw** — and the hunter *still* covers his ears. No projectile, no knockback, no damage.
+
+So the executor dispatches action 51 and the engine runs 51's semantics; the port only changes
+what is drawn. Confirmed against damage across ids on the ported build: `a1=48` (host = bite)
+lands −53, `a1=51` (host = roar, no damage component) never lands anything.
+
+**Where the semantics are NOT.** The 8-byte descriptor row (`entity+0x640` → `0x09D5A580`) does
+not carry them. Live dump around the tested ids:
+
+```
+  a1 |  b0   b1  b2..b5   p6      observed
+  47 |  47  255       0  0x0004   wind pressure
+  48 |  48  255       0  0x0400   bite — DAMAGES on the port
+  51 |  51  255       0  0x0606   roar (host) / rock throw (port) — no damage
+  53 |  53  255       0  0x0A08
+  54 |  54  255       0  0x0606   jump forward
+```
+
+`a1=51` shares `p6=0x0606` with `46`, `49` and `54`, so `p6` is a mode/param code, not an effect
+selector. The per-action hitbox/effect definition must therefore hang off the **vt[8]-resolved
+action pointer** — the `(input, ptr)` pairs the framework already snoops into its per-species
+cache (`mhfu_action_ptr_for()`). **OPEN:** dump that struct for a damaging id and a roar id and
+diff them. If it is data, an arbitrary port (Zinogre — nothing to align to) can ship its own
+moveset semantics in the relocatable species overlay; if it is code, the semantics have to be
+synthesised framework-side from the executor hook plus joint positions.
+
+### Instrument notes for anyone repeating this
+* **A HELD force is inert.** Rewriting every dispatch to one id plays the clip but deals no
+  damage — the native control managed 0 damage over 5155 co-located ticks at 66 units. Pulse it
+  (fire once, pass through for ~8 ticks). → `monster-ai`
+* **The effect window is not the dispatch.** Syncing a probe to the executor fire catches the
+  effect only ~40 % of the time even on the native build (2 of 5 trials). Count locks; never
+  average them (0 %, 6 %, 105 %, 234 % averages to "no effect" and hides the finding).
+
