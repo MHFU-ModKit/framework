@@ -1647,18 +1647,53 @@ That is the AI-scripting seam: **a mod picks the monster's move by writing `(mai
 and the engine supplies the animation, the timing and the effects.** No native call, no
 PRX rebuild, no per-tick maintenance.
 
-⚠️ **What this run does NOT show: damage.** It was flown with `--keep-hp`, which pins
-hunter HP through the watch precisely so a run survives, so no HP delta could appear.
-The monster was also drifting out (d 321 → 358). "A forced state runs a complete action"
-is established; "a forced state lands a hit" is not, and needs a run without `--keep-hp`
-and with the hunter held inside reach.
+### 34c-bis. And a forced state DEALS DAMAGE — the spin, 2026-08-25
+
+The first attempt showed the sequence but not damage (flown with `--keep-hp`, which pins
+hunter HP by design). Re-flown without it, forcing `(3,0)` = **ANGRY_SPIN** — chosen
+because the spin barely moves the monster and its hitbox is an AoE around him, so simply
+standing close is enough to be hit.
+
+```
+[actset] (0,4) -> (3,0) d=232 #10 t=900     <- the Lua write
+[state]  main=3 sub=0 (a1=43) t=900         <- engine enters (3,0), drives a1=43
+[hit]    -33 HP d=347 main=3 sub=0 t=905    <- 5 ticks later
+[actset] (0,4) -> (3,0) d=265 #12 t=924
+[state]  main=3 sub=0 (a1=43) t=924
+[hit]    -48 HP d=447 main=3 sub=0 t=929    <- 5 ticks later
+```
+
+`RESULT hp 100 -> 0` — **the hunter was killed after 60 s co-located.**
+
+| drop | distance | state | verdict |
+|---|---|---|---|
+| −9 | 4733 | natural (1,0) | too far to be this monster |
+| −9 | 8923 | natural (0,9) | too far |
+| −77 | 654 | natural (1,4) | the monster's own attack — the control |
+| −12 | 418 | **forced (3,0)** | trip-sized (≤15) |
+| −33 | 347 | **forced (3,0)** | **connected attack** |
+| −48 | 447 | **forced (3,0)** | **connected attack** |
+
+**The attribution is airtight: of 9 entries into `(3,0)`, ZERO happened without a pulse
+within 2 ticks.** The monster never chose the spin by itself in this run, so every spin
+was ours, and both attack-magnitude drops land 5 ticks after a pulse with the monster in
+reach. The natural −77 is a useful control: the engine's own moves hit for ~77, so a
+forced move at 33–48 is a real connected hit and not a rounding artefact.
+
+**Conclusion: a mod can pick a monster's move by writing `(main, sub)`, and the engine
+supplies the animation, the timing, the hitbox and the damage.** That is the whole
+framework-side-synthesis thesis demonstrated end to end.
+
+Sample honesty: 2 clean hits (plus one trip) out of 9 forced spins. The spin has a
+radius and the hunter was being walked around by `--pursue`, so misses are expected;
+this measures "can it hit", not a hit rate.
 
 ## 34d. Status of the §33f cross-check list
 
 | # | check | result |
 |---|---|---|
 | 1 | log `+0x298/+0x299` beside forced `a1` | ✅ 26/26 agreement; caught a real extractor bug |
-| 2 | drive `act_set` from Lua, see a complete move | ✅ 51/51, exact predicted `a1` sequence; damage untested |
+| 2 | drive `act_set` from Lua, see a complete move | ✅ 51/51 exact `a1` sequence, and it DEALS DAMAGE (−33, −48; hunter killed) |
 | 3 | force `a1` with `(main,sub)` free → independence | ✅ 8 states / 8 overridden ids |
 
 **Still open — the 08-25 tension is now half-resolved.** §33e flagged that "forced `a1=48`
@@ -1680,3 +1715,17 @@ experiment is 34c-without-`--keep-hp`.
 * `[lua_host] compile FAILED brute_dmg.lua: not enough memory` when a script is copied
   while the previous game still runs is the known hot-reload OOM — harmless, the cold
   boot that follows compiles fine. Check *which boot* the ARMED line belongs to.
+
+### 34f. Correction — MHFU has no cold damage (user, 2026-08-25)
+
+A `-9 HP` drop recorded during the spin run was written up as map cold damage. **There
+is no cold damage in MHFU** — coldness drains max stamina faster and never takes HP.
+The drop is unattributable to the big monster regardless (it happened at **d = 7101**,
+and during the walk phase), so the conclusion stands, but the reasoning was wrong and
+`tools/dmg_experiment.py` carried the same wrong belief in its docstring.
+
+**The small-damage source that does exist near a big monster is TRIP-OVER damage** —
+it walking into the hunter, historically **under 15 points**. So for the spin test the
+bar for "the forced attack connected" is a drop **> ~15 with the monster in reach**;
+anything smaller and close is a trip, and anything at all while the monster is far is
+neither.
