@@ -1389,3 +1389,176 @@ synthesised framework-side from the executor hook plus joint positions.
   effect only ~40 % of the time even on the native build (2 of 5 trials). Count locks; never
   average them (0 %, 6 %, 105 %, 234 % averages to "no effect" and hides the finding).
 
+
+---
+
+# Section 33 — The big-monster overlay, dumped offline: TWO channels, not one (2026-08-25)
+
+Everything below comes from **static analysis of the shipped overlays** with the new
+offline tools (`tools/mips_dis.py`, `tools/ovl_explore.py`, `tools/em_moveset.py`) —
+no emulator, no cold boot. Structure (switch tables, call graph, register flow) is
+solid; the *labels* ("main state 0 is the ground set") are inference and are marked
+where they matter. The live cross-checks that would settle them are listed at the end.
+
+Context that made this legible: MH Frontier's AI has been documented publicly
+(`github.com/Paxlord/frontier-ai-doc-dump`) as an interpreted bytecode whose central
+opcode is `em_cmd_act_set (0x05) [main_state][sub_state][flags]`. MHFU is the same
+engine lineage and has the **same two-field action model** — but compiled, not
+interpreted. That framing is what turned a pile of jump tables into a moveset.
+
+## 33a. A big monster runs on two independent channels
+
+| channel | driven by | lands in | owns |
+|---|---|---|---|
+| **animation** | executor `0x09AC5228(entity, a1)` | `entity+0x324/6/8` (`a1 + 0x3E8 + slot*0xC8`) | which clip the three body-part slots play |
+| **behaviour** | `act_set(entity, main, sub, mode)` | `entity+0x298` / `+0x299` | which per-action CODE runs — hitboxes, effects, transitions |
+
+They are **set together by the engine and are independent when you force them.**
+`mhfu_on_bigmonster_action` hooks the executor, so it moves the animation channel
+**only** — the monster keeps running whatever move its brain selected. That is the
+mechanism behind "the Brute plays the rock throw while the hunter covers his ears":
+the Tigrex AI had genuinely chosen the roar, and the port had filed the Brute's
+rock-throw keyframes into the roar's clip slot (§33e).
+
+## 33b. act_set — MHFU's `em_cmd_act_set`
+
+```
+0x09AC8690  act_set(entity, main_state, sub_state, mode)   <- the public one; em75 calls this
+0x09AC87E8  thin wrapper
+0x09AC8818  the writer:
+              +0x298 = main;  +0x299 = sub
+              +0x460/+0x461  = the PREVIOUS pair (kept for transitions)
+              +0x1D5/6/7     = 0        (the per-action phase counters)
+              +0x1A8..+0x1AB = 0        (per-slot enable bytes)
+              +0x1B0..+0x1BC = 0        (per-slot input cursors)
+```
+
+The `mode` argument (0..4) selects a variant path. Clearing the slot cursors is why
+act_set and the executor cooperate: act_set retires the old animation so the new
+action's handler can install its own.
+
+`act_set` is called from **~40 sites in `game_task.ovl` and 8 in `em75.ovl`** — it is
+generic engine code, not per-species, so it works for every big monster.
+
+## 33c. The read side: `switch(+0x298) -> switch(+0x299) -> handler`
+
+`em75.ovl` never writes `+0x298/+0x299` — it only reads them, in the per-frame action
+tick `0x09D36A08`:
+
+```
+0x09D36A08  main = +0x298; sub = +0x299;  copy both to +0x460/+0x461
+            switch (main) over 8 cases  ->  a per-main sub-dispatcher:
+```
+
+| main | dispatcher | sub_states |
+|---|---|---|
+| 0 | `0x09D33EA0` | 34 |
+| 1 | `0x09D340F8` | 43 |
+| 2 | `0x09D34390` | 25 |
+| 3 | `0x09D34528` | 108 |
+| 4 | `0x09D34F08` | 32 |
+| 5/6/7 | `0x09D35140` / `0x09D351E0` / `0x09D352F0` | no switch |
+
+Each sub_state case calls one handler. A handler is a small **phase machine on
+`+0x1D5`**: phase 0 starts the clip via the executor, phase 1 waits for it, then
+transitions. The roar, `(main 0, sub 2)` = `0x09D26520`, is the canonical shape and is
+the function the old notes quoted as `li a1,0x33; jal 0x09AC5228` — it drives `a1=51`.
+
+`tools/em_moveset.py <ovl> --states` prints the whole table for any species:
+**231 (main,sub) -> handler -> animation-id rows for em75**, e.g.
+
+```
+    (3,  0)  handler 0x09D2C470  anim a1 -> 43
+    (3,  1)  handler 0x09D2C550  anim a1 -> 102,103
+    (3,  6)  handler 0x09D2CC10  anim a1 -> 47,48
+```
+
+## 33d. 🔴 Per-action semantics are CODE, not a data table — branch (a) is closed
+
+The open question from 2026-08-25 was whether a port could ship its own move
+semantics as **data** in its relocated overlay. It cannot. Effects are emitted from
+inside the handler functions, as literal arguments:
+
+```
+spawn_effect(entity, effect_id, bone)   em75 0x09D36B58
+   -> 0x09ACB3E0(entity, effect_id, ...)      game_task, biases effect_id per species
+   -> 0x08883B54(...)                          EBOOT, the actual spawn
+```
+
+Attributed to their behaviour states (`tools/em_moveset.py` + the spawn xref):
+
+```
+  (0,19) / (0,20)   effect 85, 87, 79 at bone 37
+  (1,22)(1,26)(1,41)(1,42)   effect 60 at bone 33
+  (1,23)            effect 60 at bone 33
+```
+
+Timing is `frame_reached(entity, frame)` = `0x09D36BF0` — **1970 call sites in em75**,
+the single hottest function in the overlay. So a move is literally
+`if (frame_reached(F)) spawn_effect(id, bone)`, written per species in MIPS.
+
+There is no per-action hitbox table to inject. The 8-byte descriptor rows at
+`0x09D5A580` stay what §32k said they were, and the model PAC has **no `HITS`
+sub-resource** in this family (checked: native `file_06185` and the port are both
+skeleton/pmo/tmh/anim ×2), so the port is not dropping hitbox data either.
+
+**Consequence for an arbitrary port (the Zinogre bar):** a monster running on a host
+overlay will always *behave* like the host. Authentic semantics have to be
+**synthesised framework-side** — branch (b). The primitives are all generic engine
+code and are now located: `act_set` for the behaviour channel, the executor for the
+animation channel, `spawn_effect`/`0x09ACB3E0` for effects at a bone, and the slot
+container (`entity+0x80+slot*0x40`) for frame timing.
+
+## 33e. What this says about the Brute build
+
+`v67_hostslots` was built with `fill_slots="host"`, which reproduces the host PAC's
+occupancy **slot for slot** — by position, not by meaning. Host slot 51 is the roar;
+the Brute clip that happened to land there is the rock throw. So the observed GIF is
+the engine working correctly: the AI chose the roar, the roar's effect fired, and the
+renderer drew whatever keyframes now live in slot 51.
+
+⚠️ **Open tension worth re-testing.** The 08-25 live runs found forced `a1=48` damaged
+and forced `a1=51` did not, consistently. Under the two-channel model, forcing `a1`
+should not change damage at all — damage belongs to the behaviour channel. Either the
+correlation was weaker than the sample suggested, or the swapped clip's length/frames
+shift the handler's `frame_reached` windows. **Do not treat "a1 owns the hitbox" as
+settled**; it was the right instinct about *host-side* ownership and the wrong
+mechanism.
+
+## 33f. Live cross-checks that would settle §33
+
+1. Log `entity+0x298/+0x299` next to every forced `a1` — proves the channels are
+   independent and names the state the monster was really in.
+2. Call `act_set(entity, main, sub, mode)` from Lua and confirm a *complete* move
+   runs (animation + effect + damage). That is the AI-scripting seam mod authors want.
+3. Force `a1` while holding `(main,sub)` fixed to separate the two effects cleanly.
+
+## 33g. Tools added
+
+* `tools/mips_dis.py` — MIPS32/Allegrex disassembler (integer + cop1; VFPU as raw).
+* `tools/ovl_explore.py` — MWo3 reader: `map` / `dis` / `func` / `xref` / `switch` / `hex`.
+  Reads the file on disk, so it is free and immune to the JIT-marker problem that makes
+  live disassembly of already-translated code useless.
+* `tools/em_moveset.py` — per-species move table: id -> `act_set(main,sub,mode)`, and
+  `--states` for `(main,sub)` -> handler -> animation ids. Verified to run on em01,
+  em20, em40 as well as em75.
+
+### 33h. Coverage across the 17 big monsters
+
+Every one of the 17 `em*.ovl` overlays reads `+0x298`/`+0x299` (19–44 load sites each),
+so the two-channel model is **universal, not a Tigrex quirk**. But only the larger
+movesets got compiled into jump tables; ~10 of the 17 dispatch with if/else chains, and
+`em_moveset.py --states` says so explicitly instead of reporting "not found":
+
+| overlay | action tick | (main,sub) rows |
+|---|---|---|
+| em75 (Tigrex) | `0x09D36A08` | 231 |
+| em01 | `0x09D2A508` | 142 |
+| em54 | `0x09D2C380` | 135 |
+| em15 / em17 | `0x09D1AF60` / `0x09D1D1D0` | 107 each |
+| em33 | `0x09D1E278` | 72 |
+| em82 | `0x09D1C208` | 36 |
+| em02, em07, em14, em20, em21, em40, em55, em58, em59, em83 | if/else form | extractor TODO |
+
+All seven table-form overlays report **exactly 8 main states**, which is a good
+independent check that the `switch(+0x298)` reading is right.
