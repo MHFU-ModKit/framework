@@ -1562,3 +1562,107 @@ movesets got compiled into jump tables; ~10 of the 17 dispatch with if/else chai
 
 All seven table-form overlays report **exactly 8 main states**, which is a good
 independent check that the `switch(+0x298)` reading is right.
+
+---
+
+# Section 34 — §33 confirmed LIVE, and the behaviour channel is scriptable (2026-08-25)
+
+Three cross-checks, two cold boots, native Tigrex (`INJECT_BRUTE=false`) so the port's
+slot mapping could not confound anything. The `a1` these runs log is the id the handler
+*passed to the executor*, before any clip lookup, so the result is about the engine and
+not about any particular animation pack. Tools: the two-channel probe in
+`mods/lua_host/scripts/brute_dmg.lua`, `tools/check_two_channel.py`.
+
+## 34a. The offline table is right — 26 of 26 states agree
+
+Logged `(entity+0x298, entity+0x299, a1)` at every executor dispatch during natural
+play. 44 distinct triples over 28 behaviour states, 450 state transitions.
+
+```
+=> agreement: 26 ok, 0 mismatched, 0 not in the table
+```
+
+Every state the monster entered was in the offline table, and every one asked for an
+animation the table predicted — including the multi-id states (`(2,1)` → 11,15,19,32;
+`(1,0)` → 1,3). Two states the static pass could only mark "(computed)" were resolved
+live: `(1,2)` → a1 5,6 and `(2,13)` → a1 14,30.
+
+**The one initial mismatch was a bug in our extractor, and the live run caught it.**
+`(0,5)` predicted 54, live said 46. The handler is
+
+```
+lbu  v1, 0x1E8(s0)          ; species
+bnel v1, 81, ...            ; branch-LIKELY
+  addiu a1, zero, 46        ;   delay slot — annulled unless the branch is taken
+addiu a1, zero, 54          ; species == 81
+```
+
+`a1` is species-conditional; a **branch-likely annuls its delay slot when not taken**, so
+the slot is the *other arm*, not part of the straight-line path. Walking it linearly
+reported one arm as if it were the only one. `em_moveset.py` now keeps both
+(`(0,5) -> 46,54`) and the check is 26/26. ⚠️ Any future linear reader of this code has
+the same trap waiting.
+
+## 34b. The two channels are INDEPENDENT — proven
+
+With `a1` pinned to 51 through `mhfu_on_bigmonster_action`, the behaviour channel visited
+**8 distinct `(main,sub)` states** and the force overrode **8 distinct natural `a1`
+values** (1, 6, 15, 18, 30, 32, 90…). The monster's brain never noticed. So hooking the
+executor moves the animation channel only and **cannot change what a move does** —
+which is exactly why the 08-25 forced-`a1` runs could not produce working attacks.
+
+## 34c. 🔴 The behaviour channel is scriptable from Lua TODAY — 51/51
+
+`act_set` reimplemented with plain memory writes (the framework has no native-call
+binding yet): save the previous pair to `+0x460/+0x461`, write `+0x298/+0x299`, zero
+`+0x1D5..+0x1D7`. Pulsed every 24 ticks, animation channel untouched.
+
+```
+[actset] (1,0) -> (3,6) #48 t=1152
+[state]  main=3 sub=6 (a1=47) t=1152
+[brute]  ACTION a1=47 (x48) main=3 sub=6 t=1152
+[brute]  ACTION a1=48 (x48) main=3 sub=6 t=1154
+```
+
+**51 pulses → 51 × `a1=47` → 51 × `a1=48`, and 47/48 were dispatched from no other state
+in the entire run.** Writing two bytes and a phase counter makes the engine run the
+`(3,6)` handler, which then drives *its own* two-step animation sequence (windup at t,
+strike two ticks later) — precisely the `47,48` pair the offline table predicts.
+
+That is the AI-scripting seam: **a mod picks the monster's move by writing `(main, sub)`,
+and the engine supplies the animation, the timing and the effects.** No native call, no
+PRX rebuild, no per-tick maintenance.
+
+⚠️ **What this run does NOT show: damage.** It was flown with `--keep-hp`, which pins
+hunter HP through the watch precisely so a run survives, so no HP delta could appear.
+The monster was also drifting out (d 321 → 358). "A forced state runs a complete action"
+is established; "a forced state lands a hit" is not, and needs a run without `--keep-hp`
+and with the hunter held inside reach.
+
+## 34d. Status of the §33f cross-check list
+
+| # | check | result |
+|---|---|---|
+| 1 | log `+0x298/+0x299` beside forced `a1` | ✅ 26/26 agreement; caught a real extractor bug |
+| 2 | drive `act_set` from Lua, see a complete move | ✅ 51/51, exact predicted `a1` sequence; damage untested |
+| 3 | force `a1` with `(main,sub)` free → independence | ✅ 8 states / 8 overridden ids |
+
+**Still open — the 08-25 tension is now half-resolved.** §33e flagged that "forced `a1=48`
+damages, `a1=51` does not" is unexplained by the two-channel model. §34b says forcing `a1`
+cannot change a move's semantics at all, so that correlation cannot have been causal —
+most likely the sample conflated the forced id with whatever the monster's brain was
+independently doing. It should be **retired, not repaired**; the honest replacement
+experiment is 34c-without-`--keep-hp`.
+
+## 34e. Rig notes from these runs
+
+* **A wedged debugger does not stop the game.** `memory.read_u16 timed out` killed the
+  host-side bot ~730 s in, and the Lua probe kept logging for another ~800 ticks — which
+  is where most of the §34b force data came from. Read `framework.log` before assuming a
+  wedged leg produced nothing.
+* **A run that ends in-quest leaves a signed contract**, and the next boot's elder offers
+  to cancel instead of opening the board (`quests.py` handles it, but can burn its three
+  retries). Cost one leg; a re-run cleared it.
+* `[lua_host] compile FAILED brute_dmg.lua: not enough memory` when a script is copied
+  while the previous game still runs is the known hot-reload OOM — harmless, the cold
+  boot that follows compiles fine. Check *which boot* the ARMED line belongs to.
