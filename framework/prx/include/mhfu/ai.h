@@ -1,4 +1,14 @@
 /*
+ * 🔴 TWO CHANNELS (docs/AI_SCRIPTING_ENGINE.md §33-34, verified live 2026-08-26).
+ * Everything in this header hooks the ANIMATION channel: the executor
+ * 0x09AC5228(entity, a1) chooses which CLIP the three body-part slots play.
+ * The MOVE — its hitbox, effect and damage — is chosen by the BEHAVIOUR channel,
+ * act_set 0x09AC8690 -> entity+0x298 (main_state) / +0x299 (sub_state), which the
+ * species overlay dispatches into per-action code. Forcing a1 provably cannot
+ * change what an attack does. No binding for act_set exists yet; drive it from Lua
+ * with plain writes (see the minimal sequence in §34c) until one is added.
+ */
+/*
  * AI override events — synchronous priority-chain hooks that let mods
  * intercept and override the engine's per-frame AI decisions for big
  * monsters (Popo / Anteka / Tigrex / Giadrome and any other species

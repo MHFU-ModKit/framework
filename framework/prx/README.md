@@ -133,11 +133,20 @@ hook the per-frame per-entity tick `z_un_08865648` and its sub-calls
   monster appears in the entity registry.
 - `mhfu_on_bigmonster_death(cb, priority)` — observe; HP > 0 → 0 edge,
   one-shot per slot.
-- `mhfu_on_bigmonster_action(cb, priority)` — **the production action-force
-  seam** (Section 32k). Entry detour on the big-mon executor `0x09AC5228`;
-  rewrite the `a1` action id and the engine fans it to every body-part slot
-  itself — coherent, no desync/crash (verified Tigrex spin-lock). Prefer this
-  over poking per-slot inputs. See `docs/AI_SCRIPTING_ENGINE.md` §32k.
+- `mhfu_on_bigmonster_action(cb, priority)` — **the ANIMATION-force seam**
+  (Section 32k). Entry detour on the big-mon executor `0x09AC5228`; rewrite the
+  `a1` action id and the engine fans it to every body-part slot itself —
+  coherent, no desync/crash (verified Tigrex spin-lock). Prefer this over poking
+  per-slot inputs. See `docs/AI_SCRIPTING_ENGINE.md` §32k.
+
+  🔴 **It changes the CLIP, not the MOVE.** A big monster runs on two channels;
+  hitboxes, effects and damage belong to the behaviour channel
+  (`act_set` → `entity+0x298`/`+0x299`), which this hook does not touch. With `a1`
+  pinned, the behaviour channel was measured moving through 8 states untouched. To
+  drive an actual attack, write the `(main, sub)` pair — a Lua-forced spin dealt
+  −33/−48 and killed the hunter. There is no native-call binding yet; the minimal
+  Lua `act_set` and the per-species `(main,sub)` tables
+  (`tools/em_moveset.py <ovl> --states`) are in `AI_SCRIPTING_ENGINE.md` §33–34.
 
 Big-monster filtering uses an allowlist on `entity+0x1E8` (Tigrex 0x4B,
 Giadrome 0x4D). Will switch to `quest.targets[2]` enumeration once
@@ -248,7 +257,7 @@ Header:    `include/mhfu/ai_script.h` (a1 constants, C helper inlines, docs).
 | Event | API | Thread | Purpose |
 |-------|-----|--------|---------|
 | spawn | `mhfu.on_bigmonster_spawn(fn)` | poll (5 Hz) | initial setup, render fix |
-| action override | `mhfu.on_bigmonster_action(fn, prio)` | exec (marshalled) | force actions |
+| animation override | `mhfu.on_bigmonster_action(fn, prio)` | exec (marshalled) | force the CLIP (not the move — see §33–34) |
 | tick | `function mhfu_tick()` | worker (2 Hz) | maintenance, state advance |
 | death | `mhfu.on_bigmonster_death(fn)` | poll (5 Hz) | disarm AI |
 

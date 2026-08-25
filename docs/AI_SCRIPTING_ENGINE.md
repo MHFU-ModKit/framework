@@ -1347,7 +1347,11 @@ and **that fights + deals damage.**
 
 ---
 
-## Effects and hitboxes are bound to the ACTION ID, not to the clip (2026-08-25)
+## Effects and hitboxes are HOST-SIDE, not carried by the clip (2026-08-25)
+
+> ⚠️ **SUPERSEDED on the mechanism, 2026-08-26 (§33–34).** Host-side ownership below is right;
+> "bound to the ACTION ID" is wrong. They belong to the **behaviour state**
+> `(entity+0x298, entity+0x299)`; `a1` is the animation channel.
 
 Measured on the ported Brute, in-game, by forcing one id on two builds of the same monster and
 filming both (`tools/anim_capture.sh <pac> 51`):
@@ -1376,10 +1380,12 @@ not carry them. Live dump around the tested ids:
 `a1=51` shares `p6=0x0606` with `46`, `49` and `54`, so `p6` is a mode/param code, not an effect
 selector. The per-action hitbox/effect definition must therefore hang off the **vt[8]-resolved
 action pointer** — the `(input, ptr)` pairs the framework already snoops into its per-species
-cache (`mhfu_action_ptr_for()`). **OPEN:** dump that struct for a damaging id and a roar id and
-diff them. If it is data, an arbitrary port (Zinogre — nothing to align to) can ship its own
-moveset semantics in the relocatable species overlay; if it is code, the semantics have to be
-synthesised framework-side from the executor hook plus joint positions.
+cache (`mhfu_action_ptr_for()`).
+
+**ANSWERED 2026-08-26 — and the premise was wrong.** The definition is not behind the
+vt[8]-resolved pointer; that pointer resolves an ANIMATION. Per-action semantics are **code** in
+the species overlay behind `switch(+0x298) -> switch(+0x299)`. So it is the second branch: the
+semantics have to be synthesised framework-side — and that is now demonstrated end to end (§34).
 
 ### Instrument notes for anyone repeating this
 * **A HELD force is inert.** Rewriting every dispatch to one id plays the clip but deals no
@@ -1517,13 +1523,11 @@ the Brute clip that happened to land there is the rock throw. So the observed GI
 the engine working correctly: the AI chose the roar, the roar's effect fired, and the
 renderer drew whatever keyframes now live in slot 51.
 
-⚠️ **Open tension worth re-testing.** The 08-25 live runs found forced `a1=48` damaged
-and forced `a1=51` did not, consistently. Under the two-channel model, forcing `a1`
-should not change damage at all — damage belongs to the behaviour channel. Either the
-correlation was weaker than the sample suggested, or the swapped clip's length/frames
-shift the handler's `frame_reached` windows. **Do not treat "a1 owns the hitbox" as
-settled**; it was the right instinct about *host-side* ownership and the wrong
-mechanism.
+⚠️ **RESOLVED 2026-08-26 (§34b) — retired, not repaired.** The 08-25 runs found forced
+`a1=48` damaged and forced `a1=51` did not. Forcing `a1` provably cannot change a move's
+semantics (with `a1` pinned, the behaviour channel moved through 8 states untouched), so
+that correlation was never causal — most likely the sample conflated the forced id with
+whatever the monster's brain was independently doing.
 
 ## 33f. Live cross-checks that would settle §33
 
