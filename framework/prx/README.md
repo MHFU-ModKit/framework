@@ -242,6 +242,30 @@ version = 1
 7. **C++ atan2f etc. need `extern "C"`** (or `<math.h>`) or the linker
    looks for the mangled name.
 
+## Lua ported-monster runtime (v2) — `mhfu_port.lua`
+
+The current surface for "load a ported MHP3rd monster and script its AI". A plain memstick mod,
+so no rebuild; full guide in **`docs/MOD_PORTED_MONSTER.md`**.
+
+It exists because of the two-channel finding (`docs/AI_SCRIPTING_ENGINE.md` §33–34): the v1
+surface below moves the ANIMATION only, and a port's clips are filed into host slots **by
+position, not by meaning**, so the host handler asks for clip *N* and gets whatever the packer
+put there. v2 makes the mapping explicit —
+
+```lua
+moves = { charge = { main = 3, sub = 6, clip = "charge" } }
+```
+
+`port:play("charge")` writes the behaviour pair `entity+0x298/+0x299` (the physics, the hitbox,
+the damage) **and** latches the port's own clip over the executor dispatch that follows. That is
+what lets a port with no host analogue — a Zinogre — have moves at all: you pick a host behaviour
+for its physics and put your own animation on it.
+
+Worked example: `mods/lua_host/scripts/brute_showcase.lua`, flown by `tools/brute_showcase.py`.
+
+⚠️ v1's `brute_tigrex.lua` predates this and forces `a1` alone. Everything it does to the clip is
+still true; everything it implies about the MOVE is not.
+
 ## Lua AI scripting layer (v1) — ported monsters
 
 Lets a Lua script define the behaviour of a ported monster that runs on a
