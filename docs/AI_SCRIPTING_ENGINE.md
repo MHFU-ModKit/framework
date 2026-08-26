@@ -1921,3 +1921,23 @@ body — a head-and-neck movement while the body stands. That is the engine's ow
 `tools/slot_catalog.py` prints it as a labelling template: slot -> the `(main,sub)` pairs
 that drive it, whether the host and the port fill it, and whether the port's clip there is
 unique or aliased.
+
+## 34f. A move table row is not proof the species uses that move
+
+`em_moveset` enumerates what the dispatcher can *reach*. Now that `a1` is known to be
+the animation slot index (§34e), each row can be checked against the species' own PAC —
+and **16 of the Tigrex's 74 driven slots have no clip in `file_06185` or `file_06134`, in
+any stream**:
+
+```
+  55 56 63 64 66 84 85 86 87 88 89 91 92 93 94 99
+```
+
+Slot 92 is referenced by **13** behaviour pairs, joint-most in the whole table, and the
+monster has no animation for it. Those pairs cannot animate, which is an **offline
+predictor** for the rule `monster-ai` records empirically ("a pair the engine never enters
+bounces straight back out" — 411 of 411 forced moves lasted one tick). Check the slot has a
+clip before spending a cold boot forcing the pair.
+
+`tools/slot_catalog.py` prints the list. The likely reading is that em75.ovl carries generic
+or variant code paths the shipped Tigrex never takes; it has not been chased further.
