@@ -282,12 +282,19 @@ end
 --- Lock the monster's XZ where it stands. The Y is left alone: the engine drives
 --- it to the local floor every frame and fighting that makes a monster sink.
 ---
---- ⚠️ This is a per-tick write and CLAUDE.md rule 8 says never maintain a big
+--- 🔴 ONLY PIN A BEHAVIOUR THAT IS ALREADY STATIONARY. This rewrites the position
+--- at 2 Hz while the engine advances it every frame, so against a pursuit state
+--- it is a tug of war the player can see: a play session logged `pin corrected`
+--- of 526-646 units on EVERY tick, and on screen the monster slid forward and
+--- snapped back twice a second. That is not the lock misbehaving, it is the
+--- wrong behaviour pair underneath it — pick one the census reports as
+--- HOLDS + STATIONARY (`tools/em_state_census.py`) and the pin has nothing to do.
+---
+--- ⚠️ It is also a per-tick write, and CLAUDE.md rule 8 says never maintain a big
 --- monster per-tick. The rule is about UNCONDITIONAL maintenance of +0x29A /
---- +0x638 / size / the freeze gate, which is what made swapped monsters look
---- combat-broken. This write is conditional, scoped to one brain phase, and
---- reports how far it actually had to correct — if that number is 0 the lock is
---- doing nothing and can be removed.
+--- +0x638 / size / the freeze gate; this is conditional and scoped to one brain
+--- phase. The `pin corrected` number is the honest gauge: at 0 it is doing
+--- nothing and can go.
 function Port:pin()
   if self.ent == 0 or self.pinned then return end
   self.pinned = { rf(self.ent + OFF_POS),
@@ -408,6 +415,13 @@ local function port_state(port)
     section = sec, area = area, same_section = (sec == area),
     -- true on the first tick of a new frame: dist is readable, travelled is not
     reframed = (last == nil or last[3] ~= sec),
+    -- ⚠️ NOT full combat mode. +0x5DC comes up when the monster has DETECTED you
+    -- and is pursuing — the '!' over its head. Played by hand, a swapped Brute
+    -- showed the '!' and pursued but the yellow eye never appeared next to the
+    -- hunter's name: a swapped big monster detects and does not latch combat
+    -- (agent_memory_map.md, aggro-commit — the swap leaves the combat target
+    -- unwired and engage flickers 1->0->1). No read for the latched state is
+    -- known. Gate on this and you are gating on "has noticed you".
     engaged = mhfu.entity_engaged(ent),
     main = mhfu.read_u8(ent + OFF_MAIN), sub = mhfu.read_u8(ent + OFF_SUB),
     hp = mhfu.read_u16(ent + OFF_HP),
