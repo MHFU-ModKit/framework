@@ -206,8 +206,9 @@ a per-tick force.
 comes up when the monster has detected you and is pursuing — the `!` over its head. Played by
 hand, the ported Brute showed the `!` and roamed and pursued, but the **yellow eye never
 appeared next to the hunter's name**: a swapped big monster detects but does not latch combat
-(`docs/agent_memory_map.md`, the aggro-commit section — the swap leaves the combat target
-unwired and engage flickers 1→0→1). So gating a brain on `s.engaged` gates on "has noticed you",
+⛔ Not, as this guide used to say, because "the swap leaves the combat target unwired" — that was
+a misread of the target-table base and is retracted. The target is wired **to the Felyne**. So
+gating a brain on `s.engaged` gates on "has noticed you",
 which is weaker and flickier than it sounds.
 
 **The read for "is he after ME" is `s.targets_player`** (`+0x2F4`, the resolved combat target),
@@ -218,13 +219,19 @@ it oscillates several times a second up close and loses outright at range — a 
 it stutters. Log it (every showcase phase line carries `tgt=`), gate on `engaged`, and treat a
 single sample of this cell as meaningless.
 
+⚠️ A native Tigrex reads PLAYER 100 %, but that is **not** a native-vs-swap difference: the
+savestate it was measured on (`tigrex_s6`) has no Felyne at all. It is cat-present vs cat-absent.
+
 **🔴 What it usually resolves to is the FELYNE, and that is not a swap defect.** `+0x542` is a
 target priority index — `0` = player, `1` = cat — and the Felyne outranks the hunter whenever it
 is alive. Holding the cat at HP 0 raises the player's share of `+0x2F4` from 0–4 % to 32–100 %
 (`tools/felyne_target_test.py`). ⚠️ It does not reliably hand the target over, and it does **not**
-produce the yellow eye: `+0x2A4` read 0 in every sample of every run, including at the moment
-`+0x2F4` read PLAYER. Note also that `dmg_experiment.Culler` cannot touch the cat — it walks the
-entity registry and the Felyne is not in it (fixed address `0x090BDC40`).
+produce the yellow eye. ⛔ And **`+0x2A4` is not the cell to chase** — it reads 0 on a *native*
+Tigrex that is engaged, targeting the player and mid-attack with the eye plainly visible
+(`tigrex_s6`, screenshot-verified). The best current reading is that the eye means "this
+monster's target is me right now" and what differs is the **duty cycle**: ~6 s on the cat, ~0.1 s
+on the player, too brief to see. Note also that `dmg_experiment.Culler` cannot touch the cat — it
+walks the entity registry and the Felyne is not in it (fixed address `0x090BDC40`).
 
 **⚠️ A coordinate pin fights the engine, and the SIZE of the fight is the diagnostic.**
 `port:pin()` rewrites the position at the 2 Hz tick while the engine keeps advancing it every

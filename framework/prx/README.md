@@ -261,6 +261,14 @@ the damage) **and** latches the port's own clip over the executor dispatch that 
 what lets a port with no host analogue — a Zinogre — have moves at all: you pick a host behaviour
 for its physics and put your own animation on it.
 
+🔴 **ONE dispatch, not all of them.** A forced pair is not a single executor dispatch: filmed
+live, one seven-tick `(2,1)` asked the executor for a1 **15, 11, 19 and 18** in turn — a handler
+runs a *sequence* of sub-actions. Answering every dispatch restarts the port's clip from frame 0
+several times inside one move, which on screen is "no animation ever plays to the end" — the same
+symptom as forcing a pair the engine refuses, from the opposite cause. The latch covers the
+dispatch that OPENS the move (`act_set` has just zeroed the phase cursor) and abstains after;
+`latch = <n>` on a move buys more.
+
 Worked example: `mods/lua_host/scripts/brute_showcase.lua`, flown by `tools/brute_showcase.py`.
 
 ⚠️ v1's `brute_tigrex.lua` predates this and forces `a1` alone. Everything it does to the clip is

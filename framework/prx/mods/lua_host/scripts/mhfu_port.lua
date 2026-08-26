@@ -99,8 +99,9 @@ local FREEZE_BITS   = 0x100 | 0x10000
 -- 🔴 The player's WORLD position is the combat entity's transform row 3.
 -- `mhfu.player_pos()` reads 0x09998D50, which is the CAMERA EYE — it reported
 -- d=26000 for a monster that was 365 units away. Framework bug; fixing the
--- header needs a PRX rebuild and there is no PSP toolchain on this machine, so
--- the correct address is used directly here.
+-- header needs a PRX rebuild, which is a `make -C framework/prx` away (the
+-- toolchain is the `pspdev/pspdev:latest` Docker image and it is on this box) —
+-- nobody has done it. Until then the correct address is used directly here.
 local PLAYER_ENT  = 0x090B3440
 local PLAYER_XYZ  = 0x40
 
@@ -167,8 +168,11 @@ end
 
 -- ------------------------------------------------------------- act_set
 -- act_set (0x09AC8690) reimplemented with plain memory writes, because the
--- framework has no native-call binding and no PSP toolchain is installed to add
--- one. The engine's version also clears the per-slot cursors behind two
+-- framework has no native-call binding for it. ⚠️ That is a gap, not a wall: the
+-- PRX builds from `pspdev/pspdev:latest` via `make -C framework/prx` and the
+-- image is on this box, so a real binding — and a tick faster than 2 Hz — is
+-- work rather than a blocker. The engine's version also clears the per-slot
+-- cursors behind two
 -- condition checks; this does the unconditional part, which is the minimum a
 -- handler needs to run from its first phase. Measured: a pair written this way
 -- ran a complete attack and killed the hunter.
@@ -322,19 +326,25 @@ end
 --- Lock the monster's XZ where it stands. The Y is left alone: the engine drives
 --- it to the local floor every frame and fighting that makes a monster sink.
 ---
---- 🔴 ONLY PIN A BEHAVIOUR THAT IS ALREADY STATIONARY. This rewrites the position
---- at 2 Hz while the engine advances it every frame, so against a pursuit state
---- it is a tug of war the player can see: a play session logged `pin corrected`
---- of 526-646 units on EVERY tick, and on screen the monster slid forward and
---- snapped back twice a second. That is not the lock misbehaving, it is the
---- wrong behaviour pair underneath it — pick one the census reports as
---- HOLDS + STATIONARY (`tools/em_state_census.py`) and the pin has nothing to do.
+--- 🔴 PIN A PAIR THAT ONLY DRIFTS, AND WATCH THE NUMBER. This rewrites the
+--- position at 2 Hz while the engine advances it every frame, so the lock is
+--- always undoing something; what matters is how much. Against a pursuit state
+--- it is a tug of war the player can see — a play session logged 526-646 units
+--- corrected on EVERY tick, and on screen the monster slid forward and snapped
+--- back twice a second. Against a pair the engine actually dwells in it is ~45.
+---
+--- ⚠️ Do NOT expect to retire it. The plan was to drop the pin once the pair
+--- underneath was stationary, and the measurement said no pair is: the census
+--- called (2,1) "HOLDS + STATIONARY" at 45 units/TICK under a threshold of 60,
+--- but the tick is 2 Hz, so that is 90 units a SECOND — a probe that held (2,1)
+--- continuously walked the Brute 10 952 -> 31 164 units off the map in 450 s.
+--- The census now says STILL under 25/tick and DRIFTS up to 60.
 ---
 --- ⚠️ It is also a per-tick write, and CLAUDE.md rule 8 says never maintain a big
 --- monster per-tick. The rule is about UNCONDITIONAL maintenance of +0x29A /
 --- +0x638 / size / the freeze gate; this is conditional and scoped to one brain
---- phase. The `pin corrected` number is the honest gauge: at 0 it is doing
---- nothing and can go.
+--- phase. `unpin` logs the running total — divide by the tick count and compare
+--- to 45 (fine) and to 526 (the wrong pair underneath).
 function Port:pin()
   if self.ent == 0 or self.pinned then return end
   self.pinned = { rf(self.ent + OFF_POS),
@@ -480,19 +490,33 @@ local function port_state(port)
     -- ⚠️ NOT full combat mode. +0x5DC comes up when the monster has DETECTED you
     -- and is pursuing — the '!' over its head. Played by hand, a swapped Brute
     -- showed the '!' and pursued but the yellow eye never appeared next to the
-    -- hunter's name: a swapped big monster detects and does not latch combat
-    -- (agent_memory_map.md, aggro-commit — the swap leaves the combat target
-    -- unwired and engage flickers 1->0->1). No read for the latched state is
-    -- known. Gate on this and you are gating on "has noticed you".
+    -- hunter's name.
+    --
+    -- ⛔ The reason is NOT "the swap leaves the combat target unwired" — that
+    -- was retracted (a misread of the target-table base). The target is wired,
+    -- to the CAT: `+0x542` is a priority index and the Felyne outranks the
+    -- hunter, so `+0x2F4` sits on the cat ~6 s and flicks to the player ~0.1 s,
+    -- measured as PLAYER 0-4 % of samples. The yellow eye is that 0.1 s window,
+    -- too short to see. A native Tigrex in a quest with no Felyne reads PLAYER
+    -- 100 % and shows a solid eye (savestate `tigrex_s6`).
+    --
+    -- Gate on this and you are gating on "has noticed you".
     engaged = mhfu.entity_engaged(ent),
     -- 🔴 WHO he has committed to, which is NOT what `engaged` says.
-    -- `+0x2F4` is the resolved combat target pointer. A native slot-7 Tigrex
-    -- resolves it to the player `0x090B3440`; a Giadrome->Tigrex SWAP resolves
-    -- it to the CAT `0x090BDC40` (agent_memory_map.md, +0x2F4 / +0x542) — which
-    -- is the same monster, on the same quest, showing the '!' and pursuing with
-    -- `engaged` true. That difference is the missing yellow eye, and it is the
-    -- read a brain should gate on when it means "is he after ME".
-    -- `+0x2A4` is the aggro-eval's target-acquired flag, set once its gates pass.
+    -- `+0x2F4` is the resolved combat target pointer, selected by the priority
+    -- index `+0x542` (0 = player, 1 = cat). It is a DIAGNOSTIC, not a gate: it
+    -- oscillates several times a second up close (CAT 44 % / PLAYER 42 % in one
+    -- take) and the cat wins outright at range (CAT 100 %), so a brain that
+    -- gates on `targets_player` stutters.
+    --
+    -- ⚠️ A native Tigrex reads PLAYER 100 %, but do NOT read that as
+    -- native-vs-swap: the savestate it was measured on (`tigrex_s6`) has no
+    -- Felyne at all (`0x090BDC40` reads vtable 0, HP 0, position NaN). It is
+    -- cat-present vs cat-absent.
+    --
+    -- `+0x2A4` is the aggro-eval's target-acquired flag. ⛔ It is NOT the
+    -- combat-mode read — it is 0 on a native Tigrex that is engaged, targeting
+    -- the player and mid-attack with the yellow eye plainly visible.
     target = target, targets_player = (target == PLAYER_ENT),
     acquired = mhfu.read_u8(ent + OFF_ACQUIRED),
     main = mhfu.read_u8(ent + OFF_MAIN), sub = mhfu.read_u8(ent + OFF_SUB),
