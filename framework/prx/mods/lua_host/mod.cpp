@@ -21,7 +21,7 @@
  * serialised by a binary semaphore (lua_enter / lua_leave). The panic handler
  * releases the lock before parking so a dead VM never hangs the game thread.
  *
- * Heap: a dedicated 64 KB slab (sceKernelAllocPartitionMemory) with a
+ * Heap: a dedicated 256 KB slab (sceKernelAllocPartitionMemory) with a
  * self-contained allocator, so Lua never competes with the game or the
  * framework newlib heap. MHFU leaves <512 KB contiguous free at runtime and
  * each section load pulls its own PAC — a big slab starves that load and the
@@ -76,8 +76,19 @@ static SceUID g_filebuf_uid = -1;
 /* ------------------------------------------------------------------ slab
  * A self-contained implicit-free-list allocator over a fixed slab. Lua's
  * realloc-heavy pattern is fully supported (malloc/free/realloc + forward
- * coalescing). Keep the slab SMALL (see header comment). */
-#define LUA_SLAB_BYTES (64 * 1024)
+ * coalescing).
+ *
+ * 🔴 SIZED 2026-08-26, and the old 64 KB was a real ceiling, not a margin. The
+ * VM plus the prelude plus ONE ~10 KB mod already sat at live=63776B of 65536 —
+ * a second mod (the ported-monster runtime) could not compile at all, and the
+ * failure was invisible because mhfu_log drops everything before the game
+ * reaches an area, so boot-time compile errors never reached framework.log. A
+ * mod that never loaded looked exactly like a mod that did nothing.
+ *
+ * 256 KB is ~1% of the 24 MB user partition on real hardware, which is the
+ * constraint that made this small in the first place. `[lua_host] VM ready`
+ * logs live and peak — size it off that rather than off a guess. */
+#define LUA_SLAB_BYTES (256 * 1024)
 
 typedef struct blk_hdr { unsigned size; unsigned free; } blk_hdr; /* 8 bytes */
 
