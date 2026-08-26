@@ -1879,3 +1879,45 @@ cat-vs-player comparison could not control for.)
   action is running; it is the wrong tool for choosing one.
 * A "monster is in combat" predicate should read `+0x5DC` plus the `(main,sub)` pair
   against the table, not any of the `+0x4Bx` flags.
+
+## 34e. 🔴 `a1` IS the animation slot index — identity. The chain is closed.
+
+§34a gave `(main,sub) -> a1`. The hop nobody had pinned was `a1 -> which clip in the
+PAC`, and `capture_action_anim_map.py` was written on the assumption it could only be
+resolved live. It resolves offline, and the answer is that there is no mapping to resolve:
+
+**Evidence 1 — every live `a1` lands on a filled slot.** Take the 715-sample native trace,
+take each body-slot's `a1`, and look it up in `file_06185`'s anim sub as a *slot index* in
+the stream that body-slot reads (0/1/2 -> streams 0/2/4): **2145 of 2145 hit a populated
+slot, 0 miss.** The native Tigrex fills 62/64/62 of 100 and leaves 38 empty per stream, so
+a wrong mapping would miss constantly.
+
+**Evidence 2 — the asymmetric handler is explained by the asset.** `(0,8)`/`(0,9)` drive
+`a1` 24/25 into body-slot 1 only, pushing slots 0 and 2 to `a1` 1 (§34b). Slots 24 and 25
+exist **only in stream 2**, and carry **9 tracks** — stream 2's whole bone partition:
+
+```
+  slot  s0   s2   s4   sum
+     1  31    9    5    45      idle — a whole-rig clip
+    54  31    9    5    45      the roar
+    17  31    9    5    45      the charge
+    24   0    9    0     9      HEAD-ONLY, stream 2 only
+    25   0    9    0     9      HEAD-ONLY, stream 2 only
+```
+
+The handler puts 24 in body-slot 1 because **that is the only slot that has it**. MHFU ships
+partial clips that animate one bone partition and are designed to be layered over an idle
+body — a head-and-neck movement while the body stands. That is the engine's own version of
+"the head is doing something else", and it is a feature.
+
+**So the whole chain is now data:**
+
+```
+  act_set(main, sub)  ->  em_moveset row  ->  a1  ==  PAC anim slot index
+                                              |
+                          body-slot 0/1/2 read streams 0/2/4, 31+9+5 = 45 bones
+```
+
+`tools/slot_catalog.py` prints it as a labelling template: slot -> the `(main,sub)` pairs
+that drive it, whether the host and the port fill it, and whether the port's clip there is
+unique or aliased.
