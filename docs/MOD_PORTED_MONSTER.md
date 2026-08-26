@@ -92,7 +92,7 @@ Drop it in `ms0:/PSP/PLUGINS/mhfu_framework/mods/` next to `mhfu_port.lua` and c
 | `inject_dir` | defaults to `ms0:/PSP/PLUGINS/mhfu_framework/inject` |
 | `replace` | list of quest monster ids to swap for `species` at `QUEST_TARGETS_BUILDING` |
 | `clips` | name → executor `a1` |
-| `moves` | name → `{ main, sub, clip }` (or `anim = <a1>` to skip the vocabulary) |
+| `moves` | name → `{ main, sub, clip }` (or `anim = <a1>` to skip the vocabulary). `latch = <n>` overrides how many executor dispatches the clip covers — **the default is 1**, because one forced pair runs a SEQUENCE of sub-actions (a seven-tick `(2,1)` asked for a1 15, 11, 19 and 18 in turn) and overriding all of them restarts the clip from frame 0 each time |
 
 The injector is armed **once per boot** however many times `define` runs, so hot-reloading a
 mod file is safe.
@@ -107,12 +107,17 @@ mod file is safe.
 | `tick` | tick counter |
 | `x, y, z` / `px, py, pz` | monster / player world position |
 | `dist` | XZ distance between them |
-| `travelled` | units moved since the last tick — the only speed signal a 2 Hz brain gets |
+| `travelled` | units the MONSTER moved since the last tick — the signal that says which behaviour pair is running |
+| `closing` | units the GAP shrank since the last tick. Not the same number: a hunter walking into a charge contributes his own speed. **Project reach-the-player decisions off this**, or off `max(travelled, closing)` |
 | `section`, `area`, `same_section` | |
+| `reframed` | true on the first tick after a section change: `dist` is readable, `travelled`/`closing` are not |
 | `engaged` | `entity+0x5DC` — **detected/pursuing, NOT full combat.** See the warning below |
+| `target` / `targets_player` | `entity+0x2F4`, the resolved combat target pointer, and whether it is the hunter. This is the "is he after **me**" read `engaged` is not |
+| `acquired` | `entity+0x2A4`, the aggro-eval's target-acquired flag |
 | `main`, `sub` | the live behaviour pair |
 | `move` | the scripted move still running, or `nil` when it has ended |
-| `pinned` | is the coordinate lock on |
+| `last_move`, `last_move_ticks` | what the previous scripted move was and **how many ticks it survived**. A forced pair the host handler declines ends on its first tick — this is the only way to find that out, and what a candidate shortlist rotates on |
+| `pinned`, `slip` | is the coordinate lock on, and how many units it had to correct last tick |
 | `hp`, `player_hp` | |
 
 ### `port:play(name [, min_gap])`
@@ -169,18 +174,27 @@ either pair **zero times**.
 writes and reports, per pair, how long the engine HOLDS it and whether it moves the monster:
 
 ```
-state     dwell    n  move/tick     a1   verdict          (dwell in 2 Hz ticks)
-(2, 8)     23.7   46       1127   [15]   HOLDS + MOVES        <- the charge
-(0, 7)     15.8  109          ?   [80]   HOLDS + MOVES
-(2, 1)     11.5   45         45   [15]   HOLDS + STATIONARY   <- a "held in place" move
+state     dwell    n  move/tick     a1   verdict       (2 Hz: move/tick x2 = units/second)
+(2, 8)     23.7   46       1127   [15]   HOLDS + MOVES       <- the charge
+(0, 7)     15.8  109          ?   [80]   HOLDS + unmeasured
+(2, 1)     11.5   45         45   [15]   HOLDS + DRIFTS      <- the "held in place" move
+(3, 0)     10.9  123        121   [43]   HOLDS + MOVES
 (3, 6)      5.0  120        649   [47]   short — will bounce out
-(4,15)        —    0          —          NEVER ENTERED        <- what the showcase used
+(4,15)        —    0          —          NEVER ENTERED       <- what the showcase used
 ```
 
 Long dwell means the handler is happy to run. Never-entered means it will bounce out however good
 it looks in the dispatcher table. Closing speed alone is not enough either: `(3,6)` closes
 649 units/tick when the ENGINE picks it, and exits after one tick having moved ~30 when forced
 from out of range — it is a close-range lunge and the target was too far.
+
+**⚠️ And read `move/tick` as units per SECOND before you call anything still — the tick is 2 Hz.**
+This report used to print `HOLDS + STATIONARY` for anything under 60 units/tick, which made
+`(2,1)`'s 45 look like standing still. It is **90 units a second, in whatever direction the
+monster happens to be facing**: a clip probe that held `(2,1)` continuously walked the Brute
+**10 952 → 31 164 units off the map in 450 s** while the run sat waiting for him to arrive. The
+verdict column now says `STILL` under 25/tick and `DRIFTS` between 25 and 60. `?` is a gap in the
+sample, not a finding — the pair never occurred on two consecutive co-located ticks.
 
 **⚠️ A scripted move ends on its own.** The runtime drops the clip latch when the engine moves
 off the pair you wrote, because leaving it latched paints your animation over whatever the AI
@@ -194,21 +208,49 @@ hand, the ported Brute showed the `!` and roamed and pursued, but the **yellow e
 appeared next to the hunter's name**: a swapped big monster detects but does not latch combat
 (`docs/agent_memory_map.md`, the aggro-commit section — the swap leaves the combat target
 unwired and engage flickers 1→0→1). So gating a brain on `s.engaged` gates on "has noticed you",
-which is weaker and flickier than it sounds. There is no known read for the latched state yet.
+which is weaker and flickier than it sounds.
 
-**⚠️ A coordinate pin fights the engine, visibly.** `port:pin()` rewrites the position at the 2 Hz
-tick while the engine keeps advancing it every frame. If the underlying behaviour is a pursuit
-state, the monster slides forward and snaps back twice a second — a play session logged
-`pin corrected` of **526–646 units on every single tick**. Pin only a behaviour that is already
-stationary (see the census `HOLDS + STATIONARY` column); if you are pinning to stop a monster
-that wants to walk, you have the wrong behaviour pair, not a missing lock.
+**The read for "is he after ME" is `s.targets_player`** (`+0x2F4`, the resolved combat target),
+and it is worth watching but **not worth gating on**. Sampled every 1.5 s across two takes of a
+swapped Brute: with him never closer than 3200 units it was **the CAT, 100 % of samples**; with
+him at a median of 663 units and in the scripted loop, **CAT 44 %, PLAYER 42 %, none 14 %**. So
+it oscillates several times a second up close and loses outright at range — a brain that gates on
+it stutters. Log it (every showcase phase line carries `tgt=`), gate on `engaged`, and treat a
+single sample of this cell as meaningless.
+
+**⚠️ A coordinate pin fights the engine, and the SIZE of the fight is the diagnostic.**
+`port:pin()` rewrites the position at the 2 Hz tick while the engine keeps advancing it every
+frame, so the lock is always undoing something. What matters is how much. Against a pursuit
+state it is a tug of war the player can see: a play session logged `pin corrected` of **526–646
+units on every single tick**, and on screen that is a monster sliding forward and snapping back
+twice a second — which is exactly what "he floats forward and clips back" was. Against a pair the
+engine actually dwells in it is ~45.
+
+So the rule is not "never pin", it is **pin a pair that only drifts, and watch the number**. The
+runtime prints a running total (`pin has corrected N ticks, M units total`); divide and compare.
+If it is in the hundreds per tick you have the wrong behaviour pair, not a missing lock. And do
+not expect to retire the pin altogether — the intent was to drop it once the pair underneath was
+stationary, and the measurement said no pair in the census is stationary enough for a monster to
+be held still for four seconds without one.
 
 **🔴 Verify your clip ids on YOUR build before you trust them.** They are positions in the packed
 PAC, and they move whenever the PAC is rebuilt. `docs/brute_tigrex_anim_ids.txt` was labelled by
-filming an *earlier* Brute and the `-1` offset recorded for `v67_hostslots` is **unverified for
-the ids the showcase uses**. A wrong id is not a subtle failure: clips carry root motion on the
-hip joint, so painting the wrong one over a grounded behaviour visibly lifts the monster off the
-floor. Film them with `tools/anim_capture.sh <pac> <a1>`.
+filming an *earlier* Brute and the `-1` offset recorded for `v67_hostslots` is confirmed for
+`a1=51` and nothing else. A wrong id is not a subtle failure: clips carry root motion on the hip
+joint, so painting the wrong one over a grounded behaviour visibly lifts the monster off the floor.
+
+`tools/clip_probe.py` films several ids in one cold boot — it holds the monster in `(2,1)`, pins
+his coordinates so anything moving is the clip's own motion, and cuts the recording into one
+folder per id. Filmed on `v67_hostslots` (2026-08-26): **`a1=61` and `a1=82` render the Brute high
+off the ground and rotating; `a1=69` renders him low.** That is the "he flings into the air way
+higher than he should" the showcase was reported with, and it is attached to specific ids.
+
+⚠️ **It is not yet enough to say what any of them IS**, and the reason is worth knowing: a forced
+pair does not correspond to one executor dispatch. One seven-tick `(2,1)` asked the executor for
+a1 15, 11, 19 and 18 in turn — the handler runs a *sequence*. The probe overrode all of them, so
+each window is one clip restarted several times over several different behaviours. `port:play`
+now latches for **one** dispatch by default for exactly this reason; a clean single-clip capture
+needs the probe to do the same.
 
 **🔴 Decode floats with `mhfu.read_f32`, not by hand.** The `if u >= 0x80000000` idiom in most
 of this repo's scripts is always true on the PSP build (32-bit `lua_Integer` wraps the literal),

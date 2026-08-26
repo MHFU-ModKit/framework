@@ -90,6 +90,10 @@ local OFF_PHASE     = 0x1D5   -- per-action phase cursor (+0x1D5..+0x1D7)
 local OFF_SECTION   = 0x29A   -- u16, compares against get_area_index()
 local OFF_HP        = 0x41E
 local OFF_FREEZE    = 0x4B8
+-- The two cells that say WHO the monster has committed to, as opposed to
+-- whether it has noticed anyone. See `targets_player` in the state table.
+local OFF_TARGET    = 0x2F4   -- u32, resolved combat target pointer
+local OFF_ACQUIRED  = 0x2A4   -- u8, aggro-eval target-acquired flag
 local FREEZE_BITS   = 0x100 | 0x10000
 
 -- 🔴 The player's WORLD position is the combat entity's transform row 3.
@@ -221,6 +225,12 @@ function P.define(spec)
     clip    = nil,      -- currently latched executor a1, nil = hands off
     move    = nil,      -- currently scripted move name
     pinned  = nil,      -- {x, y, z} while the coordinate lock is on
+    -- How long the last scripted move actually SURVIVED, in ticks. This is the
+    -- feedback a brain needs to pick behaviour pairs by measurement instead of
+    -- by hope: a forced pair whose handler declines the situation ends on its
+    -- first tick, and the only way to find that out is to try it and count.
+    last_move = nil, last_move_ticks = 0,
+    slip    = 0,        -- units the pin had to correct on the last tick
     _brain  = nil,
   }, Port)
 
@@ -260,22 +270,52 @@ function Port:play(move_name, min_gap)
   act_set(self.ent, mv.main, mv.sub)
   self.move, self._played, self._played_at = move_name, move_name, self._tick
   self.clip = mv.clip and self.clips[mv.clip] or mv.anim
+  -- 🔴 HOW MANY DISPATCHES THE CLIP OVERRIDE IS GOOD FOR, and one is the right
+  -- answer. A forced pair does not correspond to a single executor dispatch:
+  -- filmed live, one `(2,1)` lasting seven ticks asked the executor for a1
+  -- 15, 11, 19 and 18 in turn — the handler runs a SEQUENCE of sub-actions.
+  -- Overriding all of them restarts the port's clip from frame 0 each time,
+  -- which is the same held-force failure that made the first build look like
+  -- "no animation ever plays to the end", arriving by a different route. So the
+  -- latch covers the dispatch that OPENS the move (act_set has just zeroed the
+  -- phase cursor, so that is the move's first action) and then abstains, and the
+  -- engine's own choice stands for the rest. `latch = <n>` on a move buys more.
+  self._clip_uses = mv.latch or 1
   return true
 end
 
 --- Hand both channels back to the engine's own AI.
 function Port:release()
-  self.move, self.clip, self._played = nil, nil, nil
+  self.move, self.clip, self._played, self._clip_uses = nil, nil, nil, 0
   self:unpin()
 end
 
 --- Point the monster at (x, z). Writes +0x1F4 only, so the engine's own VFPU
 --- rotator renders the turn — no moonwalk, no matrix fight.
+---
+--- 🔴 THE ANGLE IS `atan2(dx, dz)`, AND GETTING THAT WRONG IS INVISIBLE UNTIL YOU
+--- MEASURE IT. This used to compute `-atan2(z - mz, x - mx)`, which is the same
+--- angle measured from the other axis and in the other direction — exactly 90
+--- degrees out. The symptom, reported from play: "his crazy forward dash goes
+--- first seemingly towards me and then away from me".
+---
+--- It was blamed on the write being contested (`transform_builder` rebuilds the
+--- matrix from this cell every frame, and the species AI writes it too), and
+--- that was wrong: the cell is obeyed exactly. One logged charge, monster at
+--- (13114, 8642), hunter at (11201, 6101):
+---
+---     toward the hunter : -143.0 deg
+---     Port:face wrote   : +127.0 deg
+---     he actually moved : +126.8 deg      <- 0.2 deg from what was written
+---
+--- The engine's convention is the same one `mhfu_bot.navigation` uses for the
+--- player (`yaw = atan2(m20, m22)`, i.e. atan2 of the forward vector's X over
+--- its Z), and `+0x1F4` packs 0..0xFFFF over 0..2pi.
 function Port:face(x, z)
   if self.ent == 0 then return end
   local mx = rf(self.ent + OFF_POS)
   local mz = rf(self.ent + OFF_POS + 8)
-  local hw = math.floor(-atan2(z - mz, x - mx) * 32768.0 / math.pi) % 65536
+  local hw = math.floor(atan2(x - mx, z - mz) * 32768.0 / math.pi) % 65536
   mhfu.entity_set_yaw(self.ent, hw)
 end
 
@@ -301,7 +341,13 @@ function Port:pin()
                   rf(self.ent + OFF_POS + 4),
                   rf(self.ent + OFF_POS + 8) }
 end
-function Port:unpin() self.pinned = nil end
+function Port:unpin()
+  if self.pinned and (self._slip_n or 0) > 0 then
+    log("[port:%s] pin released after correcting %d ticks, %d units total",
+        self.name, self._slip_n, math.floor(self._slip_sum or 0))
+  end
+  self.pinned, self._slip_n, self._slip_sum = nil, 0, 0
+end
 
 function Port:hold_pin()
   local p = self.pinned
@@ -366,7 +412,8 @@ end)
 -- port's. Returning nil abstains and the engine's choice stands.
 mhfu.on_bigmonster_action(function(ctx)
   for _, port in pairs(P.ports) do
-    if ctx.entity == port.ent and port.clip then
+    if ctx.entity == port.ent and port.clip and (port._clip_uses or 0) > 0 then
+      port._clip_uses = port._clip_uses - 1
       if port.clip ~= ctx.action_id then
         log("[port:%s] clip %d -> %d  (move=%s)", port.name, ctx.action_id,
             port.clip, tostring(port.move))
@@ -400,18 +447,33 @@ local function port_state(port)
   -- predictive abort a speed of 15000 units/tick and fired it on nonsense.
   -- Distances are only meaningful within one frame; the first tick after a
   -- change has no valid previous sample.
+  local dist = math.sqrt((mx - px) ^ 2 + (mz - pz) ^ 2)
   local last = port._last
-  local travelled = 0
+  local travelled, closing = 0, 0
   if last and last[3] == sec then
     travelled = math.sqrt((mx - last[1]) ^ 2 + (mz - last[2]) ^ 2)
+    -- 🔴 CLOSING, NOT TRAVELLED, is what a "will he reach the hunter" projection
+    -- has to be built on. They are the same number only when the hunter stands
+    -- still: a hunter walking INTO a charge shrinks the gap by his speed as well
+    -- as the monster's, and a dry run of exactly that had the Brute abort a tick
+    -- late and finish at d=189 with SAFE set to 320. `travelled` still earns its
+    -- place — it is the signal that says which behaviour pair is running — but
+    -- the abort line takes whichever of the two is larger.
+    closing = last[4] - dist
   end
-  port._last = { mx, mz, sec }
+  port._last = { mx, mz, sec, dist }
+  local target = mhfu.read_u32(ent + OFF_TARGET)
   return {
-    travelled = travelled, move = port.move, pinned = (port.pinned ~= nil),
+    travelled = travelled, closing = closing,
+    move = port.move, pinned = (port.pinned ~= nil),
+    slip = port.slip,
+    -- what the LAST scripted move achieved, so a brain can drop a pair the
+    -- engine refuses instead of re-issuing it forever
+    last_move = port.last_move, last_move_ticks = port.last_move_ticks,
     since_play = g_tick - (port._played_at or -999),
     port = port, ent = ent, tick = g_tick,
     x = mx, y = my, z = mz, px = px, py = py, pz = pz,
-    dist = math.sqrt((mx - px) ^ 2 + (mz - pz) ^ 2),
+    dist = dist,
     section = sec, area = area, same_section = (sec == area),
     -- true on the first tick of a new frame: dist is readable, travelled is not
     reframed = (last == nil or last[3] ~= sec),
@@ -423,6 +485,16 @@ local function port_state(port)
     -- unwired and engage flickers 1->0->1). No read for the latched state is
     -- known. Gate on this and you are gating on "has noticed you".
     engaged = mhfu.entity_engaged(ent),
+    -- 🔴 WHO he has committed to, which is NOT what `engaged` says.
+    -- `+0x2F4` is the resolved combat target pointer. A native slot-7 Tigrex
+    -- resolves it to the player `0x090B3440`; a Giadrome->Tigrex SWAP resolves
+    -- it to the CAT `0x090BDC40` (agent_memory_map.md, +0x2F4 / +0x542) — which
+    -- is the same monster, on the same quest, showing the '!' and pursuing with
+    -- `engaged` true. That difference is the missing yellow eye, and it is the
+    -- read a brain should gate on when it means "is he after ME".
+    -- `+0x2A4` is the aggro-eval's target-acquired flag, set once its gates pass.
+    target = target, targets_player = (target == PLAYER_ENT),
+    acquired = mhfu.read_u8(ent + OFF_ACQUIRED),
     main = mhfu.read_u8(ent + OFF_MAIN), sub = mhfu.read_u8(ent + OFF_SUB),
     hp = mhfu.read_u16(ent + OFF_HP),
     player_hp = mhfu.get_player_hp(),
@@ -467,15 +539,29 @@ function mhfu_tick()
         local mv = port.moves[port.move]
         if mv and (mhfu.read_u8(port.ent + OFF_MAIN) ~= mv.main
                 or mhfu.read_u8(port.ent + OFF_SUB) ~= mv.sub) then
+          local held = g_tick - (port._played_at or g_tick)
           log("[port:%s] move '%s' ended after %d ticks -> (%d,%d)", port.name,
-              port.move, g_tick - (port._played_at or g_tick),
+              port.move, held,
               mhfu.read_u8(port.ent + OFF_MAIN), mhfu.read_u8(port.ent + OFF_SUB))
-          port.move, port.clip = nil, nil
+          port.last_move, port.last_move_ticks = port.move, held
+          port.move, port.clip, port._clip_uses = nil, nil, 0
         end
       end
       if port.pinned then
-        local slip = port:hold_pin()
-        if slip > 40 then log("[port:%s] pin corrected %d units t=%d", port.name, slip, g_tick) end
+        port.slip = port:hold_pin()
+        -- ⚠️ ONE LINE PER PIN, NOT ONE PER TICK. The pin runs at 2 Hz for as long
+        -- as a phase lasts; logging each correction buried a 2200-line take under
+        -- 152 identical lines and made the interesting events unfindable. The
+        -- running total is the number that matters anyway: at 0 the pin is doing
+        -- nothing and can go.
+        port._slip_n = (port._slip_n or 0) + (port.slip > 4 and 1 or 0)
+        port._slip_sum = (port._slip_sum or 0) + port.slip
+        if port.slip > 40 and (port._slip_n == 1 or port._slip_n % 20 == 0) then
+          log("[port:%s] pin has corrected %d ticks, %d units total (last %d) t=%d",
+              port.name, port._slip_n, math.floor(port._slip_sum), port.slip, g_tick)
+        end
+      else
+        port.slip = 0
       end
       if port._brain then
         local ok, err = pcall(port._brain, port_state(port))
