@@ -1733,3 +1733,149 @@ it walking into the hunter, historically **under 15 points**. So for the spin te
 bar for "the forced attack connected" is a drop **> ~15 with the monster in reach**;
 anything smaller and close is a trip, and anything at all while the monster is far is
 neither.
+
+---
+
+# Section 34 — The offline move table, CONFIRMED LIVE on a native Tigrex; and a THIRD channel (2026-08-26)
+
+§33 recovered `(main,sub) -> handler -> anim a1` for em75 by disassembling the overlay.
+That was inference. `tools/native_ai_probe.py` loads `tigrex_s6` — a **native** Tigrex, the
+positive control — and snapshots its whole entity struct at 5 Hz through complete
+notice→roar→charge→bite ramps. The two line up.
+
+## 34a. The disassembly is right
+
+Live pairs against `tools/em_moveset.py --states`, one cold boot:
+
+```
+   (0, 7)  a1 80          offline 80          idle/roam
+   (1, 2)  a1 5           offline (computed)
+   (0, 4)  a1 54  +0x523=1  offline 54        THE ROAR   (clip end 292)
+   (1, 3)  a1 2           offline 2           reorient   (clip end 56)
+   (0, 2)  a1 51          offline 51          2nd roar   (clip end 370)
+   (1, 4)  a1 17          offline 17          THE CHARGE (clip end 110)
+   (3, 5)  a1 42 then 41  offline 41,42       the attack (clip end 26, then 214)
+   (3, 4)  a1 41          offline 41,42
+   (0, 5)  a1 46          offline 46,54
+   (2, 1)  a1 15,11,19    offline 11,15,19,32
+   (3, 6)  a1 47          offline 47,48
+   (0, 8)  a1 24          offline 24,25
+   (0, 9)  a1 25          offline 24,25
+```
+
+**`em_moveset.py` can be trusted as the move table.** Use it instead of guessing clip ids.
+
+Note `(2, 1)`: it is not one animation, it is a **three-clip sequence keyed on `+0x1D5`** —
+phase 1 → a1 15 (62 frames), phase 2 → a1 11 (50), phase 3 → a1 19 (140). Most handlers are
+shaped like this. A move is a *program*, and its animation ids are its instructions.
+
+## 34b. 🔴 The animation channel has THREE SLOTS, and the executor is not the only writer
+
+`entity+0x324 + slot*2` is one u16 per slot, holding `a1 + 0x3E8 + slot*0xC8`.
+
+**The three slots are the animation pack's three BONE-PARTITION STREAMS**, not three
+arbitrary layers. MHFU's 0x38 anim layout partitions ONE rig across streams 0/2/4 — for the
+Tigrex, 31 + 9 + 5 = 45 bones (`monster-porting`, `docs/ANIMATION_FORMAT.md`) — and the
+runtime resolves one action id separately in each. Live: with all three inputs on the same
+`a1`, the three resolved anim-node pointers were **distinct in 715 of 715 samples**
+(`a1=54` → `0x0948BC34`, `0x094EFFEC`, `0x09511CD8`). The gaps, `0x643B8` then `0x21CEC`,
+sit at a ~3:1 ratio against a 31:9 bone ratio — the sizes the partition predicts.
+*(Slot-index ↔ stream-index is the natural reading of that alignment, not something this
+run measured directly; confirming it means reading a resolved pointer back against the
+loaded pack's stream table.)*
+
+So one action is one animation **sliced three ways**, dispatched three times.
+
+*Independent corroboration from the 2026-06 work:* the spin was recorded then as "three
+per-slot inputs `0x0413`, `0x04DB`, `0x05A3`" without a decode. Under `a1 + 0x3E8 +
+slot*0xC8` those are **all `a1` = 43** — and `em_moveset` gives `(3,0) -> a1 43`, the spin.
+The formula and that observation were derived two months apart from different data.
+
+Two functions write the inputs:
+
+| writer | reaches | signature |
+|---|---|---|
+| executor `0x09AC5228` | **all three slots** | `(entity, a1)` |
+| per-slot applier `0x09AC5520` | **ONE slot** | `(a0=entity, a1=biased input, a2=speed, a3=mode, t0=slot)` |
+
+`0x09AC5520` computes `v1 = entity + (t0<<1) + 0x324`, `sh a1, 0(v1)`, then
+`+0x32C+slot*2 = mode`, `+0x334+slot*2 = speed>>1`, resolves the clip through `vt[8]` and
+installs it with `0x08863E70(entity+0x80, node, mode, speed, slot)`. It also **skips the
+restart when the slot already holds that input** (`beql v0, a1` → speed 0), which is how the
+engine avoids re-triggering a clip that is already running.
+
+**And this is how the engine makes one body part do something else.** `(0,8)`'s handler
+`0x09D26B10` calls the executor with `a1=24`, then immediately overrides slots 0 and 2 back
+to idle — i.e. bones 0–30 and 40–44 keep standing while bones 31–39 play clip 24:
+
+```
+0x09D26B70  jal 0x09AC5228        a1 = 24            ; whole body
+0x09D26BA0  jal 0x09AC5520        a1 = 1001, t0 = 0  ; slot 0 <- a1 1
+0x09D26BB8  jal 0x09AC5520        a1 = 1401, t0 = 2  ; slot 2 <- a1 1
+```
+
+and the live trace reads back exactly that: `a1 = 1/24/1`, in 106 samples. `(0,9)` is the
+same handler with `a1=25` → `1/25/1`.
+
+🔴 **This is the shape of "his head is playing a different animation from his body" —
+and the engine does it on purpose.** For a PORT it is a hazard rather than a feature: the
+injected pack must populate the *same* slot index coherently in all three streams. Fill
+slot N in stream 0 and leave it mismatched in stream 2, and that bone range plays whatever
+sits at that offset while the rest of the body plays the clip.
+
+**41 call sites in em75.ovl reach `0x09AC5520`**, and they are concentrated, not scattered:
+
+```
+  33  in 0x09D32490  <- called from ONE place: 0x09D351E0, the MAIN 6 dispatcher
+   3  in 0x09D26398  <- handler (0,0)
+   3  in 0x09D26308  <- slot helper, called only by 0x09D26B10
+   2  in 0x09D26B10  <- handlers (0,8) and (0,9)
+```
+
+That is a partial answer to §33c's loose end — **mains 5/6/7 have no sub-state switch
+because they are not move banks.** Main 6 at least is a bank of 33 per-slot animation
+writes, dispatched straight out of `0x09D351E0`. (Mains 5 and 7 are unexplained; the live
+trace never entered any of the three, so this is structure, not observation.)
+
+For everything a monster does in ordinary combat — mains 0..3, which is all the live trace
+ever showed — the executor is the only writer and **all three slots stay in agreement.**
+
+`mhfu_on_bigmonster_action` hooks only `0x09AC5228`, so a forced clip is a whole-body write
+that a per-slot call can then partially overwrite. Slots disagreeing is the engine's
+*normal* composition mechanism, not a bug — but it means "force one `a1`" is not the same
+operation the engine performs.
+
+## 34c. How combat is entered, measured
+
+Same ramp three times (two fired; the third is a clean negative — see below):
+
+1. **`+0x5DC` 0 → 1 first**, while the monster is still in its roam state. This is
+   detection, and it is gated on the species sight radius `0x09BC1030` (Tigrex 5000):
+   zeroing it prevents the flip, restoring it produces one within ~7 s, and the cycle where
+   the hunter stood **5753 units away — outside 5000 — never engaged at all.**
+2. `(0,4)` `a1` 54, `+0x523=1` — the roar.
+3. `(1,3)` `a1` 2 — reorient onto the target.
+4. `(0,2)` `a1` 51 — second roar.
+5. `(1,4)` `a1` 17, `+0x1D5` climbing to 3 — **the charge**; 4687 → 893 units.
+6. `(3,5)`/`(3,4)` `a1` 42 → 41 — the attack.
+
+⛔ **`+0x4B5` and `+0x4B7` are not the latch.** Through all of the above on a *native*
+monster, `+0x4B7` never left 0, and `+0x4B5` only ever appeared as a **one-sample pulse**
+at `(0,2)`/`(0,1)`. §33's "combat-enter sets `+0x4B5`" described a transient.
+
+`+0x2F4` read PLAYER for the entire run **including while calmed** — the target selector is
+not the combat gate either. (This state has no Felyne; that is the confound §33b's
+cat-vs-player comparison could not control for.)
+
+## 34d. What this means for the framework
+
+* **Do not override `a1`.** The handler already picks the right clip, in the right order,
+  with the right length. A forced id replaces a clip the phase machine is timing against —
+  the machine keeps its own schedule, so the clip restarts mid-move and never completes.
+  Drive `act_set(main, sub)` and let the animation follow.
+* If a port's clips are numbered differently, remap them **in the asset**, not at runtime.
+* An AI-scripting API should expose the move table (`em_moveset.py` output) as data, and
+  `act_set` as the verb. `mhfu_on_bigmonster_action` stays useful for *observing* which
+  action is running; it is the wrong tool for choosing one.
+* A "monster is in combat" predicate should read `+0x5DC` plus the `(main,sub)` pair
+  against the table, not any of the `+0x4Bx` flags.
