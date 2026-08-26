@@ -218,6 +218,14 @@ it oscillates several times a second up close and loses outright at range — a 
 it stutters. Log it (every showcase phase line carries `tgt=`), gate on `engaged`, and treat a
 single sample of this cell as meaningless.
 
+**🔴 What it usually resolves to is the FELYNE, and that is not a swap defect.** `+0x542` is a
+target priority index — `0` = player, `1` = cat — and the Felyne outranks the hunter whenever it
+is alive. Holding the cat at HP 0 raises the player's share of `+0x2F4` from 0–4 % to 32–100 %
+(`tools/felyne_target_test.py`). ⚠️ It does not reliably hand the target over, and it does **not**
+produce the yellow eye: `+0x2A4` read 0 in every sample of every run, including at the moment
+`+0x2F4` read PLAYER. Note also that `dmg_experiment.Culler` cannot touch the cat — it walks the
+entity registry and the Felyne is not in it (fixed address `0x090BDC40`).
+
 **⚠️ A coordinate pin fights the engine, and the SIZE of the fight is the diagnostic.**
 `port:pin()` rewrites the position at the 2 Hz tick while the engine keeps advancing it every
 frame, so the lock is always undoing something. What matters is how much. Against a pursuit
