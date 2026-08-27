@@ -486,7 +486,72 @@ instructions lifted out of em75.ovl — zero mismatches** — and `sltiu` agains
 > replica. Check encoders against **real instruction words**, not against a second implementation
 > of the same idea.
 
-## 12. Tooling
+## 12. `em_vhook` tested in-game — two real crashes, both fixed
+
+Cold-boot runs via `tools/test_em_vhook.py` (deploys the PRX + `tigrex_hunt.lua`, which swaps the
+Giadrome for a Tigrex and walks him to the player, skipping the ~430 s roam-in).
+
+**The capability works.** On a cold boot, with no debugger writing any code:
+
+```
+[em_vhook] block @0x09E24400 (outside the PRX image)
+[em_vhook] vtable 0x089BB69C: slot29 0x09D35328 -> 0x09E24400, slot32 0x09D3D608 -> 0x09E24460
+slot29 151 dispatches in 5s = 30.2/s   -> stubs are LIVE
+```
+
+Same 30 Hz the debugger measured, on the real Tigrex vtable, from a shipped mod. It then survived
+arming, a section transition and 300 s+ of play with its canary intact.
+
+Getting there cost two crashes, and both root causes generalise beyond this mod.
+
+### 🔴 Crash 1 — static buffers in the PRX image get overwritten by an engine thread stack
+
+v1.0 put the stubs and config in `.bss`, which linked them near the **top** of the PRX image
+(`[0x09D65000, 0x09DD9000)` -> stubs at ~`0x09DD1E00`). The engine parks thread stacks inside that
+image, and one based at the top growing down reaches `0x09DD1E00` after only ~0x7000 bytes.
+
+Symptom: **rock stable while the hunter idled in base camp** (shallow stack), then PPSSPP spun at
+131 % CPU on one run and **exited outright** on another — both during heavy activity. Nothing was
+wrong with the stub logic; its *bytes* were being overwritten.
+
+This is the same hazard as the documented "PRX-stack collision", but the existing note frames it as
+*"a C-call frame from a hook tips it over"*. That is too narrow. **Any static buffer a mod places in
+the PRX image is exposed**, executable or not — and the failure reads like a logic bug, not a
+memory bug. The framework's own `self-guard FAILED rc=0x800200D9 for [0x09D65000,0x09DD9000)` line
+at boot is the standing reminder that this region cannot be reserved.
+
+Fix: allocate with `sceKernelAllocPartitionMemory` (as `entity.cpp` already does for clones) and
+keep only pointers in the PRX.
+
+### 🔴 Crash 2 — do not run stubs from the extra-RAM window
+
+The first fix used `PSP_SMEM_High`, which landed the block at **`0x0BFFFD00`** — inside PPSSPP's
+raw extra-RAM window (`0x0B000000..0x0C000000`, what `inject.cpp` uses for its xram copy).
+
+The stub *executed* from there perfectly while unarmed. But the stub is **branchless** — armed and
+unarmed run identical instructions, and only the store target differs (an in-block sink vs.
+`entity+0x414` in normal RAM). The moment that store retargeted into normal RAM, **PPSSPP exited**,
+twice, reproducibly. The identical store from a stub at `0x08A5E000` had already run a full A/B/A
+in `wrap_em_slot.py` without trouble.
+
+Fix: `PSP_SMEM_Low`, plus an explicit refusal if the block lands at >= `0x0A000000`.
+
+> The branchless design is what made this diagnosable: because both paths execute the same
+> instructions, "armed crashes / unarmed does not" isolated the *store target* rather than leaving
+> a control-flow difference to blame.
+
+### Still open: the `+0x414` override
+
+Not settled, for a sampling reason rather than a technical one. The 27 timer-gated actions are
+transient: a 120 s survey in section 1 saw `(2,9)` 39 times and `(2,16)` 32 times, but arming on
+`(2,9)` and watching 300 s caught it **zero** times (slot 32 dispatched 66 times meanwhile, so the
+monster was transitioning throughout). In base camp the Tigrex simply idles in `(1,0)`.
+
+The instrument is stable now, so the next attempt is cheap. The obvious change is a **wildcard
+match** — let `want_sub = 0xFE` mean "any sub", so the stub fires on all nine gated `(2,x)` actions
+at once instead of betting on one. That is ~3 extra branchless instructions.
+
+## 13. Tooling
 
 ```bash
 tools/em_abi.py inventory --em     # 17 species overlays; one load VA, zero ctors

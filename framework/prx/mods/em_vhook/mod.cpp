@@ -37,6 +37,7 @@
  */
 #include "mhfu/mhfu.h"
 #include "mhfu/mips.h"
+#include <pspsysmem.h>
 
 #define MOD_ID "em_vhook"
 
@@ -68,9 +69,21 @@ typedef struct {
     uint32_t ai_ticks;       /* +0x10  slot-29 dispatch counter */
     uint32_t act_enters;     /* +0x14  slot-32 dispatch counter */
     uint32_t last_pair;      /* +0x18  last (main<<8)|sub seen at enter-action */
+    uint32_t canary;         /* +0x1C  CFG_CANARY; if this ever reads back wrong,
+                              *        the block was overwritten and nothing the
+                              *        stubs load from it can be trusted */
 } em_vhook_cfg_t;
 
-static em_vhook_cfg_t g_cfg __attribute__((aligned(16)));
+#define CFG_CANARY 0x5645484Bu   /* 'VEHK' */
+
+/* 🔴 The entity is 0x800 bytes (the species factory at 0x09AB15D8 allocates
+ * 2048, align 16). Masking patch_off to 0x7FC bounds every store to the
+ * monster's own struct and keeps it word-aligned, branchlessly — so even a
+ * garbage config can only ever scribble on the monster, never on RAM at large.
+ * (This was first added on the theory that a clobbered config caused the v1.0
+ * hang. It did not — the STUB BYTES were what got overwritten, see the block
+ * comment below. The mask is cheap insurance and stays.) */
+#define PATCH_OFF_MASK 0x7FCu
 
 #define CFG_WANT_MAIN 0x00
 #define CFG_WANT_SUB  0x01
@@ -80,10 +93,65 @@ static em_vhook_cfg_t g_cfg __attribute__((aligned(16)));
 #define CFG_AI_TICKS  0x10
 #define CFG_ACT_ENTER 0x14
 #define CFG_LAST_PAIR 0x18
+#define CFG_CANARY_OFF 0x1C
 
+/* 🔴 THE STUBS AND THE CONFIG MUST NOT LIVE IN THE PRX IMAGE.
+ *
+ * v1.0 put them in .bss, which linked them near the TOP of the image
+ * ([0x09D65000,0x09DD9000) -> stubs at ~0x09DD1E00). The engine parks thread
+ * stacks inside that image, and a stack based at the top growing DOWN reaches
+ * 0x09DD1E00 after only ~0x7000 bytes. Measured consequence: rock stable while
+ * the hunter idled in base camp (shallow stack), then PPSSPP spun at 131% CPU on
+ * one run and exited outright on another, both during heavy activity. Nothing
+ * was wrong with the stub logic — its bytes were being overwritten by stack.
+ *
+ * The debugger-driven proofs (Stage B/C) never saw this because they wrote their
+ * stub to 0x08A5E000, outside the PRX. So: allocate from the user partition,
+ * exactly as entity.cpp does for clones, and keep only pointers here. */
 #define STUB_INSNS 24
-static uint32_t g_stub_ai[STUB_INSNS]  __attribute__((aligned(64)));
-static uint32_t g_stub_act[STUB_INSNS] __attribute__((aligned(64)));
+#define BLOCK_BYTES (2 * STUB_INSNS * 4 + 64)
+
+static uint32_t *g_stub_ai;
+static uint32_t *g_stub_act;
+static em_vhook_cfg_t *g_cfgp;
+static SceUID g_block = -1;
+
+static int alloc_block(void)
+{
+    if (g_block >= 0) return 0;
+    /* 🔴 LOW, not High. PSP_SMEM_High landed the block at 0x0BFFFD00 — inside
+     * PPSSPP's raw extra-RAM window (0x0B000000..0x0C000000, what inject.cpp
+     * uses for its xram copy). Stubs EXECUTED from there fine while unarmed,
+     * but the moment the (branchless) store retargeted from the in-block sink
+     * to entity+0x414 in normal RAM, PPSSPP EXITED — twice, reproducibly. The
+     * identical store from a stub at 0x08A5E000 (normal RAM) had already run a
+     * full A/B/A without trouble in tools/wrap_em_slot.py. Keep the stub in
+     * ordinary user RAM; never in the extra-RAM window. */
+    g_block = sceKernelAllocPartitionMemory(2, "em_vhook", PSP_SMEM_Low,
+                                            BLOCK_BYTES, 0);
+    if (g_block < 0) {
+        mhfu_log("[%s] partition alloc FAILED (%d) - refusing to install",
+                 MOD_ID, (int)g_block);
+        return -1;
+    }
+    uint8_t *base = (uint8_t *)sceKernelGetBlockHeadAddr(g_block);
+    if ((uintptr_t)base >= 0x0A000000u) {
+        mhfu_log("[%s] block at 0x%08X is in the extra-RAM window - refusing",
+                 MOD_ID, (unsigned)(uintptr_t)base);
+        sceKernelFreePartitionMemory(g_block);
+        g_block = -1;
+        return -1;
+    }
+    base = (uint8_t *)(((uintptr_t)base + 63) & ~(uintptr_t)63);
+    g_stub_ai  = (uint32_t *)base;
+    g_stub_act = (uint32_t *)(base + STUB_INSNS * 4);
+    g_cfgp     = (em_vhook_cfg_t *)(base + 2 * STUB_INSNS * 4);
+    for (unsigned k = 0; k < sizeof(*g_cfgp) / 4; k++)
+        ((uint32_t *)g_cfgp)[k] = 0;
+    mhfu_log("[%s] block @0x%08X (outside the PRX image)",
+             MOD_ID, (unsigned)(uintptr_t)base);
+    return 0;
+}
 
 static uint32_t g_vtable;            /* the species vtable we latched onto */
 static uint32_t g_orig_ai;
@@ -93,7 +161,7 @@ static int      g_installed;
 /* --- slot 29: count, then tail-call. Frame-free, branchless, 7 insns. ----- */
 static void build_ai_stub(uint32_t original)
 {
-    uint32_t cfg = (uint32_t)(uintptr_t)&g_cfg;
+    uint32_t cfg = (uint32_t)(uintptr_t)g_cfgp;
     int i = 0;
     uint32_t *s = g_stub_ai;
     s[i++] = mips_lui(MIPS_REG_T7, (uint16_t)(cfg >> 16));
@@ -115,7 +183,7 @@ static void build_ai_stub(uint32_t original)
  */
 static void build_act_stub(uint32_t original)
 {
-    uint32_t cfg = (uint32_t)(uintptr_t)&g_cfg;
+    uint32_t cfg = (uint32_t)(uintptr_t)g_cfgp;
     int i = 0;
     uint32_t *s = g_stub_act;
     s[i++] = mips_lui(MIPS_REG_T7, (uint16_t)(cfg >> 16));
@@ -139,6 +207,7 @@ static void build_act_stub(uint32_t original)
 
     s[i++] = mips_lw (MIPS_REG_T4, CFG_PATCH_OFF, MIPS_REG_T7);
     s[i++] = mips_lw (MIPS_REG_T5, CFG_PATCH_VAL, MIPS_REG_T7);
+    s[i++] = mips_andi(MIPS_REG_T4, MIPS_REG_T4, PATCH_OFF_MASK);  /* bound it */
     s[i++] = mips_addu(MIPS_REG_T4, MIPS_REG_A0, MIPS_REG_T4); /* &entity[off] */
     s[i++] = mips_addiu(MIPS_REG_T6, MIPS_REG_T7, CFG_SINK);   /* &cfg.sink   */
     s[i++] = mips_movn(MIPS_REG_T6, MIPS_REG_T4, MIPS_REG_T2); /* pick on match */
@@ -154,25 +223,26 @@ static void build_act_stub(uint32_t original)
 extern "C" void em_vhook_arm(uint8_t main_state, uint8_t sub_state,
                              uint32_t off, uint32_t val)
 {
-    g_cfg.want_main = main_state;
-    g_cfg.want_sub  = sub_state;
-    g_cfg.patch_off = off;
-    g_cfg.patch_val = val;
-    g_cfg.armed     = 1;
+    g_cfgp->want_main = main_state;
+    g_cfgp->want_sub  = sub_state;
+    g_cfgp->patch_off = off;
+    g_cfgp->patch_val = val;
+    g_cfgp->armed     = 1;
     mhfu_log("[%s] armed: (%u,%u) -> entity+0x%X = %u",
              MOD_ID, main_state, sub_state, (unsigned)off, (unsigned)val);
 }
 
 extern "C" void em_vhook_stats(uint32_t *ai, uint32_t *acts, uint32_t *last)
 {
-    if (ai)   *ai   = g_cfg.ai_ticks;
-    if (acts) *acts = g_cfg.act_enters;
-    if (last) *last = g_cfg.last_pair;
+    if (ai)   *ai   = g_cfgp->ai_ticks;
+    if (acts) *acts = g_cfgp->act_enters;
+    if (last) *last = g_cfgp->last_pair;
 }
 
 static void install_for(uint32_t entity)
 {
     if (g_installed || !entity) return;
+    if (alloc_block() < 0) return;
     uint32_t vt = mhfu_read_u32(entity);
     if (vt < VT_LO || vt >= VT_HI) {
         mhfu_log("[%s] entity 0x%08X vtable 0x%08X outside the species band "
@@ -209,7 +279,7 @@ static void uninstall(void)
     g_installed = 0;
     mhfu_log("[%s] restored vtable 0x%08X (ai_ticks=%u act_enters=%u)",
              MOD_ID, (unsigned)g_vtable,
-             (unsigned)g_cfg.ai_ticks, (unsigned)g_cfg.act_enters);
+             (unsigned)g_cfgp->ai_ticks, (unsigned)g_cfgp->act_enters);
 }
 
 static void on_spawn(const mhfu_monster_spawn_ctx_t *ctx)
@@ -225,19 +295,21 @@ static void on_quest(const mhfu_event_ctx_t *ctx)
      * no longer describe resident code. Drop the hook and re-latch on the next
      * big-monster spawn. */
     uninstall();
-    g_cfg.ai_ticks = g_cfg.act_enters = 0;
+    g_cfgp->ai_ticks = g_cfgp->act_enters = 0;
 }
 
 static int em_vhook_init(void)
 {
-    g_cfg.patch_off = 0x414;     /* the action countdown; see em_phase_map.py */
-    g_cfg.patch_val = 900;
-    g_cfg.want_main = 0xFF;      /* matches nothing until armed */
-    g_cfg.want_sub  = 0xFF;
+    if (alloc_block() < 0) return -1;
+    g_cfgp->patch_off = 0x414;     /* the action countdown; see em_phase_map.py */
+    g_cfgp->patch_val = 900;
+    g_cfgp->want_main = 0xFF;      /* matches nothing until armed */
+    g_cfgp->want_sub  = 0xFF;
+    g_cfgp->canary    = CFG_CANARY;
     mhfu_on_monster_spawned(on_spawn);
     mhfu_on_quest_beginning(on_quest);
     mhfu_log("[%s] ready; cfg @0x%08X, stubs @0x%08X / 0x%08X", MOD_ID,
-             (unsigned)(uintptr_t)&g_cfg,
+             (unsigned)(uintptr_t)g_cfgp,
              (unsigned)(uintptr_t)g_stub_ai, (unsigned)(uintptr_t)g_stub_act);
     return 0;
 }

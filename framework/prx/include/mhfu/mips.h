@@ -134,6 +134,9 @@ static inline uint32_t mips_or(uint32_t rd, uint32_t rs, uint32_t rt) {
     return mips_r3(rd, rs, rt, 0x25u);
 }
 
+static inline uint32_t mips_andi(uint32_t rt, uint32_t rs, uint16_t imm) {
+    return (0x0Cu << 26) | ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16) | imm;
+}
 static inline uint32_t mips_xori(uint32_t rt, uint32_t rs, uint16_t imm) {
     return (0x0Eu << 26) | ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16) | imm;
 }
