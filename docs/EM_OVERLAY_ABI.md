@@ -355,7 +355,60 @@ function. So the workflow for blocker #2 is: pick the capability (spawn an effec
 read its JP signature here, then locate the EU address by behaviour rather than by guessing what
 an unnamed function does.
 
-## 10. Tooling
+## 10. Stage C and the slot semantics, measured (2026-08-27)
+
+`tools/wrap_em_slot.py`. Three modes; all restore in a `finally`.
+
+### Stage C — wrap, don't replace: PASS
+
+Slot 29 pointed at a `lui/ori/jr` trampoline that tail-calls em75's own implementation:
+
+| | transitions | distinct pairs | mean dwell |
+|---|---|---|---|
+| A baseline | 5 | 5 | 1.60 s |
+| B via our trampoline | 5 | 5 | 1.60 s |
+
+Indistinguishable. A tail-call through our own code costs nothing, which is the foundation the
+whole "wrap" plan rests on.
+
+### The two seams, measured rather than inferred
+
+`--mode count` installs a **frame-free** wrapper that bumps a counter in scratch RAM and then
+tail-calls the original (`jr`, not `jalr` — no stack frame at all, which is also the shape that is
+safe near big-monster construction).
+
+| slot | dispatches | pattern |
+|---|---|---|
+| **29** (`vt+0x7C`) | **308 in 10 s = 30.8/s** | every frame, unconditionally |
+| **32** (`vt+0x88`) | **8 in 12 s = 0.7/s** | **exactly 2 per `(main,sub)` transition, 0 otherwise** |
+
+So slot 29 is a genuine ~30 Hz per-frame hook, and slot 32 is precisely the enter-action seam —
+empirically, not just from the four-argument call shape in §6.
+
+### 🔴 `entity+0x414` is NOT the action-duration gate — an earlier claim here was wrong
+
+The static pass found **81 literal stores** to `+0x414` (150, 300, 60, 180, 240, 600 …) and handler
+code decrementing it, and this document previously concluded that a ported clip longer than the
+native one would be truncated by that countdown. **That does not hold up live.**
+
+- `+0x414` reads **0** throughout `(0,4)`, `(1,3)` and `(1,4)` — actions that plainly have
+  duration — and only shows 60 during `(3,5)`.
+- A slot-32 wrapper that calls the original and then writes 900 into `+0x414` produced **no
+  observable effect**: the value never survived to the next sample.
+
+The timer is real and some handlers use it, but **what decides how long an action runs is still
+unidentified.** Candidates: per-handler counters at other offsets, `+0x1D5` advancing on the
+clip-done flag, or a value re-established on the slot-29 path every frame. A port's timing plan
+should not be built on `+0x414` until this is settled.
+
+> ⚠️ **The methodology that produced the false positive.** The first run compared *mean dwell per
+> `(main,sub)`* between two **sequential** windows of one evolving fight and reported 1.75× =
+> "WORKS". A and B never cover the same phases, so dwell moves for reasons unrelated to the
+> change. Reading the cell directly showed the override never landed at all. Two rules fall out:
+> **read the cell, don't infer from behaviour**, and **give each condition its own fresh savestate
+> load** — sequential windows of one run are not an A/B.
+
+## 11. Tooling
 
 ```bash
 tools/em_abi.py inventory --em     # 17 species overlays; one load VA, zero ctors
@@ -371,6 +424,8 @@ Live verification (needs the emulator; both load `tigrex_s6` cold):
 ```bash
 tools/verify_em_vtable.py          # Stage A: static trace vs. live, + writability
 tools/redirect_em_slot.py          # Stage B: A/B/A proving the engine follows a patch
+tools/wrap_em_slot.py --mode trampoline   # Stage C: tail-call wrap is transparent
+tools/wrap_em_slot.py --mode count --slot 29   # measure a slot's dispatch rate
 ```
 
 ⚠️ `callers` matches on the vtable byte offset alone, which many unrelated classes share. High
