@@ -440,7 +440,53 @@ expects, or the effect fires at the wrong moment. Those numbers come out per act
 > **read the cell, don't infer from behaviour**, and **give each condition its own fresh savestate
 > load** — sequential windows of one run are not an A/B.
 
-## 11. Tooling
+## 11. `em_vhook` — the capability, as a shipped mod
+
+`framework/prx/mods/em_vhook/mod.cpp`, enabled in `build/mods.manifest`. Builds clean into
+`mhfu_framework.prx`.
+
+It latches onto the vtable of a big monster the engine has **actually spawned**
+(`mhfu_on_monster_spawned` → read `entity+0x00`, gated to the `0x089BB000..0x089BF800` species
+band) rather than hardcoding a species, then patches abi slots 29 and 32 to its own stubs and
+restores them at the next `quest_beginning` — because a new quest may load a different overlay,
+which would leave the saved slot values describing code that is no longer resident.
+
+**The stubs are frame-free and branchless by construction**, which is not stylistic: the engine's
+big-monster construction-thread stack sits inside the PRX image, and a C-call frame from a hook is
+what produced the long "Lua VM corruption" hunt. Selection uses `MOVN` against two precomputed
+addresses — on a miss the store lands in a sink word nothing reads — so the whole stub is one
+basic block with no `$sp` access and no `jal`. Verified by disassembling the emitted words:
+**0 branches, no `$sp`, no `jal`.**
+
+Config lives in a fixed-layout struct the stubs index by byte offset, so an experiment retargets at
+runtime instead of needing a rebuild:
+
+```c
+em_vhook_arm(main, sub, off, val);   /* on this (main,sub), store val at entity+off */
+em_vhook_stats(&ai_ticks, &act_enters, &last_pair);
+```
+
+Its first job is the question §10 left open: whether overriding `+0x414` works for the **27
+actions that actually use the countdown** (the earlier live attempt only ever sampled actions with
+`timer=0`, so it settled nothing). `em_phase_map.py` names those 27.
+
+⚠️ **Untested in-game.** It compiles and links, and the emitted MIPS was disassembled and checked
+against the invariants — but plugins load on cold boot only, so an actual run costs a full boot
+plus the walk-in to a big monster.
+
+### Encoder work this needed
+
+`include/mhfu/mips.h` gained `mips_r3/addu/subu/xor/or/xori/sltiu` (the brute mod had been defining
+`MIPS_R3` locally). They are validated by **re-encoding 4000 real `addu`/`subu`/`xor`/`or`
+instructions lifted out of em75.ovl — zero mismatches** — and `sltiu` against the game's own
+`sltiu at, v0, 90` in the species factory.
+
+> ⚠️ A first attempt verified the stub by reimplementing the emitters in Python. That replica
+> masked `j` with `0x03FFFFF` instead of `0x03FFFFFF` and "found" a bug that existed only in the
+> replica. Check encoders against **real instruction words**, not against a second implementation
+> of the same idea.
+
+## 12. Tooling
 
 ```bash
 tools/em_abi.py inventory --em     # 17 species overlays; one load VA, zero ctors

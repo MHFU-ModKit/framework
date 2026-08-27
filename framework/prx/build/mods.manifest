@@ -39,6 +39,15 @@ brute_overlay_hook
 # dodges the PRX-stack collision). Disabled to avoid double swap/inject.
 # brute_port
 
+# --- em vtable hook --------------------------------------------------------
+# em_vhook: takes over a big monster's AI by patching its species VTABLE, which
+# is EBOOT rodata and writable at runtime (proven live 2026-08-27 — Stage A/B/C
+# in docs/EM_OVERLAY_ABI.md). Wraps abi slot 29 (per-frame AI, 30.8/s measured)
+# and slot 32 (enter-action, exactly 2 per (main,sub) transition). Stubs are
+# frame-free and branchless, so they cannot tip the engine's construction-thread
+# stack into the PRX. Inert until em_vhook_arm() is called.
+em_vhook
+
 # --- disabled --------------------------------------------------------------
 # tigrex_spin   # C baseline; crashes on spin via action_decided ptr-force
 # noop          # core-only bisect build (kept for future isolation)

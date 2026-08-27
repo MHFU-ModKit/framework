@@ -115,6 +115,34 @@ static inline uint32_t mips_jalr(uint32_t rs) {
     return ((rs & 0x1Fu) << 21) | (31u << 11) | 0x09u;
 }
 
+/* R-type helper: op=0, rs, rt, rd, shamt=0, funct. */
+static inline uint32_t mips_r3(uint32_t rd, uint32_t rs, uint32_t rt, uint32_t fn) {
+    return ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16)
+         | ((rd & 0x1Fu) << 11) | (fn & 0x3Fu);
+}
+
+static inline uint32_t mips_addu(uint32_t rd, uint32_t rs, uint32_t rt) {
+    return mips_r3(rd, rs, rt, 0x21u);
+}
+static inline uint32_t mips_subu(uint32_t rd, uint32_t rs, uint32_t rt) {
+    return mips_r3(rd, rs, rt, 0x23u);
+}
+static inline uint32_t mips_xor(uint32_t rd, uint32_t rs, uint32_t rt) {
+    return mips_r3(rd, rs, rt, 0x26u);
+}
+static inline uint32_t mips_or(uint32_t rd, uint32_t rs, uint32_t rt) {
+    return mips_r3(rd, rs, rt, 0x25u);
+}
+
+static inline uint32_t mips_xori(uint32_t rt, uint32_t rs, uint16_t imm) {
+    return (0x0Eu << 26) | ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16) | imm;
+}
+/* SLTIU rt, rs, imm -> rt = (unsigned)rs < imm. With imm=1 this is "rs == 0",
+ * which is how a branchless equality test produces its 0/1 selector. */
+static inline uint32_t mips_sltiu(uint32_t rt, uint32_t rs, uint16_t imm) {
+    return (0x0Bu << 26) | ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16) | imm;
+}
+
 /* MOVN: if (rt != 0) rd = rs. Branchless conditional move. R-type funct=0x0B. */
 static inline uint32_t mips_movn(uint32_t rd, uint32_t rs, uint32_t rt) {
     return ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16)
