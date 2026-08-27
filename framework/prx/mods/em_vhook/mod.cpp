@@ -85,6 +85,10 @@ typedef struct {
  * comment below. The mask is cheap insurance and stays.) */
 #define PATCH_OFF_MASK 0x7FCu
 
+/* want_sub value meaning "any sub state" — see build_act_stub. 0xFE, because
+ * 0xFF is already the never-match idle value the mod initialises with. */
+#define SUB_ANY 0xFEu
+
 #define CFG_WANT_MAIN 0x00
 #define CFG_WANT_SUB  0x01
 #define CFG_PATCH_OFF 0x04
@@ -108,7 +112,7 @@ typedef struct {
  * The debugger-driven proofs (Stage B/C) never saw this because they wrote their
  * stub to 0x08A5E000, outside the PRX. So: allocate from the user partition,
  * exactly as entity.cpp does for clones, and keep only pointers here. */
-#define STUB_INSNS 24
+#define STUB_INSNS 32
 #define BLOCK_BYTES (2 * STUB_INSNS * 4 + 64)
 
 static uint32_t *g_stub_ai;
@@ -196,12 +200,28 @@ static void build_act_stub(uint32_t original)
 
     s[i++] = mips_lbu(MIPS_REG_T0, ENT_MAIN, MIPS_REG_A0);   /* live main */
     s[i++] = mips_lbu(MIPS_REG_T1, ENT_SUB,  MIPS_REG_A0);   /* live sub  */
-    s[i++] = mips_sw (MIPS_REG_T1, CFG_LAST_PAIR, MIPS_REG_T7);
+    /* last_pair = (main<<8)|sub. v1.0 stored only the sub byte while claiming
+     * the packed form in the struct comment; the host read 2 and could not tell
+     * which main state it belonged to. */
+    s[i++] = mips_sll(MIPS_REG_T6, MIPS_REG_T0, 8);
+    s[i++] = mips_or (MIPS_REG_T6, MIPS_REG_T6, MIPS_REG_T1);
+    s[i++] = mips_sw (MIPS_REG_T6, CFG_LAST_PAIR, MIPS_REG_T7);
 
     s[i++] = mips_lbu(MIPS_REG_T2, CFG_WANT_MAIN, MIPS_REG_T7);
     s[i++] = mips_lbu(MIPS_REG_T3, CFG_WANT_SUB,  MIPS_REG_T7);
-    s[i++] = mips_xor(MIPS_REG_T0, MIPS_REG_T0, MIPS_REG_T2);
-    s[i++] = mips_xor(MIPS_REG_T1, MIPS_REG_T1, MIPS_REG_T3);
+    s[i++] = mips_xor(MIPS_REG_T0, MIPS_REG_T0, MIPS_REG_T2);  /* 0 iff main ok */
+    s[i++] = mips_xor(MIPS_REG_T1, MIPS_REG_T1, MIPS_REG_T3);  /* 0 iff sub ok  */
+
+    /* WILDCARD: want_sub == SUB_ANY means "any sub of this main state".
+     * Betting on one exact pair does not work in practice — the timer-gated
+     * actions are transient, and a 300 s watch armed on (2,9) caught it zero
+     * times even though a survey minutes earlier saw it 39 times. Matching a
+     * whole main state fires on all nine gated (2,x) actions at once.
+     * Branchless: force the sub difference to 0 when the wildcard is set. */
+    s[i++] = mips_xori(MIPS_REG_T3, MIPS_REG_T3, SUB_ANY);   /* 0 iff wildcard */
+    s[i++] = mips_sltiu(MIPS_REG_T3, MIPS_REG_T3, 1);        /* 1 iff wildcard */
+    s[i++] = mips_movn(MIPS_REG_T1, MIPS_REG_ZERO, MIPS_REG_T3);
+
     s[i++] = mips_or (MIPS_REG_T0, MIPS_REG_T0, MIPS_REG_T1); /* 0 iff match */
     s[i++] = mips_sltiu(MIPS_REG_T2, MIPS_REG_T0, 1);         /* 1 iff match */
 

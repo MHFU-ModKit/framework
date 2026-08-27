@@ -134,6 +134,11 @@ static inline uint32_t mips_or(uint32_t rd, uint32_t rs, uint32_t rt) {
     return mips_r3(rd, rs, rt, 0x25u);
 }
 
+/* SLL rd, rt, shamt — R-type funct=0x00. (shamt 0 with rt=rd=0 is NOP.) */
+static inline uint32_t mips_sll(uint32_t rd, uint32_t rt, uint32_t shamt) {
+    return ((rt & 0x1Fu) << 16) | ((rd & 0x1Fu) << 11) | ((shamt & 0x1Fu) << 6);
+}
+
 static inline uint32_t mips_andi(uint32_t rt, uint32_t rs, uint16_t imm) {
     return (0x0Cu << 26) | ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16) | imm;
 }

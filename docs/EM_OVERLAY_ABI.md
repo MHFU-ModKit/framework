@@ -540,16 +540,52 @@ Fix: `PSP_SMEM_Low`, plus an explicit refusal if the block lands at >= `0x0A0000
 > instructions, "armed crashes / unarmed does not" isolated the *store target* rather than leaving
 > a control-flow difference to blame.
 
-### Still open: the `+0x414` override
+### 🔴 The `+0x414` override — ANSWERED: our store lands, then the handler overwrites it
 
-Not settled, for a sampling reason rather than a technical one. The 27 timer-gated actions are
-transient: a 120 s survey in section 1 saw `(2,9)` 39 times and `(2,16)` 32 times, but arming on
-`(2,9)` and watching 300 s caught it **zero** times (slot 32 dispatched 66 times meanwhile, so the
-monster was transitioning throughout). In base camp the Tigrex simply idles in `(1,0)`.
+Two things had to be fixed before this could even be measured.
 
-The instrument is stable now, so the next attempt is cheap. The obvious change is a **wildcard
-match** — let `want_sub = 0xFE` mean "any sub", so the stub fires on all nine gated `(2,x)` actions
-at once instead of betting on one. That is ~3 extra branchless instructions.
+**1. Test where the monster has AI.** The Tigrex only NATURALLY occupies sections **1, 3, 6, 7 and
+8**; the others are fly-through transit. He *can* be forced into base camp — `tigrex_hunt.lua`
+parks him wherever the player stands — but the game has no behaviour for him there. Measured
+consequence: parked in base camp he sits in `(1,0)` **forever**, `+0x414` = 0, and not one of the
+27 timer-gated actions ever fires. Every earlier attempt failed for this reason alone.
+
+**2. Wildcard matching.** The gated actions are transient, so betting on one exact pair loses: a
+120 s survey saw `(2,9)` 39 times, yet arming on `(2,9)` and watching 300 s caught it **zero**
+times. `want_sub = SUB_ANY (0xFE)` now matches any sub of a main state, firing on all nine gated
+`(2,x)` at once — three extra branchless instructions (`xori`/`sltiu`/`movn` forcing the sub
+difference to zero).
+
+With the player in **section 1** and the wildcard armed on main state 2, gated actions fired
+immediately and the answer is unambiguous:
+
+```
+armed: (2,ANY) -> entity+0x414 = 900
+  (2,16) active, +0x414 = 149, 145, 142, 138, 133, 130, 126, 122, 118, 114
+  ...
+  (2,ANY) gated actions active in 85 samples; 1 showed our value 900
+```
+
+`(2,16)` counts down at ~32/s starting from ~150 — **the handler's own literal** (150 is the most
+common of em75's 81 stores), not our 900. Exactly **1 of 85** samples read 900.
+
+That single hit is the tell, not noise: **our store does land, and is then immediately overwritten.**
+The stub stores and *tail-calls* the original, so the species' enter-action code runs afterwards and
+sets its own timer. The one 900 was caught in the gap between the two writes.
+
+⇒ **Position matters more than capability.** Writing `+0x414` from a *pre*-hook can never control
+duration. To own the timer the write has to happen **after** the handler, which means either
+
+- a **post-hook** (`jal` the original, then store) — but that needs a stack frame, and frame-free is
+  the rule near the engine's construction thread, so it needs care; or
+- the **slot-29 per-frame path**, re-asserting the value each frame while the target action is
+  active. It runs at 30 Hz and is already frame-free.
+
+The second is the cheaper experiment and does not need a post-hook at all.
+
+> ⚠️ The test tool originally called 1/85 a PASS. Requiring merely `hits > 0` is wrong when a
+> pre-hook write is guaranteed to be visible for one sampling gap. `test_em_vhook.py` now demands a
+> majority and reports `OVERWRITTEN BY THE HANDLER` otherwise.
 
 ## 13. Tooling
 
