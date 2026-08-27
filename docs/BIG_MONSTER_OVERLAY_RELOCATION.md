@@ -186,6 +186,15 @@ provisions (vt[8]) + drives (vt[0xC]) it natively. This is `M3b`.
 
 TaskBase ABI + TaskManager singletons: memory `taskbase-abi-eu`.
 
+**Partial answer to step 2 (2026-08-27, static — `docs/EM_OVERLAY_ABI.md`).** On the
+**entity** side species selection is now fully traced and is not a tangle at all:
+`0x09AB15D8(ctx, emId)` is a jump-table factory (90 entries at `0x09C0CCF8` in
+`game_task` .data, `emId` is a `lbu` off a record). Each case allocates a 0x800-byte
+entity and installs that species' 61-slot EBOOT vtable — em75/Tigrex = `0x089BB69C`,
+matching the live-read value. 42 of 90 emIds share the 17 overlays (variants reuse a base
+species' AI). **Still open:** whether the *manager* task resolves species the same way —
+this traced the entity constructor, not `0x088a7090`/`0x8898748`.
+
 ## 5. Roadmap (status)
 
 | # | task | status |
