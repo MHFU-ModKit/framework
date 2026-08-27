@@ -385,21 +385,53 @@ safe near big-monster construction).
 So slot 29 is a genuine ~30 Hz per-frame hook, and slot 32 is precisely the enter-action seam —
 empirically, not just from the four-argument call shape in §6.
 
-### 🔴 `entity+0x414` is NOT the action-duration gate — an earlier claim here was wrong
+### 🔴 SOLVED: what ends an action — and why a ported clip can be ANY length
 
-The static pass found **81 literal stores** to `+0x414` (150, 300, 60, 180, 240, 600 …) and handler
-code decrementing it, and this document previously concluded that a ported clip longer than the
-native one would be truncated by that countdown. **That does not hold up live.**
+Each `(main,sub)` handler is a phase machine on `entity+0x1D5`, and its transitions are gated on
+the **clip's own cursor**, not on a wall clock. Worked example, the roar `(0,4)`
+(`0x09D26648`, 77 insns, 3 phases):
 
-- `+0x414` reads **0** throughout `(0,4)`, `(1,3)` and `(1,4)` — actions that plainly have
-  duration — and only shows 60 during `(3,5)`.
-- A slot-32 wrapper that calls the original and then writes 900 into `+0x414` produced **no
-  observable effect**: the value never survived to the next sample.
+```
+phase 0 : start clip a1=54 (executor), face the target, set the roar flag +0x523
+phase 1 : jal 0x08864408(entity+0x80, slot 0, 60.0f)   <- "has the cursor reached frame 60?"
+          if so -> phase 2
+phase 2 : lhu v1, 0xBC(s0); andi v1,1                  <- "is the clip still playing?"
+          if not -> the action ends
+```
 
-The timer is real and some handlers use it, but **what decides how long an action runs is still
-unidentified.** Candidates: per-handler counters at other offsets, `+0x1D5` advancing on the
-clip-done flag, or a value re-established on the slot-29 path every frame. A port's timing plan
-should not be built on `+0x414` until this is settled.
+The two primitives, both in the EBOOT and used by all 17 species:
+
+| gate | meaning |
+|---|---|
+| `0x08864408(block, slot, frame)` | 1 once the cursor has reached `frame`. Decoded: `lb 0x3E(a0)` disable check, `lwc1 f0, 0x10(a0 + slot*0x40)` = the live cursor, `c.le.s f12, f0`. `entity+0x80 + 0*0x40 + 0x10` = `entity+0x90`, the cursor `native_ai_probe.py` already reads. |
+| `0x08864348(block, slot, frame)` | the **windowed** form (cursor inside a range) — the shape of a hitbox-active test. 280 call sites in em75, its most-called external after the executor. |
+| `entity+0xBC & 1` | the clip is still PLAYING; the engine clears it at the end. |
+| `entity+0x414` | a hardcoded frame countdown. Real, but a minority gate. |
+
+`tools/em_phase_map.py` classifies all **231** em75 actions by what ENDS them:
+
+| | count | consequence for a port |
+|---|---|---|
+| clip-done only | 69 | any clip length, no event frames to match |
+| clip-done + cursor tests | 113 | any clip length, but **fixed event frames** |
+| **`+0x414` countdown** | **27** | **fixed length — a longer clip IS truncated** |
+| cursor tests only | 10 | |
+| no gate found | 12 | instant / driven from elsewhere |
+
+**182/231 (79%) end when the clip ends.** So a ported clip's LENGTH is free for four actions in
+five, and retiming ported clips to native durations is unnecessary — and would be wrong.
+
+The real constraint is narrower: **113 actions test hardcoded frame numbers inside the clip.** A
+ported clip may run as long as it likes but must place its impact on the frame the handler
+expects, or the effect fires at the wrong moment. Those numbers come out per action.
+
+> ⚠️ **An earlier revision of this section said `+0x414` was not a duration gate at all, based on a
+> live override that did nothing. That test was invalid**: it sampled `(0,4)`, `(1,3)`, `(1,4)` and
+> `(0,2)`, every one of which has `timer=0`. It never touched one of the 27 actions that use the
+> countdown, so it is evidence for neither side. Whether overriding `+0x414` works for those 27 is
+> **still open**.
+
+> ⚠️ 2 of the cursor thresholds are loaded from data rather than as literals and show as `?`.
 
 > ⚠️ **The methodology that produced the false positive.** The first run compared *mean dwell per
 > `(main,sub)`* between two **sequential** windows of one evolving fight and reported 1.75× =
@@ -426,6 +458,8 @@ tools/verify_em_vtable.py          # Stage A: static trace vs. live, + writabili
 tools/redirect_em_slot.py          # Stage B: A/B/A proving the engine follows a patch
 tools/wrap_em_slot.py --mode trampoline   # Stage C: tail-call wrap is transparent
 tools/wrap_em_slot.py --mode count --slot 29   # measure a slot's dispatch rate
+tools/em_phase_map.py <ovl>        # what ends each action: clip / cursor frames / timer
+tools/em_phase_map.py <ovl> --pair 0,4
 ```
 
 ⚠️ `callers` matches on the vtable byte offset alone, which many unrelated classes share. High
