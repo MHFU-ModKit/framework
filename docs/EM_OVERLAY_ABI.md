@@ -1,7 +1,12 @@
 # The engine ↔ big-monster-overlay interface (MHFU EU, ULES01213)
 
-**Traced 2026-08-27, statically — no cold boot, no debugger.** Reproduce any table here with
-`tools/em_abi.py`.
+**Traced 2026-08-27 statically, then CONFIRMED LIVE the same day (§9).** Reproduce any table here
+with `tools/em_abi.py`; re-verify against a running game with `tools/verify_em_vtable.py` and
+`tools/redirect_em_slot.py`.
+
+**Bottom line for modding:** the EBOOT vtable is writable at runtime and the engine follows a
+patched slot on every dispatch (both proven live). So a mod can take over a big monster's
+per-frame AI by writing **one word** — no MWo3 overlay to author, compile or inject.
 
 A big monster's AI is a per-species MWo3 overlay (`em*.ovl`). This document answers *how the
 engine calls into one*, which is the piece that was never mapped: we knew a great deal about
@@ -262,7 +267,95 @@ The blockers, honestly:
 **What it does NOT change:** the ~2 damaging-big-monster cap is architectural and closed
 (`monster-ai`); this is about one monster's behaviour, not about how many can exist.
 
-## 9. Tooling
+## 9. VERIFIED LIVE — Stage A and Stage B (2026-08-27)
+
+Everything above §9 was static. Both halves have now been confirmed against a running game on
+the `tigrex_s6` savestate.
+
+### Stage A — the static trace is correct, and the vtable is WRITABLE
+
+`tools/verify_em_vtable.py` (PASS):
+
+- live Tigrex `0x090BD530`, type `0x4B`, `entity+0x00` = `0x089BB69C` — as predicted;
+- **all 9 mandatory slots match the statically-predicted addresses, 9/9**;
+- writing a sentinel to `0x089BB4A4+0x7C` (em83's vtable — no Blangonga in this quest, so nothing
+  can dispatch through it) reads back the sentinel and restores cleanly.
+
+⇒ **The EBOOT's vtable rodata is writable at runtime.**
+
+> ⚠️ em83's slot 29 held `0x09D1A368` while em75 was the resident overlay — a **stale** pointer
+> into another species' code. Vtable slots are static data; whether the code behind them is valid
+> depends on which overlay is loaded. Never dispatch through a species whose overlay is not
+> resident, and restore any patch before the quest ends.
+
+### Stage B — the engine really does follow a patched slot
+
+Writable is not the same as *followed*: PPSSPP could have cached or inlined the dispatch.
+`tools/redirect_em_slot.py` settles it with an A/B/A on the live Tigrex, sampling
+`(main, sub, phase)` at 10 Hz:
+
+| phase | slot 29 points at | distinct states in 3 s | |
+|---|---|---|---|
+| **A** baseline | `0x09D35328` (em75) | 2 — `(0,4,1)→(0,4,2)` | AI running |
+| **B** redirected | a 2-instruction stub | **1 — `(0,4,2)`** | **frozen** |
+| **A'** restored | `0x09D35328` | 4 — `(0,4,2)→(1,3,1)→(1,4,2)→(1,4,3)` | recovered, combat ladder resumed |
+
+The stub is `jr ra; addu v0,zero,zero` written to `0x08A5E000`, the free tail of the quest staging
+buffer. **No PRX rebuild, no compiled overlay** — two words of MIPS plus one vtable word.
+
+⇒ **The engine reads the vtable word on every dispatch and calls whatever it finds.** Our own code
+can receive the per-frame AI step.
+
+> Writing *code* to `0x08A5E000` is safe precisely because that region has never been executed, so
+> the JIT holds no stale translation for it. Patching an existing function would hit the
+> code-patch trap in `ppsspp-debugging`; this does not.
+
+### What that changes
+
+An overlay no longer has to be authored or compiled. The practical shape is **wrap, don't
+replace**: point slot 29 (per-frame AI) and/or slot 32 (enter-action) at our own function, do our
+work, and tail-call the saved original so em75's hitbox and effect code still runs. Slot 29 is a
+**native ~30 Hz hook**, which also retires the 2 Hz Lua-tick limit on sequencing.
+
+Remaining unknowns for a real implementation, in order of risk:
+
+1. **Where our code lives.** The stub proved the mechanism from scratch RAM; a real handler wants
+   to be C in the framework PRX. ⚠️ The engine's big-monster construction thread has its stack
+   *inside* the PRX image (`BIG_MONSTER_OVERLAY_RELOCATION` §"PRX-stack collision"), and a `jal`
+   frame from a hook firing during construction is what clobbered it before. Slot 29 fires
+   per-frame, not during construction, so the risk is lower — but the proven-safe shape is a
+   frame-free, branchless stub.
+2. **Patch and restore lifecycle.** Apply once em75 is resident (quest load), restore on quest
+   exit. A slot left patched across a species change points at unrelated code.
+3. **The other 7 mandatory slots** still run em75's implementations, which is what we want — they
+   are the construction and housekeeping we are not trying to replace.
+
+### The MHP2G decomp — names and architecture, but NOT addresses
+
+`tools/mhfu_external/mhp2g-decomp` (tclamb/mhp2g-decomp) ships
+`config/em/em75.symbol_addrs.txt`: 289 symbol entries for the JP overlay, 86 of them real
+demangled C++ names rather than `func_*` placeholders.
+
+**Address overlap with MHFU EU is 0 of 212** — JP and EU are not co-located for these functions,
+so the file cannot be used as an address map without a per-function correspondence pass (content
+matching is the obvious method; the JP binary is not in this repo).
+
+What it *does* give, immediately, is the **shape of the engine API** a mod would call:
+
+```
+Singleton<EffectManager>   Singleton<HitManager>    Singleton<Sound>
+Singleton<ShellManager>    Singleton<EnemyManager>  Singleton<DrawManager>
+Singleton<Quest>           Singleton<PlayerManager> Singleton<DataManager>
+ObjBase::testAnimation(bool, u8)      DataManager::find_emmodel(u8)
+pmo::drawMesh(Hierarchy*, tmh*, u8)   pmo::set_mesh_color / set_mesh_alpha
+```
+
+The mangled names carry full signatures, which is the expensive half of identifying an unknown
+function. So the workflow for blocker #2 is: pick the capability (spawn an effect, play a sound),
+read its JP signature here, then locate the EU address by behaviour rather than by guessing what
+an unnamed function does.
+
+## 10. Tooling
 
 ```bash
 tools/em_abi.py inventory --em     # 17 species overlays; one load VA, zero ctors
@@ -270,10 +363,18 @@ tools/em_abi.py vtables            # the 17 entity vtables, attributed 1:1
 tools/em_abi.py interface          # 61-slot diff -> mandatory / optional / never
 tools/em_abi.py classes em75       # the classes an overlay installs itself
 tools/em_abi.py callers 29         # engine dispatch sites for a slot, in context
+tools/em_abi.py factory --check    # emId -> species overlay, with sanity checks
+```
+
+Live verification (needs the emulator; both load `tigrex_s6` cold):
+
+```bash
+tools/verify_em_vtable.py          # Stage A: static trace vs. live, + writability
+tools/redirect_em_slot.py          # Stage B: A/B/A proving the engine follows a patch
 ```
 
 ⚠️ `callers` matches on the vtable byte offset alone, which many unrelated classes share. High
 counts (slot 25 → 284, slot 32 → 669) are contaminated; read the low-count sites in context and
 treat the totals as an upper bound.
 
-All of it reads `workspace/extracted/` only — no emulator, no cold boot.
+`em_abi.py` reads `workspace/extracted/` only — no emulator, no cold boot. The two verification scripts need a running emulator and load the savestate cold.
