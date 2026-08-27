@@ -406,7 +406,7 @@ The two primitives, both in the EBOOT and used by all 17 species:
 | `0x08864408(block, slot, frame)` | 1 once the cursor has reached `frame`. Decoded: `lb 0x3E(a0)` disable check, `lwc1 f0, 0x10(a0 + slot*0x40)` = the live cursor, `c.le.s f12, f0`. `entity+0x80 + 0*0x40 + 0x10` = `entity+0x90`, the cursor `native_ai_probe.py` already reads. |
 | `0x08864348(block, slot, frame)` | the **windowed** form (cursor inside a range) — the shape of a hitbox-active test. 280 call sites in em75, its most-called external after the executor. |
 | `entity+0xBC & 1` | the clip is still PLAYING; the engine clears it at the end. |
-| `entity+0x414` | a hardcoded frame countdown. Real, but a minority gate. |
+| `entity+0x414` | a per-action **frame budget** the handler counts down and tests. Real, but a minority gate — and since §13 it is also **ours to set**. |
 
 `tools/em_phase_map.py` classifies all **231** em75 actions by what ENDS them:
 
@@ -414,7 +414,7 @@ The two primitives, both in the EBOOT and used by all 17 species:
 |---|---|---|
 | clip-done only | 69 | any clip length, no event frames to match |
 | clip-done + cursor tests | 113 | any clip length, but **fixed event frames** |
-| **`+0x414` countdown** | **27** | **fixed length — a longer clip IS truncated** |
+| **`+0x414` countdown** | **27** | fixed length natively — but the budget is **writable from a mod** (§13) |
 | cursor tests only | 10 | |
 | no gate found | 12 | instant / driven from elsewhere |
 
@@ -428,8 +428,12 @@ expects, or the effect fires at the wrong moment. Those numbers come out per act
 > ⚠️ **An earlier revision of this section said `+0x414` was not a duration gate at all, based on a
 > live override that did nothing. That test was invalid**: it sampled `(0,4)`, `(1,3)`, `(1,4)` and
 > `(0,2)`, every one of which has `timer=0`. It never touched one of the 27 actions that use the
-> countdown, so it is evidence for neither side. Whether overriding `+0x414` works for those 27 is
-> **still open**.
+> countdown, so it is evidence for neither side. **§13 settled it on a real gated action: the budget
+> is a genuine gate and a mod can set it.**
+
+> ⚠️ "Fixed length" describes the *native* game, not the ceiling. §13 shows the budget is one word
+> written per enter-action, so a port whose clip is longer than the native budget is only truncated
+> if nobody raises it. That removes the last category where clip length was not free.
 
 > ⚠️ 2 of the cursor thresholds are loaded from data rather than as literals and show as `?`.
 
@@ -581,13 +585,104 @@ duration. To own the timer the write has to happen **after** the handler, which 
 - the **slot-29 per-frame path**, re-asserting the value each frame while the target action is
   active. It runs at 30 Hz and is already frame-free.
 
-The second is the cheaper experiment and does not need a post-hook at all.
+The second is the cheaper experiment and does not need a post-hook at all. §13 took the first route
+anyway, because a post-hook is what a mod actually wants: it costs one dispatch, not 30 a second.
 
 > ⚠️ The test tool originally called 1/85 a PASS. Requiring merely `hits > 0` is wrong when a
 > pre-hook write is guaranteed to be visible for one sampling gap. `test_em_vhook.py` now demands a
 > majority and reports `OVERWRITTEN BY THE HANDLER` otherwise.
 
-## 13. Tooling
+
+## 13. 🟢 The post-hook WINS — a big monster's action clock is settable, one word per action
+
+§12 left one hypothesis: the pre-hook loses only because of *ordering*. Confirmed live on
+2026-08-28, on a genuinely timer-gated action, with the value read out of the cell.
+
+**The stub.** `wrap_em_slot.py --mode duration` writes a branchless post-hook over slot 32:
+
+```
+addiu sp,-0x20; sw ra/a0/a1/a2      spill — the original may clobber a0..a3
+jalr  original                       <-- the species' own enter-action runs FIRST
+lw    t0/t1/t2                       entity, main, sub
+andi/xori t1 ; andi/xori t2          0 iff main / sub match  (a wildcard is resolved
+or / sltiu   -> t1 = 1 iff match      HOST-side: emit `t=0` instead of the compare)
+addiu t5, t0, 0x414 ; li t6, SINK
+movn  t6, t5, t1                     pick entity+0x414 iff matched, else a scratch word
+sw    frames, 0(t6)                  the SAME instructions run either way
+jr    ra
+```
+
+Zero branches (the JIT-marker rule), `$v0`/`$v1` never touched (the original's return value has to
+survive), and one `movn` instead of a conditional store so armed and unarmed runs execute an
+identical instruction stream — the property that made the extra-RAM crash diagnosable in §12.
+
+**The result**, `tigrex_s6` (section 6, native Tigrex), each condition its own fresh cold load,
+player HP pinned so a 140 s soak survives an idle mauling:
+
+| armed `(2,9)` → `+0x414` | max `+0x414` seen | longest occupancy |
+|---|---|---|
+| baseline (no hook) | 498 | 3.30 s |
+| **1500** | **1499** (1499, 1497, 1493, 1491, 1487 …) | 3.15 s |
+| **30** | **30** (30, 26, 21, 19, 16 …) | **0.55 s** |
+
+The cell counts down from **our** number, and at 30 the action is **cut to a sixth of its natural
+length**. Targeting is exact: the stub was dispatched 101–107 times per run and matched **1**; every
+other pair's timer and dwell is unchanged between baseline and armed. Compare §12's pre-hook: 1 of
+85 samples. **Position was the whole problem.**
+
+### What `+0x414` actually is: a frame BUDGET, not a duration
+
+Why 1500 did nothing while 30 did everything. The `(2,9)` handler (`0x09D2AEB0`, phase 1):
+
+```
+lwc1  f1, 60(sp)        ; distance to the target
+mtc1  v1, f0            ; 1000.0f
+lw    a0, 1044(s1)      ; the budget
+c.le.s f1, f0           ; close enough?
+bc1t  -> next phase     ;   yes: transition NOW, budget untouched
+sw    v1, 1044(s1)      ;   no:  budget--
+bgez  v1, -> keep going ;        until it goes negative
+                        ; next phase: budget = 600; vt+0x88(entity, 2, 18, 1)
+```
+
+`(2,9)` is the charge. It ends on **whichever comes first** — the target coming inside 1000 units,
+or the budget expiring. Natively the Tigrex closes the distance in ~3.3 s while the budget still
+reads ~400, so raising it to 1500 is a no-op; dropping it to 30 makes the budget win and the charge
+aborts into `(2,18)` early. Both readings are the same mechanism.
+
+That transition is itself `vt+0x88` — the handler re-enters through **slot 32**, so a post-hook sees
+the chained action too.
+
+**How far this generalises.** A static pass over all 27 gated handlers finds only **2 of 17**
+countdown sites sitting behind an alternative float-compare exit (`(2,9)` and `(2,13)`); the other
+25 actions have no competing test, so there the budget should be the sole exit and setting it should
+move duration directly. Seed constants across the 27 are `{30, 60, 150, 300, 600, 900}` frames.
+
+> ⚠️ That 2/17 is a heuristic scan (`addiu X,X,-1` preceded by a `+0x414` reference, float compare
+> within the preceding 6 instructions), and 10 of the 27 do their decrement in a shared subroutine
+> rather than inline. Treat it as "the deadline shape is the exception", not as a proof for the
+> other 25 — each is one armed run away from being checked.
+
+### Consequences
+
+1. **A mod owns the action clock.** One store, after the original, on the action it names. No
+   overlay to author, no per-frame maintenance, no engine function to call.
+2. **The last "clip length is not free" category is gone.** §12's table called the 27 fixed-length;
+   they are only fixed until someone writes the budget. A ported clip longer than the native budget
+   just needs the budget raised to match — which is the same one word.
+3. **`em_vhook`'s shipped stub is still a pre-hook** (store, then `j original`). It needs the
+   ordering flipped to gain this; the tool-side stub above is the reference implementation.
+
+### Two method notes that cost time here
+
+- **A gated action has to actually occur.** `tigrex_s6` never entered main state 2 in a 25 s window,
+  and `--main 2 --sub any` reported INCONCLUSIVE rather than a failure. `--mode survey` (150 s, HP
+  pinned) lists every pair the monster visits and flags the gated ones — run it before arming.
+- **Pin the player's HP.** An idle hunter loses ~73 HP per 25 s to a Tigrex, and a dead player
+  shifts the world frame. One `write_u16` on `PLAYER+0x2E4` per sample holds it. This is the
+  *player*, not a big monster — the never-maintain-a-big-monster-per-tick rule does not apply.
+
+## 14. Tooling
 
 ```bash
 tools/em_abi.py inventory --em     # 17 species overlays; one load VA, zero ctors
@@ -607,6 +702,10 @@ tools/wrap_em_slot.py --mode trampoline   # Stage C: tail-call wrap is transpare
 tools/wrap_em_slot.py --mode count --slot 29   # measure a slot's dispatch rate
 tools/em_phase_map.py <ovl>        # what ends each action: clip / cursor frames / timer
 tools/em_phase_map.py <ovl> --pair 0,4
+tools/wrap_em_slot.py --mode survey --dwell 150 --pin-hp        # which pairs occur, gated flagged
+tools/wrap_em_slot.py --mode duration --main 2 --sub 9 \
+                      --frames 30 --dwell 140 --pin-hp          # §13: own the action clock
+tools/wrap_em_slot.py --mode duration --verify-gated <ovl>      # re-derive the 27 and diff
 ```
 
 ⚠️ `callers` matches on the vtable byte offset alone, which many unrelated classes share. High
