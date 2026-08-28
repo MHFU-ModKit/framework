@@ -23,12 +23,15 @@
  *   abi slot 32 (vt+0x88)  enter-action            — exactly 2 per (main,sub)
  *                          transition, 0 otherwise; args (entity, main, sub, mode)
  *
- * 🔴 THE STUBS ARE FRAME-FREE AND BRANCHLESS, deliberately. The engine's
+ * 🔴 BOTH STUBS ARE BRANCHLESS; the slot-29 one is also FRAME-FREE. The engine's
  * big-monster construction-thread stack sits INSIDE the PRX image (~0x09D8A000),
  * so a C-call frame from a hook is what clobbered the Lua VM in the long
- * "Lua VM corruption" hunt. These stubs touch no stack at all: a few loads, a
- * MOVN, one store, then `j original`. Selection is done with MOVN rather than a
- * branch so the whole thing stays a single basic block.
+ * "Lua VM corruption" hunt. Selection is done with MOVN rather than a branch so
+ * each stub stays a single basic block and the JIT cannot mis-handle it.
+ *
+ * The slot-32 stub (v2.0) does use a 16-byte hand-written frame, because it has
+ * to CALL the original before storing — see the block comment on build_act_stub
+ * for why that ordering is mandatory and why this particular frame is safe.
  *
  * ⚠️ A vtable slot's VALUE is static EBOOT data, but the code behind it is only
  * valid while THAT species' overlay is resident. We therefore latch onto the
@@ -112,7 +115,10 @@ typedef struct {
  * The debugger-driven proofs (Stage B/C) never saw this because they wrote their
  * stub to 0x08A5E000, outside the PRX. So: allocate from the user partition,
  * exactly as entity.cpp does for clones, and keep only pointers here. */
-#define STUB_INSNS 32
+/* The slot-32 post-hook is 40 instructions; the slot-29 counter is 7. A too-small
+ * value here would run one stub into the next, so build_act_stub assembles into a
+ * local buffer and refuses to install if it does not fit. */
+#define STUB_INSNS 48
 #define BLOCK_BYTES (2 * STUB_INSNS * 4 + 64)
 
 static uint32_t *g_stub_ai;
@@ -178,31 +184,90 @@ static void build_ai_stub(uint32_t original)
     while (i < STUB_INSNS) s[i++] = MIPS_NOP;
 }
 
-/* --- slot 32: on a matching (main,sub), store patch_val at entity+patch_off.
+/* --- slot 32: POST-hook. Call the species' own enter-action FIRST, then, on a
+ * matching (main,sub), store patch_val at entity+patch_off.
  *
- * Branchless selection: compute BOTH candidate store addresses and pick with
- * MOVN. On a miss the store lands in cfg.sink, which nothing reads. That keeps
- * the stub one basic block, so the JIT cannot mis-handle it, and costs one
- * pointless word write per dispatch (slot 32 fires ~0.7/s — free).
+ * 🔴 THE ORDERING IS THE WHOLE POINT. v1.0/v1.1 stored and then TAIL-CALLED the
+ * original, so the species code ran last and simply overwrote us: armed on all
+ * nine gated (2,x) actions, exactly 1 of 85 samples ever read our value back —
+ * the gap between our store and the handler's. Reversed, on `(2,9)`:
+ *
+ *     forced +0x414 | value read back | longest occupancy of (2,9)
+ *     --            | 498             | 3.30 s
+ *     1500          | 1499            | 3.15 s
+ *     30            |   30            | 0.55 s
+ *
+ * The action clock is ours. docs/EM_OVERLAY_ABI.md §13.
+ *
+ * ⚠️ This stub therefore uses a 16-byte STACK FRAME, which the file header's
+ * "frame-free" rule otherwise forbids. That rule exists because the engine parks
+ * thread stacks inside the PRX image, and a hook's C-call frame is what clobbered
+ * the Lua VM once. Four things make this one different, and none of them
+ * generalise to a C callback:
+ *   - it is 16 bytes of hand-written asm, not a C frame plus everything C calls;
+ *   - the function it wraps allocates 0x20 itself and then calls deeper, so our
+ *     addition to the high-water mark is noise;
+ *   - the identical frame ran on this exact dispatch path 100+ times per run
+ *     across three multi-minute debugger sessions with no incident;
+ *   - the stubs and config no longer live in the image at all (see alloc_block).
+ * A frame-free post-hook IS possible — spill `ra` to a config word instead of the
+ * stack and let `jal` set it — but that is not reentrant, and slot 32 fires twice
+ * per transition and can be re-entered from a handler (the (2,9) handler itself
+ * calls vt+0x88). The stack is the reentrant answer.
+ *
+ * ⚠️ It also matches on the ARGUMENTS (a1,a2) rather than entity+0x298/+0x299.
+ * The pre-hook read the struct, but `act_set` runs INSIDE the original, so before
+ * the call those bytes still hold the PREVIOUS action — and some paths through
+ * the original return early without ever reaching act_set. The args are the
+ * intent, and they are what the validated tools/wrap_em_slot.py stub matched on.
+ *
+ * Branchless after the call: compute BOTH candidate store addresses and pick with
+ * MOVN. On a miss the store lands in cfg.sink, which nothing reads. Armed and
+ * unarmed runs therefore execute an identical instruction stream — the property
+ * that made the extra-RAM crash diagnosable.
  */
+#define ACT_FRAME   0x10
+#define ACT_SP_ENT  0x00
+#define ACT_SP_MAIN 0x04
+#define ACT_SP_SUB  0x08
+#define ACT_SP_RA   0x0C
+
 static void build_act_stub(uint32_t original)
 {
     uint32_t cfg = (uint32_t)(uintptr_t)g_cfgp;
+    uint32_t s[STUB_INSNS + 32];      /* assemble here, bounds-check, then copy */
     int i = 0;
-    uint32_t *s = g_stub_act;
+
+    /* prologue: spill ra and the three args the original may clobber */
+    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -ACT_FRAME);
+    s[i++] = mips_sw(MIPS_REG_RA, ACT_SP_RA,   MIPS_REG_SP);
+    s[i++] = mips_sw(MIPS_REG_A0, ACT_SP_ENT,  MIPS_REG_SP);
+    s[i++] = mips_sw(MIPS_REG_A1, ACT_SP_MAIN, MIPS_REG_SP);
+    s[i++] = mips_sw(MIPS_REG_A2, ACT_SP_SUB,  MIPS_REG_SP);
+
+    /* the species' own enter-action, with a0..a3 untouched. `jal` (not jalr)
+     * because the stub block and the overlay share a 256 MB region, same as the
+     * slot-29 stub's `j original`. */
+    s[i++] = mips_jal(original);
+    s[i++] = MIPS_NOP;                                   /* jal delay slot */
+
+    /* reload and tear the frame down: everything below is registers only.
+     * $v0/$v1 are never touched — the original's return value has to survive. */
+    s[i++] = mips_lw(MIPS_REG_T8, ACT_SP_ENT,  MIPS_REG_SP);   /* entity */
+    s[i++] = mips_lw(MIPS_REG_T0, ACT_SP_MAIN, MIPS_REG_SP);
+    s[i++] = mips_lw(MIPS_REG_T1, ACT_SP_SUB,  MIPS_REG_SP);
+    s[i++] = mips_lw(MIPS_REG_RA, ACT_SP_RA,   MIPS_REG_SP);
+    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, ACT_FRAME);
+
     s[i++] = mips_lui(MIPS_REG_T7, (uint16_t)(cfg >> 16));
     s[i++] = mips_ori(MIPS_REG_T7, MIPS_REG_T7, (uint16_t)cfg);
+    s[i++] = mips_andi(MIPS_REG_T0, MIPS_REG_T0, 0xFF);        /* main */
+    s[i++] = mips_andi(MIPS_REG_T1, MIPS_REG_T1, 0xFF);        /* sub  */
 
     /* bookkeeping: ++act_enters, last_pair = (main<<8)|sub */
-    s[i++] = mips_lw (MIPS_REG_T0, CFG_ACT_ENTER, MIPS_REG_T7);
-    s[i++] = mips_addiu(MIPS_REG_T0, MIPS_REG_T0, 1);
-    s[i++] = mips_sw (MIPS_REG_T0, CFG_ACT_ENTER, MIPS_REG_T7);
-
-    s[i++] = mips_lbu(MIPS_REG_T0, ENT_MAIN, MIPS_REG_A0);   /* live main */
-    s[i++] = mips_lbu(MIPS_REG_T1, ENT_SUB,  MIPS_REG_A0);   /* live sub  */
-    /* last_pair = (main<<8)|sub. v1.0 stored only the sub byte while claiming
-     * the packed form in the struct comment; the host read 2 and could not tell
-     * which main state it belonged to. */
+    s[i++] = mips_lw (MIPS_REG_T6, CFG_ACT_ENTER, MIPS_REG_T7);
+    s[i++] = mips_addiu(MIPS_REG_T6, MIPS_REG_T6, 1);
+    s[i++] = mips_sw (MIPS_REG_T6, CFG_ACT_ENTER, MIPS_REG_T7);
     s[i++] = mips_sll(MIPS_REG_T6, MIPS_REG_T0, 8);
     s[i++] = mips_or (MIPS_REG_T6, MIPS_REG_T6, MIPS_REG_T1);
     s[i++] = mips_sw (MIPS_REG_T6, CFG_LAST_PAIR, MIPS_REG_T7);
@@ -213,10 +278,10 @@ static void build_act_stub(uint32_t original)
     s[i++] = mips_xor(MIPS_REG_T1, MIPS_REG_T1, MIPS_REG_T3);  /* 0 iff sub ok  */
 
     /* WILDCARD: want_sub == SUB_ANY means "any sub of this main state".
-     * Betting on one exact pair does not work in practice — the timer-gated
-     * actions are transient, and a 300 s watch armed on (2,9) caught it zero
-     * times even though a survey minutes earlier saw it 39 times. Matching a
-     * whole main state fires on all nine gated (2,x) actions at once.
+     * Betting on one exact pair is a poor bet — the timer-gated actions are
+     * transient, and a 300 s watch armed on (2,9) caught it zero times even
+     * though a survey minutes earlier saw it 39 times. Matching a whole main
+     * state fires on all nine gated (2,x) actions at once.
      * Branchless: force the sub difference to 0 when the wildcard is set. */
     s[i++] = mips_xori(MIPS_REG_T3, MIPS_REG_T3, SUB_ANY);   /* 0 iff wildcard */
     s[i++] = mips_sltiu(MIPS_REG_T3, MIPS_REG_T3, 1);        /* 1 iff wildcard */
@@ -228,14 +293,27 @@ static void build_act_stub(uint32_t original)
     s[i++] = mips_lw (MIPS_REG_T4, CFG_PATCH_OFF, MIPS_REG_T7);
     s[i++] = mips_lw (MIPS_REG_T5, CFG_PATCH_VAL, MIPS_REG_T7);
     s[i++] = mips_andi(MIPS_REG_T4, MIPS_REG_T4, PATCH_OFF_MASK);  /* bound it */
-    s[i++] = mips_addu(MIPS_REG_T4, MIPS_REG_A0, MIPS_REG_T4); /* &entity[off] */
+    s[i++] = mips_addu(MIPS_REG_T4, MIPS_REG_T8, MIPS_REG_T4); /* &entity[off] */
     s[i++] = mips_addiu(MIPS_REG_T6, MIPS_REG_T7, CFG_SINK);   /* &cfg.sink   */
     s[i++] = mips_movn(MIPS_REG_T6, MIPS_REG_T4, MIPS_REG_T2); /* pick on match */
     s[i++] = mips_sw (MIPS_REG_T5, 0, MIPS_REG_T6);
 
-    s[i++] = mips_j(original);
-    s[i++] = MIPS_NOP;                                   /* j delay slot */
-    while (i < STUB_INSNS) s[i++] = MIPS_NOP;
+    s[i++] = mips_jr(MIPS_REG_RA);
+    s[i++] = MIPS_NOP;                                   /* jr delay slot */
+
+    if (i > STUB_INSNS) {
+        /* Cannot happen with the code above, but if someone extends the stub
+         * past the slot it would overrun the config block — fall back to a plain
+         * tail-call so the monster still behaves, and say so. */
+        mhfu_log("[%s] act stub is %d insns > STUB_INSNS %d - installing a plain "
+                 "trampoline instead", MOD_ID, i, STUB_INSNS);
+        g_stub_act[0] = mips_j(original);
+        g_stub_act[1] = MIPS_NOP;
+        return;
+    }
+    for (int k = 0; k < i; k++) g_stub_act[k] = s[k];
+    for (int k = i; k < STUB_INSNS; k++) g_stub_act[k] = MIPS_NOP;
+    mhfu_log("[%s] act stub: POST-hook, %d insns, frame 0x%X", MOD_ID, i, ACT_FRAME);
 }
 
 /* Public control surface — a mod (or the Lua host) can retarget the override
@@ -336,6 +414,6 @@ static int em_vhook_init(void)
 
 static void em_vhook_shutdown(void) { uninstall(); }
 
-MHFU_MOD(.id = MOD_ID, .version = "1.0",
+MHFU_MOD(.id = MOD_ID, .version = "2.0",
          .needs = 0, .conflicts = 0,
          .init = em_vhook_init, .shutdown = em_vhook_shutdown);
