@@ -663,6 +663,79 @@ move duration directly. Seed constants across the 27 are `{30, 60, 150, 300, 600
 > rather than inline. Treat it as "the deadline shape is the exception", not as a proof for the
 > other 25 — each is one armed run away from being checked.
 
+### The shipped mod: em_vhook v2.0, in-game
+
+`em_vhook`'s stub carries the same ordering, and was validated on a cold boot with no debugger
+writing any code — deploy, Giadrome quest, walk to **section 1**, verify, arm:
+
+```
+[em_vhook] act stub: POST-hook, 40 insns, frame 0x10
+[em_vhook] vtable 0x089BB69C: slot29 0x09D35328 -> 0x09E24500, slot32 0x09D3D608 -> 0x09E245C0
+stub readback — disassembling the installed slot-32 stub:
+  +04 sw ra,12(sp)  +08 sw a0,0(sp)  +0C sw a1,4(sp)  +10 sw a2,8(sp)
+  +14 jal 0x09D3D608   +18 nop   +20 lw t0,4(sp) ...
+  ... call at insn 5, store at insn 37   -> POST-hook confirmed in RAM
+slot29 151 dispatches in 5s = 30.2/s      canary intact for 25s
+armed: (2,ANY) -> entity+0x414 = 1234
+   pair  owned  samples  held ours  max +0x414
+ (2,16) re-seeds     16          0         146
+ (2,24)    YES       13         13        1231
+TIMER OVERRIDE via em_vhook: HOLDS
+```
+
+**13 of 13** on the owned pair, reproduced across two independent cold boots (`(2,24)` peaked at
+1231 both times, `(2,16)` at 146 both times).
+
+> ⚠️ The readback disassembles two words as `.word 0x68295xxx` — PPSSPP's **JIT block markers**, at
+> the stub entry and at the return point from the `jal`. That is the documented
+> "reading a hook back returns the marker, not your bytes" trap, and it is why the verifier checks
+> the *shape* (call before store, no branches, `$v0`/`$v1` untouched) rather than comparing bytes.
+> It also means a post-hook is necessarily **two** JIT blocks, not one — which the branchless rule
+> was meant to avoid, and which nevertheless runs correctly here.
+
+> ⚠️ Score **per pair**, never in aggregate. The first run of this pooled an owned action with a
+> re-seeding one and reported a misleading `14/35 → OVERWRITTEN`, on a run where every owned action
+> was in fact owned.
+
+### 🔴 15 of the 27, not all 27 — phase 0 can re-seed the budget after we store
+
+The in-game run above armed the wildcard on main state 2 and caught two gated
+actions in one window. They behaved **differently**, and the difference is not noise:
+
+```
+max +0x414 per gated pair, armed on (2,ANY) -> 1234
+   (2,24) = 1231      <- ours
+   (2,16) =  146      <- the handler's own 150
+```
+
+`(2,24)`'s handler `0x09D2C348` only ever **consumes** the budget: phase 0 writes no `+0x414` at
+all, phase 1 goes straight to `lw / addiu -1 / blez`. `(2,16)`'s handler `0x09D2BA98` **re-seeds**
+it in phase 0 — `addiu v1, zero, 150; sw v1, 1044(s1)`, hidden in the delay slot of the block's
+terminating branch.
+
+Phase 0 runs on the **first slot-29 tick**, which is one frame *after* enter-action. So a slot-32
+hook of any ordering stores first and is overwritten. This is not the §12 pre-hook bug reappearing —
+it is a different write, from a different seam, and it cannot be fixed by reordering.
+
+`em_phase_map.py <ovl> --budget-owner` splits the 27 on exactly that criterion:
+
+| | count | pairs |
+|---|---|---|
+| **post-hook OWNS** (handler only consumes) | **15** | `(0,0) (0,19) (0,20) (2,2) (2,4) (2,7) (2,9) (2,11) (2,13) (2,24) (4,11) (4,14) (4,21) (4,23) (4,26)` |
+| phase 0 re-seeds → needs the slot-29 seam | 12 | `(0,3) (0,25) (1,21) (1,25) (2,16) (2,17) (3,12)…(3,16) (4,24)` |
+
+All three live data points agree with it: `(2,9)` owned (debugger, 3.30 s → 0.55 s), `(2,24)` owned
+(in-game, 1231 of 1234), `(2,16)` not (146 vs 150).
+
+> ⚠️ An earlier version of this classifier flagged **any** literal seed anywhere in the handler and
+> got `(2,9)` wrong — `(2,9)` seeds 600 on its way *out*, for the action it chains into. The
+> criterion has to be "seeds **in the phase-0 block**", delay slot included.
+
+⇒ For the remaining 12, re-assert the budget from the **slot-29 per-frame path** while the target
+action is active. That is a per-frame write, so it is the one place where the
+never-maintain-a-big-monster-per-tick rule needs a deliberate, narrow exception rather than a
+blanket one.
+
 ### Consequences
 
 1. **A mod owns the action clock.** One store, after the original, on the action it names. No
@@ -670,8 +743,12 @@ move duration directly. Seed constants across the 27 are `{30, 60, 150, 300, 600
 2. **The last "clip length is not free" category is gone.** §12's table called the 27 fixed-length;
    they are only fixed until someone writes the budget. A ported clip longer than the native budget
    just needs the budget raised to match — which is the same one word.
-3. **`em_vhook`'s shipped stub is still a pre-hook** (store, then `j original`). It needs the
-   ordering flipped to gain this; the tool-side stub above is the reference implementation.
+3. **`em_vhook` v2.0 ships it** — validated in-game above. Its slot-29 stub stays frame-free; the
+   slot-32 stub uses a 16-byte hand-written frame, which is the one deliberate exception to the
+   frame-free rule and is argued in the block comment on `build_act_stub`.
+4. **12 of the 27 still need the slot-29 seam** — their phase 0 re-seeds the budget one frame after
+   any slot-32 hook can write it. That is the next capability, and the only one that requires a
+   per-frame write.
 
 ### Two method notes that cost time here
 
@@ -702,6 +779,8 @@ tools/wrap_em_slot.py --mode trampoline   # Stage C: tail-call wrap is transpare
 tools/wrap_em_slot.py --mode count --slot 29   # measure a slot's dispatch rate
 tools/em_phase_map.py <ovl>        # what ends each action: clip / cursor frames / timer
 tools/em_phase_map.py <ovl> --pair 0,4
+tools/em_phase_map.py <ovl> --budget-owner   # which of the 27 a slot-32 post-hook can own
+tools/test_em_vhook.py --pair 2,0 --wild --frames 1234 --section 1   # the shipped mod, in-game
 tools/wrap_em_slot.py --mode survey --dwell 150 --pin-hp        # which pairs occur, gated flagged
 tools/wrap_em_slot.py --mode duration --main 2 --sub 9 \
                       --frames 30 --dwell 140 --pin-hp          # §13: own the action clock
