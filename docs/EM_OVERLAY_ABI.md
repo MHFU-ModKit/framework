@@ -731,10 +731,52 @@ All three live data points agree with it: `(2,9)` owned (debugger, 3.30 s → 0.
 > got `(2,9)` wrong — `(2,9)` seeds 600 on its way *out*, for the action it chains into. The
 > criterion has to be "seeds **in the phase-0 block**", delay slot included.
 
-⇒ For the remaining 12, re-assert the budget from the **slot-29 per-frame path** while the target
-action is active. That is a per-frame write, so it is the one place where the
-never-maintain-a-big-monster-per-tick rule needs a deliberate, narrow exception rather than a
-blanket one.
+### 🟢 The slot-29 seam closes the other 12 — a ONE-SHOT, not a per-frame re-assert
+
+Added and validated 2026-08-29 (`em_vhook` v2.1, `--seam29`). `(2,16)`, which the slot-32 post-hook
+scored 0/16 on with a max of 146, now reads:
+
+```
+   pair   target  samples  held ours  max +0x414
+ (2, 4)    other       15         15        1233
+ (2,16)      YES       26         26        1233
+ (2,24)    other       28         28        1233
+armed (2,ANY) -> 1234;  69/69 samples held our value
+TIMER OVERRIDE via em_vhook (slot-29 one-shot): HOLDS
+```
+
+**Re-asserting every frame would have been wrong.** It would not set the duration, it would FREEZE
+it: the handler decrements, we put it back, the action never ends. The stub writes on exactly **one
+tick per action instance — the second**:
+
+- **tick 1** is the phase-0 tick. The handler seeds its own literal *after* us (the stub stays a
+  frame-free **pre**-hook because it runs at 30 Hz), so a write there would be lost anyway.
+- **tick 2** is the first phase-1 tick, which only decrements. Our value lands and counts down
+  naturally from there.
+
+That is why the observed maximum is **1233 and not 1234** — the handler decrements once immediately
+after our store. Shortening and lengthening both work; a clamp ("write only if the budget exceeds
+ours") would have been a instruction cheaper and could only ever shorten.
+
+"Second tick" is decided branchlessly from two history words in the config:
+
+```
+write  iff  matched  &&  prev == cur  &&  prev2 != cur          (prev/prev2 shifted every tick)
+```
+
+No stack, no branch, one basic block — the frame-free rule holds here precisely *because* this seam
+runs 30×/s, where the slot-32 post-hook's 16-byte frame fires ~0.7×/s.
+
+> ⚠️ `prev`/`prev2` initialise to `0xFFFFFFFF`, not 0: `(0,0)` packs to 0, so a zeroed history reads
+> as "the monster has been in `(0,0)` for two ticks" and would fire the one-shot on install.
+
+> ⚠️ **Attribution.** `(2,4)` and `(2,24)` also held our value in that run, but both seams were armed
+> — the stubs key off `want_main`/`want_sub`, and `armed` does not gate the slot-32 stub. So this run
+> proves the slot-29 seam on the **re-seeding** set only. It very likely covers the other 15 too (it
+> writes on tick 2 regardless of whether phase 0 seeded), but that is not isolated here.
+
+A mod picks the seam with `em_vhook_seam29(1)`; off by default, so the cheap slot-32 hook stays the
+default for the 15 it already owns.
 
 ### Consequences
 
@@ -746,9 +788,13 @@ blanket one.
 3. **`em_vhook` v2.0 ships it** — validated in-game above. Its slot-29 stub stays frame-free; the
    slot-32 stub uses a 16-byte hand-written frame, which is the one deliberate exception to the
    frame-free rule and is argued in the block comment on `build_act_stub`.
-4. **12 of the 27 still need the slot-29 seam** — their phase 0 re-seeds the budget one frame after
-   any slot-32 hook can write it. That is the next capability, and the only one that requires a
-   per-frame write.
+4. **All 27 are now reachable.** The 15 whose handler only consumes the budget go through the
+   slot-32 post-hook; the 12 whose phase 0 re-seeds it go through the slot-29 one-shot
+   (`em_vhook_seam29(1)`). Neither needs a per-frame re-assert.
+5. ⇒ **209 of em75's 231 actions have a length a mod chooses.** 182 end when the clip ends, so
+   their length was already the ported clip's; the **27** budget-gated ones now have that budget
+   settable, on a seam proven for both shapes. The remaining 22 (10 cursor-only, 12 with no gate
+   found) are instant or driven from elsewhere and were never clip-length-bound to begin with.
 
 ### Two method notes that cost time here
 
@@ -781,6 +827,7 @@ tools/em_phase_map.py <ovl>        # what ends each action: clip / cursor frames
 tools/em_phase_map.py <ovl> --pair 0,4
 tools/em_phase_map.py <ovl> --budget-owner   # which of the 27 a slot-32 post-hook can own
 tools/test_em_vhook.py --pair 2,0 --wild --frames 1234 --section 1   # the shipped mod, in-game
+tools/test_em_vhook.py --pair 2,0 --wild --frames 1234 --seam29     # ... via the slot-29 one-shot
 tools/wrap_em_slot.py --mode survey --dwell 150 --pin-hp        # which pairs occur, gated flagged
 tools/wrap_em_slot.py --mode duration --main 2 --sub 9 \
                       --frames 30 --dwell 140 --pin-hp          # §13: own the action clock

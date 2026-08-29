@@ -23,6 +23,13 @@
  *   abi slot 32 (vt+0x88)  enter-action            — exactly 2 per (main,sub)
  *                          transition, 0 otherwise; args (entity, main, sub, mode)
  *
+ * Two capabilities, one per seam:
+ *   slot 32 post-hook  sets `entity+0x414` for the 15 gated actions whose handler
+ *                      only consumes the budget;
+ *   slot 29 pre-hook   a ONE-SHOT on the action's second frame, for the 12 whose
+ *                      phase-0 block re-seeds it after slot 32 has written.
+ *                      `em_vhook_seam29(1)` turns it on; off by default.
+ *
  * 🔴 BOTH STUBS ARE BRANCHLESS; the slot-29 one is also FRAME-FREE. The engine's
  * big-monster construction-thread stack sits INSIDE the PRX image (~0x09D8A000),
  * so a C-call frame from a hook is what clobbered the Lua VM in the long
@@ -65,7 +72,7 @@ typedef struct {
     uint8_t  want_main;      /* +0x00  match this (main,sub) ... */
     uint8_t  want_sub;       /* +0x01 */
     uint8_t  armed;          /* +0x02  0 = stub stores to sink only */
-    uint8_t  pad;            /* +0x03 */
+    uint8_t  arm29;          /* +0x03  1 = the SLOT-29 stub owns patch_off too */
     uint32_t patch_off;      /* +0x04  ... then store to entity+patch_off */
     uint32_t patch_val;      /* +0x08  ... this value */
     uint32_t sink;           /* +0x0C  harmless target when unmatched */
@@ -75,6 +82,10 @@ typedef struct {
     uint32_t canary;         /* +0x1C  CFG_CANARY; if this ever reads back wrong,
                               *        the block was overwritten and nothing the
                               *        stubs load from it can be trusted */
+    uint32_t prev_pair;      /* +0x20  (main<<8)|sub at the previous slot-29 tick */
+    uint32_t prev2_pair;     /* +0x24  ... and the one before that. Together they
+                              *        make a branchless "this is the SECOND tick
+                              *        of this action" one-shot — see build_ai_stub */
 } em_vhook_cfg_t;
 
 #define CFG_CANARY 0x5645484Bu   /* 'VEHK' */
@@ -94,6 +105,7 @@ typedef struct {
 
 #define CFG_WANT_MAIN 0x00
 #define CFG_WANT_SUB  0x01
+#define CFG_ARM29     0x03
 #define CFG_PATCH_OFF 0x04
 #define CFG_PATCH_VAL 0x08
 #define CFG_SINK      0x0C
@@ -101,6 +113,8 @@ typedef struct {
 #define CFG_ACT_ENTER 0x14
 #define CFG_LAST_PAIR 0x18
 #define CFG_CANARY_OFF 0x1C
+#define CFG_PREV      0x20
+#define CFG_PREV2     0x24
 
 /* 🔴 THE STUBS AND THE CONFIG MUST NOT LIVE IN THE PRX IMAGE.
  *
@@ -158,6 +172,9 @@ static int alloc_block(void)
     g_cfgp     = (em_vhook_cfg_t *)(base + 2 * STUB_INSNS * 4);
     for (unsigned k = 0; k < sizeof(*g_cfgp) / 4; k++)
         ((uint32_t *)g_cfgp)[k] = 0;
+    /* NOT zero: (0,0) packs to 0, so a zeroed history would read as "the monster
+     * has been in (0,0) for two ticks" and could fire the one-shot on install. */
+    g_cfgp->prev_pair = g_cfgp->prev2_pair = 0xFFFFFFFFu;
     mhfu_log("[%s] block @0x%08X (outside the PRX image)",
              MOD_ID, (unsigned)(uintptr_t)base);
     return 0;
@@ -168,20 +185,109 @@ static uint32_t g_orig_ai;
 static uint32_t g_orig_act;
 static int      g_installed;
 
-/* --- slot 29: count, then tail-call. Frame-free, branchless, 7 insns. ----- */
+/* --- slot 29: count, optionally SET THE ACTION BUDGET, then tail-call. -----
+ *
+ * Why this seam exists at all. A slot-32 post-hook owns `entity+0x414` for 15 of
+ * the 27 timer-gated actions; the other 12 re-seed it in their handler's
+ * **phase-0 block**, which runs on the FIRST slot-29 tick — one frame after any
+ * slot-32 hook can write. Measured: armed on (2,ANY) -> 1234, `(2,24)` held our
+ * value 13/13 while `(2,16)` counted down from its own 150.
+ * `em_phase_map.py <ovl> --budget-owner` names both sets.
+ *
+ * 🔴 THE ONE-SHOT IS THE DESIGN. Re-asserting the budget every frame would not
+ * "set the duration", it would FREEZE it — the handler decrements, we put it
+ * back, and the action never ends. So we write on exactly ONE tick per action
+ * instance: the SECOND one. Tick 1 is the phase-0 tick, where the handler seeds
+ * its own literal AFTER us (this stub is frame-free, so it must stay a pre-hook);
+ * tick 2 is the first phase-1 tick, which only decrements, so our value lands and
+ * then counts down naturally from there. Shortening and lengthening both work —
+ * a clamp ("only write if the budget is bigger than ours") would have been one
+ * instruction cheaper and could only ever shorten.
+ *
+ * "Second tick" is decided branchlessly from two history words:
+ *      write  iff  matched  &&  prev == cur  &&  prev2 != cur
+ * with prev/prev2 shifted every tick. No stack, no branch, one basic block.
+ *
+ * ⚠️ This one runs at ~30 Hz, which is why it stays FRAME-FREE where the slot-32
+ * post-hook did not: the engine parks thread stacks inside the PRX image, and
+ * frequency is what turns a marginal stack cost into a collision.
+ */
 static void build_ai_stub(uint32_t original)
 {
     uint32_t cfg = (uint32_t)(uintptr_t)g_cfgp;
+    uint32_t s[STUB_INSNS + 32];
     int i = 0;
-    uint32_t *s = g_stub_ai;
+
     s[i++] = mips_lui(MIPS_REG_T7, (uint16_t)(cfg >> 16));
     s[i++] = mips_ori(MIPS_REG_T7, MIPS_REG_T7, (uint16_t)cfg);
     s[i++] = mips_lw (MIPS_REG_T0, CFG_AI_TICKS, MIPS_REG_T7);
     s[i++] = mips_addiu(MIPS_REG_T0, MIPS_REG_T0, 1);
     s[i++] = mips_sw (MIPS_REG_T0, CFG_AI_TICKS, MIPS_REG_T7);
-    s[i++] = mips_j(original);
+
+    /* cur = (main<<8)|sub, straight off the entity — a0 is still the entity
+     * because nothing has been called yet. */
+    s[i++] = mips_lbu(MIPS_REG_T0, ENT_MAIN, MIPS_REG_A0);
+    s[i++] = mips_lbu(MIPS_REG_T1, ENT_SUB,  MIPS_REG_A0);
+    s[i++] = mips_sll(MIPS_REG_T8, MIPS_REG_T0, 8);
+    s[i++] = mips_or (MIPS_REG_T8, MIPS_REG_T8, MIPS_REG_T1);   /* t8 = cur */
+
+    /* matched? same wildcard convention as the slot-32 stub. */
+    s[i++] = mips_lbu(MIPS_REG_T2, CFG_WANT_MAIN, MIPS_REG_T7);
+    s[i++] = mips_lbu(MIPS_REG_T3, CFG_WANT_SUB,  MIPS_REG_T7);
+    s[i++] = mips_xor(MIPS_REG_T0, MIPS_REG_T0, MIPS_REG_T2);
+    s[i++] = mips_xor(MIPS_REG_T1, MIPS_REG_T1, MIPS_REG_T3);
+    s[i++] = mips_xori(MIPS_REG_T3, MIPS_REG_T3, SUB_ANY);
+    s[i++] = mips_sltiu(MIPS_REG_T3, MIPS_REG_T3, 1);
+    s[i++] = mips_movn(MIPS_REG_T1, MIPS_REG_ZERO, MIPS_REG_T3);
+    s[i++] = mips_or (MIPS_REG_T0, MIPS_REG_T0, MIPS_REG_T1);
+    s[i++] = mips_sltiu(MIPS_REG_T2, MIPS_REG_T0, 1);           /* 1 iff match */
+
+    /* ... and only if this seam was explicitly armed. The slot-32 hook stays
+     * usable on its own; a mod picks the seam that owns the action it wants. */
+    s[i++] = mips_lbu(MIPS_REG_T3, CFG_ARM29, MIPS_REG_T7);
+    s[i++] = mips_sltiu(MIPS_REG_T3, MIPS_REG_T3, 1);           /* 1 iff off */
+    s[i++] = mips_xori(MIPS_REG_T3, MIPS_REG_T3, 1);            /* 1 iff on  */
+    s[i++] = mips_and(MIPS_REG_T2, MIPS_REG_T2, MIPS_REG_T3);
+
+    /* second tick of this action: prev == cur && prev2 != cur */
+    s[i++] = mips_lw (MIPS_REG_T4, CFG_PREV,  MIPS_REG_T7);
+    s[i++] = mips_lw (MIPS_REG_T5, CFG_PREV2, MIPS_REG_T7);
+    s[i++] = mips_xor(MIPS_REG_T6, MIPS_REG_T4, MIPS_REG_T8);
+    s[i++] = mips_sltiu(MIPS_REG_T6, MIPS_REG_T6, 1);           /* 1 iff prev==cur */
+    s[i++] = mips_and(MIPS_REG_T2, MIPS_REG_T2, MIPS_REG_T6);
+    s[i++] = mips_xor(MIPS_REG_T6, MIPS_REG_T5, MIPS_REG_T8);
+    s[i++] = mips_sltiu(MIPS_REG_T6, MIPS_REG_T6, 1);
+    s[i++] = mips_xori(MIPS_REG_T6, MIPS_REG_T6, 1);            /* 1 iff prev2!=cur */
+    s[i++] = mips_and(MIPS_REG_T2, MIPS_REG_T2, MIPS_REG_T6);
+
+    /* shift the history every tick, armed or not */
+    s[i++] = mips_sw (MIPS_REG_T4, CFG_PREV2, MIPS_REG_T7);
+    s[i++] = mips_sw (MIPS_REG_T8, CFG_PREV,  MIPS_REG_T7);
+
+    /* same bounded, branchless store as slot 32: entity+patch_off on a match,
+     * cfg.sink otherwise, identical instructions either way. */
+    s[i++] = mips_lw (MIPS_REG_T4, CFG_PATCH_OFF, MIPS_REG_T7);
+    s[i++] = mips_lw (MIPS_REG_T5, CFG_PATCH_VAL, MIPS_REG_T7);
+    s[i++] = mips_andi(MIPS_REG_T4, MIPS_REG_T4, PATCH_OFF_MASK);
+    s[i++] = mips_addu(MIPS_REG_T4, MIPS_REG_A0, MIPS_REG_T4);
+    s[i++] = mips_addiu(MIPS_REG_T6, MIPS_REG_T7, CFG_SINK);
+    s[i++] = mips_movn(MIPS_REG_T6, MIPS_REG_T4, MIPS_REG_T2);
+    s[i++] = mips_sw (MIPS_REG_T5, 0, MIPS_REG_T6);
+
+    s[i++] = mips_j(original);           /* tail call: a0..a3 and ra untouched */
     s[i++] = MIPS_NOP;                                   /* j delay slot */
-    while (i < STUB_INSNS) s[i++] = MIPS_NOP;
+
+    if (i > STUB_INSNS) {
+        mhfu_log("[%s] ai stub is %d insns > STUB_INSNS %d - installing a plain "
+                 "trampoline instead", MOD_ID, i, STUB_INSNS);
+        g_stub_ai[0] = mips_j(original);
+        g_stub_ai[1] = MIPS_NOP;
+        return;
+    }
+    for (int k = 0; k < i; k++) g_stub_ai[k] = s[k];
+    for (int k = i; k < STUB_INSNS; k++) g_stub_ai[k] = MIPS_NOP;
+    mhfu_log("[%s] ai stub: pre-hook + one-shot budget, %d insns, frame-free",
+             MOD_ID, i);
 }
 
 /* --- slot 32: POST-hook. Call the species' own enter-action FIRST, then, on a
@@ -330,6 +436,24 @@ extern "C" void em_vhook_arm(uint8_t main_state, uint8_t sub_state,
              MOD_ID, main_state, sub_state, (unsigned)off, (unsigned)val);
 }
 
+/* Pick which seam owns the armed action's `entity+0x414` budget.
+ *
+ *   off (default)  slot 32 only. Correct for the 15 gated actions whose handler
+ *                  merely CONSUMES the budget.
+ *   on             slot 29 as well — a one-shot on the action's second frame.
+ *                  Needed for the 12 whose phase-0 block re-seeds the budget
+ *                  after any slot-32 hook has already written.
+ *
+ * `em_phase_map.py <ovl> --budget-owner` says which set an action is in. Turning
+ * this on for an action the slot-32 hook already owns is harmless but pointless:
+ * both write the same value, so the budget just restarts once. */
+extern "C" void em_vhook_seam29(uint8_t on)
+{
+    g_cfgp->arm29 = on ? 1 : 0;
+    g_cfgp->prev_pair = g_cfgp->prev2_pair = 0xFFFFFFFFu;   /* no stale one-shot */
+    mhfu_log("[%s] slot-29 budget seam %s", MOD_ID, on ? "ON" : "off");
+}
+
 extern "C" void em_vhook_stats(uint32_t *ai, uint32_t *acts, uint32_t *last)
 {
     if (ai)   *ai   = g_cfgp->ai_ticks;
@@ -414,6 +538,6 @@ static int em_vhook_init(void)
 
 static void em_vhook_shutdown(void) { uninstall(); }
 
-MHFU_MOD(.id = MOD_ID, .version = "2.0",
+MHFU_MOD(.id = MOD_ID, .version = "2.1",
          .needs = 0, .conflicts = 0,
          .init = em_vhook_init, .shutdown = em_vhook_shutdown);
