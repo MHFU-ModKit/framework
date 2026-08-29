@@ -340,6 +340,137 @@ static int lb_resolve_attack(lua_State *L)
     return 0;
 }
 
+/* mhfu.spawn_effect(entity, effect_id, bone) -> handle
+ * mhfu.bone_pos(entity, bone)                -> x, y, z
+ *
+ * Fire one of the engine's own visual effects at one of `entity`'s bones. This
+ * is the frame-timed VFX primitive a scripted moveset needs: the engine has no
+ * per-action effect table, it emits effects as literal arguments from inside
+ * per-action MIPS in the species overlay (`AI_SCRIPTING_ENGINE.md` §33), so a
+ * ported monster inherits the HOST's effects and can only get its own by having
+ * something call this at the right frame. That something is now Lua.
+ *
+ * This is a faithful reimplementation of em75's own `spawn_effect` wrapper
+ * (`0x09D36B58`) written against GENERIC addresses only — game_task + EBOOT,
+ * both resident for every species — so it does not depend on which overlay is
+ * loaded and keeps working if the host species changes:
+ *
+ *     joints = *(u32*)(entity + 0x190)          ; joint array base
+ *     pos    = joints + bone*0x250 + 0x100      ; that bone's WORLD xyz
+ *     owner  = 0x08866284(entity)               ; entity+0x1E9/+0x1E4 tag byte
+ *     base   = *(s8*)(0x089AA1C8 + entity[0x1E8])   ; subspecies -> base species
+ *     0x09ACB3E0(entity, id, base, owner, bone, &pos, 3)
+ *
+ * ⚠️ SILENT NO-OP WHEN OUT OF SECTION. `0x09ACB3E0` gates on `0x08865BAC(entity)`,
+ * which is `entity+0x29A == <global current section>` — an effect asked for by a
+ * monster the player cannot see is dropped, and the call still returns normally.
+ * A zero handle therefore means "not spawned", not "bad id", and the two are
+ * worth telling apart before blaming the id.
+ *
+ * ⚠️ BONE INDICES ARE THE LOADED SKELETON'S. em75 spawns 60 at bone 33 and
+ * 79/85/87 at bone 37 because those are the Tigrex's mouth and head. A ported
+ * monster has its OWN bone numbering, so the same numbers point somewhere else
+ * entirely — read the port's bone list, do not copy the host's.
+ *
+ * 🔴 THREADING — AND THIS ONE IS NARROWER THAN resolve_attack's. The call
+ * allocates out of the effect manager, so it must be game-thread-synced: from
+ * inside an OVERRIDE CALLBACK, never from the free-running mhfu_tick() worker.
+ * Whether "any game-thread context" is enough is OPEN: fired from a native
+ * ai_step prefix, two takes ended within seconds of arming — but three later
+ * takes ended just as fast having made no effect call at all, so that is not
+ * evidence. See the block below `lb_bone_pos`. */
+typedef uint32_t (*mhfu_fx_owner_fn)(uint32_t entity);
+typedef int (*mhfu_fx_spawn_fn)(uint32_t entity, int effect_id, int base_species,
+                                uint32_t owner, int bone, const float *pos, int mode);
+#define MHFU_FX_OWNER      0x08866284u    /* EBOOT: (ent[0x1E9] class) | ent[0x1E4] */
+#define MHFU_FX_SPAWN      0x09ACB3E0u    /* game_task: species-biased effect spawn */
+#define MHFU_FX_BASE_SPEC  0x089AA1C8u    /* EBOOT: species -> base species (s8[]) */
+#define MHFU_FX_JOINTS     0x190u         /* entity+0x190 = joint array base ptr */
+#define MHFU_FX_JOINT_STR  0x250u         /* per-joint stride */
+#define MHFU_FX_JOINT_POS  0x100u         /* world xyz inside a joint record */
+#define MHFU_FX_SPECIES    0x1E8u         /* entity+0x1E8 = species id */
+
+static const float *mhfu_bone_world(uint32_t ent, int bone)
+{
+    if (ent < 0x08000000u || ent >= 0x0C000000u) return 0;
+    if (bone < 0 || bone > 255) return 0;
+    uint32_t joints = mhfu_read_u32(ent + MHFU_FX_JOINTS);
+    if (joints < 0x08000000u || joints >= 0x0C000000u) return 0;
+    return (const float *)(joints + (uint32_t)bone * MHFU_FX_JOINT_STR + MHFU_FX_JOINT_POS);
+}
+
+static int lb_bone_pos(lua_State *L)
+{
+    const float *p = mhfu_bone_world((uint32_t)luaL_checkinteger(L, 1),
+                                     (int)luaL_checkinteger(L, 2));
+    if (!p) return 0;
+    lua_pushnumber(L, p[0]); lua_pushnumber(L, p[1]); lua_pushnumber(L, p[2]);
+    return 3;
+}
+
+/* The whole of em75's `0x09D36B58`, against generic addresses. Shared by the Lua
+ * one-shot and the per-frame driver so there is exactly one copy of the call. */
+static int mhfu_fx_spawn(uint32_t ent, int eid, int bone)
+{
+    const float *p = mhfu_bone_world(ent, bone);
+    if (!p) return 0;
+    /* copy out: the engine keeps the vec3 by value but we hand it a stack ptr,
+     * exactly as em75 does (it builds the same three floats at sp+16). */
+    float pos[3] = { p[0], p[1], p[2] };
+    uint8_t species = mhfu_read_u8(ent + MHFU_FX_SPECIES);
+    int base = *(volatile int8_t *)(MHFU_FX_BASE_SPEC + species);
+    uint32_t owner = ((mhfu_fx_owner_fn)MHFU_FX_OWNER)(ent);
+    return ((mhfu_fx_spawn_fn)MHFU_FX_SPAWN)(ent, eid, base, owner, bone, pos, 3);
+}
+
+static int lb_spawn_effect(lua_State *L)
+{
+    lua_pushinteger(L, mhfu_fx_spawn((uint32_t)luaL_checkinteger(L, 1),
+                                     (int)luaL_checkinteger(L, 2),
+                                     (int)luaL_optinteger(L, 3, 0)));
+    return 1;
+}
+
+/* 🔴 THERE IS NO PER-FRAME EFFECT DRIVER — WITHHELD, NOT CONDEMNED.
+ *
+ * The obvious way to sweep an effect library is a native `ai_step` prefix firing
+ * one spawn every N frames while Lua writes the schedule. It was built, and both
+ * takes that armed it ended within a second or two. A ladder ran in ONE cold boot
+ * to find out why:
+ *
+ *   A  spawn_effect from an `on_bigmonster_action` override callback (exec
+ *      thread, game thread blocked)              -> 2 calls, game fine
+ *   B  the ai_step driver in DRY mode (everything but the engine call)
+ *                                                -> attempts=2 returns=2, fine
+ *   C  the same driver, live, budget 3           -> armed, then nothing, ever
+ *
+ * B clears our own code on that path — the counters, the ctx deref, the bone read
+ * all behave — and A shows the call is survivable in an override callback.
+ *
+ * 🔴 C IS NOT ESTABLISHED. Two takes that armed the live driver ended within
+ * seconds, which looked conclusive; then three LATER takes ended at 250-310 s
+ * having made no effect call at all (one on `input.analog.send timed out`, one on
+ * a plain read timeout). The emulator container had been up two days on a host
+ * with 4 GB free. The base rate of a take just ending in that window is high, so
+ * the association does not survive it.
+ *
+ * The driver is therefore WITHHELD, not condemned: not shipped because nobody has
+ * shown it safe, not because it has been shown fatal. Re-test on a freshly
+ * restarted emulator, with a counter in scratch RAM read back afterwards so the
+ * verdict does not depend on the debugger link surviving.
+ *
+ * `mhfu.spawn_effect` stays, because A demonstrates that context, and the rule
+ * below is the whole API contract:
+ *
+ *   🔴 CALL spawn_effect ONLY FROM INSIDE AN OVERRIDE CALLBACK.
+ *
+ * The frame-accurate primitive a moveset actually wants is the engine's own
+ * `0x09ACB9C8(ent, frame_lo, frame_hi, id, bone, mode, slot)`, which fuses the
+ * animation-cursor test with the spawn. Reaching it needs a call site the engine
+ * already reaches it from — i.e. wrapping an em-overlay vtable slot
+ * (`EM_OVERLAY_ABI.md` §10), not a prefix on the AI tick.
+ */
+
 /* Per-frame, game-thread CLONE COMBAT DRIVER.
  * Registered as an ai_step prefix (mhfu_on_bigmonster_ai_step) — fires per big
  * monster, per frame, ON THE GAME THREAD (prefix on z_un_08865648, the per-entity
@@ -1498,6 +1629,8 @@ static const luaL_Reg k_mhfu_api[] = {
     { "player_pos",       lb_player_pos },
     { "paint_map",        lb_paint_map },
     { "resolve_attack",   lb_resolve_attack },
+    { "spawn_effect",     lb_spawn_effect },
+    { "bone_pos",         lb_bone_pos },
     { "clone_combat",     lb_clone_combat },
     { "combat_nodes",         lb_combat_nodes },
     { "combat_swap",          lb_combat_swap },
@@ -1930,6 +2063,7 @@ static int lua_host_init(void)
     /* NB: the experimental clone combat driver's ai_step detour is installed lazily
      * by mhfu.clone_combat(true) (see lb_clone_combat), NOT here — so a default-off
      * config never patches z_un_08865648 and quest entry stays on the stable path. */
+
 
     /* Exec thread: runs ALL game-thread override callbacks' Lua work in a
      * known-good context (the engine's AI-tick thread corrupts Lua heap

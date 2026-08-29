@@ -104,6 +104,16 @@ Setters return the handle, so calls chain: `tig:set_size(0.3):make_visible()`.
 - **overlay:** `load_relocated_overlay` (relocate a 2nd different-family AI
   overlay; §39–48).
 - **AI:** `action_ptr_for`.
+- **effects (VFX):** `spawn_effect(ent, id, bone)` -> handle (0 = not spawned),
+  `bone_pos(ent, bone)` -> x,y,z. A monster's effects are emitted by CODE in its
+  species overlay, so a ported monster inherits the host's and can only get its
+  own if a mod fires them — this is that primitive. 🔴 **Call it only from inside
+  an override callback**: it allocates from the effect manager, and the same call
+  from a native `ai_step` prefix kills the emulator within a second (measured; a
+  dry run of the same driver was clean, so it is the call from that context, not
+  the code). ⚠️ A zero handle is usually the section gate
+  (`entity+0x29A == current section`), not a bad id. Bone numbers are the LOADED
+  skeleton's. → `docs/EFFECTS_AND_VFX.md`, `tools/em_effects.py`.
 
 ### Events
 
@@ -125,6 +135,7 @@ it coherently to all body slots — see `docs/AI_SCRIPTING_ENGINE.md` §32k).
 | `tigrex_section1.lua` | Spawn-native-then-relocate a big monster into snow section 1. |
 | `tigrex_aggro.lua` / `tigrex_invest.lua` / `tigrex_ontop.lua` | aggro / investigation / co-location test rigs. |
 | `freecam.lua` | Toggleable orbit fly-cam + independent free-look (quest + village). |
+| `zinogre_fx.lua` | Effect-library sweep on the ported Zinogre: fires each id at a bone and logs the handle. Driver `tools/port_effect_probe.py`. |
 
 `*.lua.h` files are the embedded-fallback headers generated from each script by
 `tools/embed_lua.py` (octal-string header). Regenerate after editing a script
