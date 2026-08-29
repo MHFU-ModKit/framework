@@ -133,6 +133,13 @@ static inline uint32_t mips_xor(uint32_t rd, uint32_t rs, uint32_t rt) {
 static inline uint32_t mips_or(uint32_t rd, uint32_t rs, uint32_t rt) {
     return mips_r3(rd, rs, rt, 0x25u);
 }
+/* AND rd, rs, rt — the register form. Chains several 0/1 predicates into one
+ * without a branch, which is how the slot-29 stub ANDs "pair matches" with
+ * "this is the second tick of this action". Encoding checked against the game's
+ * own `and v1, a1, v1` at 0x09D2BAE4 (0x00A31824). */
+static inline uint32_t mips_and(uint32_t rd, uint32_t rs, uint32_t rt) {
+    return mips_r3(rd, rs, rt, 0x24u);
+}
 
 /* SLL rd, rt, shamt — R-type funct=0x00. (shamt 0 with rt=rd=0 is NOP.) */
 static inline uint32_t mips_sll(uint32_t rd, uint32_t rt, uint32_t shamt) {
