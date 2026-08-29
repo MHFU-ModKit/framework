@@ -288,6 +288,29 @@ function Port:play(move_name, min_gap)
   return true
 end
 
+--- Latch a clip on the ANIMATION channel alone — no behaviour write.
+---
+--- `play()` is what a brain should use: it moves both channels together, which
+--- is the whole point of the library. This is the instrument underneath it, and
+--- it exists for one job — asking "which clip is in slot N of THIS build, and
+--- does it play?" without the behaviour handler's opinion in the measurement.
+---
+--- The override lands on the next executor dispatch, not immediately: the hook
+--- only fires when the engine picks a NEW action (~0.5/s), so a latch set while
+--- the monster is mid-action waits for the next one. `uses` defaults to 1 for
+--- the same reason `play` does — overriding every dispatch of a multi-action
+--- move restarts the clip from frame 0 each time, which reads on screen as an
+--- animation that never finishes.
+---
+--- ⚠️ NOT for shipping mods. A clip latched with no behaviour under it paints
+--- your animation over whatever the AI is doing, which is exactly the
+--- clip/behaviour mismatch `mhfu_port` exists to remove.
+function Port:latch(a1, uses)
+  if self.ent == 0 then return false end
+  self.clip, self._clip_uses = a1, uses or 1
+  return true
+end
+
 --- Hand both channels back to the engine's own AI.
 function Port:release()
   self.move, self.clip, self._played, self._clip_uses = nil, nil, nil, 0

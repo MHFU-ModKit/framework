@@ -129,6 +129,23 @@ politeness: re-entering the executor every tick restarts the move before it ever
 hitbox frames — the measured failure mode of a held `a1` force — and repeated forcing makes the
 engine OR in the exhaustion bits and halt the AI outright.
 
+### `port:latch(a1 [, uses])`
+
+Puts a clip on the ANIMATION channel and writes **no** behaviour pair. This is
+the instrument under `play()`, not a way to script: it exists to answer "which
+clip is in slot N of this build, and does it run?" without the behaviour
+handler's opinion in the measurement.
+
+It lands on the next **executor dispatch**, not immediately — and how long that
+takes is a property of what the monster is doing, not a constant. Parked 2200
+units away the ported Zinogre sat in one looping idle for 65 s at a stretch and
+200 s of probing produced **five** dispatches; in a fight they come every second
+or two. **So advance a probe on consumption, never on a timer** (`tools/…` and
+`zinogre_clips.lua` do exactly this).
+
+⚠️ And see §4b: a latched clip is overwritten by the engine's next dispatch. It
+proves the clip exists and plays; it cannot hold it.
+
 ### `port:release()` · `port:face(x, z)` · `port:pin()` / `port:unpin()`
 
 `release()` hands both channels back to the engine's AI.
@@ -279,6 +296,81 @@ and every mod included — it was 64 KB, which the port runtime plus one mod cou
 failure: 512 KB starved the section asset load and killed the game.
 
 ---
+
+## 4b. What a port's clip vocabulary actually is, and how to check it
+
+**The porter maps a source clip onto the host slot of the SAME INDEX**, and that
+one sentence has three consequences you have to know before writing a brain.
+
+Run the audit — it needs no emulator:
+
+```bash
+python tools/port_clip_probe.py --pac zinogre_v1.bin \
+    --coverage workspace/extracted_mhp3/data_files/file_05341.bin
+```
+
+For the Zinogre port (MHP3rd `file_05341` → `zinogre_v1.bin`) it reports:
+
+| | | |
+|---|---:|---|
+| **CARRIED** | 34 | source clip landed, frames **and** loop flag match exactly |
+| **DROPPED** | 8 | source slots 16, 22, 27, 33, 39, 63, 66, 67 — the host Tigrex pack has no slot of that index, so they are gone |
+| **FILLER** | 30 | host slots 3, 43, 45–48, 51, 52, 54, 57–60, 68–72, 74–78, 80, 83, 90, 95–98 hold a **copy of the idle clip** |
+
+So:
+
+1. **`a1` IS the slot index, 1:1** — verified live, 16/16 clip runs across two cold
+   boots. `a1 = 10` plays the source's slot 10. There is no offset to discover
+   (the Brute's `-1` was a property of *that* build, not a rule).
+2. **A third of the a1 space plays IDLE.** Forcing 51 or 83 is not a failed
+   override, it is a successful override onto filler — and on screen the two are
+   identical. Every "the latch didn't work" reading has to rule this out first.
+3. **Eight source moves are not in the build at all.** No amount of scripting
+   reaches them; they need a porter that maps by meaning rather than by index.
+
+### The clip is verifiable from memory — do not judge it by eye
+
+`ent+0x80 + slot*0x40` is the clip-state block (`docs/agent_memory_map.md`):
+`+0x10` phase, `+0x1C` end, `+0x38` clip node ptr. Two facts make it decisive:
+
+* **`+0x38` proves provenance.** A relocate-injected PAC lives at `0x0B000000`, so a
+  clip node inside that window came from *our file* and nowhere else.
+* **`+0x1C` names the clip.** Clips are stored unpadded at their authored length, so
+  `end` is a fingerprint — 18 of the Zinogre's lengths are ones the host Tigrex
+  cannot produce, and `end = 408` can only be its slot 10.
+
+`phase` climbing to `end` is then the whole "does it play through" question,
+answered without a single screenshot. `tools/port_clip_probe.py` does all of it
+and re-analyses a saved take offline with `--report-only`.
+
+**Measured on the Zinogre port, engine-driven, no forcing:** 22/22 clip runs read
+from our PAC; 14/15 reached ≥90% of their own authored length. **His clips play,
+at his own timing.** ⚠️ But `speed` (`+0x14`) comes from the *action dispatch*, not
+from the clip — 2.0 and 2.4 both observed — so the frame SPAN is authentic while
+the RATE is the host's.
+
+### 🔴 A clip latch alone does not hold — this is the two-channel rule again
+
+`Port:latch(a1)` (animation only, no behaviour write) is an instrument, not a way
+to script. Measured over one take: the hook substituted **10 times** and every
+substitution reached the executor, but only **one** was still on screen a tick
+later. The rest were overwritten within ~500 ms by the engine's own next dispatch
+— which, at pair `(0,2)`, kept asking for a1 51, a *filler* slot, so the monster
+visibly fell back to idle.
+
+The one that survived is the proof the mechanism works, and it is unambiguous:
+
+```
+asked a1=10 -> +0x324 reads 10, clip node 0x0B053C90 (inside our PAC),
+end = 408 frames (our slot 10, a length no other clip in either pack has),
+phase climbed 4 -> 384 = 94% of it, over 7.5 s
+```
+
+⇒ **You can trigger any carried clip, and it plays its authentic length. You
+cannot KEEP it with the animation channel alone** — the behaviour handler
+underneath goes on choosing animations, and it wins. Holding a clip means owning
+the pair under it, which is exactly what `port:play()` does and why it writes both
+channels. Script with `play()`; use `latch()` only to identify clips.
 
 ## 5. Testing without an emulator
 
