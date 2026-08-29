@@ -1,6 +1,6 @@
 # Porting a monster and scripting its AI — the Lua surface
 
-**Status (2026-08-26):** the runtime is `framework/prx/mods/lua_host/scripts/mhfu_port.lua`;
+**Status (2026-08-29):** the runtime is `framework/prx/mods/lua_host/scripts/mhfu_port.lua`;
 the worked example is `brute_showcase.lua`. Both are plain memstick mods — no PRX rebuild, no
 recompile, hot-reloadable.
 
@@ -56,7 +56,7 @@ mhfu.port.mod("my_mod", function(P)
     name    = "zinogre",
     species = mhfu.MON_TIGREX,          -- the host species the port rides on
     replace = { mhfu.MON_GIADROME },    -- quest monsters to swap for it
-    pac     = "zinogre_v3.bin",
+    pac     = "zinogre_v2.bin",
     orig    = "file_06185.bin.orig",
     fid     = 6186,
 
@@ -172,8 +172,14 @@ Use `port:brain(fn)`.
 
 **🔴 Clip ids are per PAC build.** `docs/brute_tigrex_anim_ids.txt` was labelled by filming an
 earlier Brute build; on `v67_hostslots` every id shifted by one (`a1 = label - 1`). There is no
-way to read a clip's meaning out of the file — re-derive with `tools/anim_capture.sh <pac> <a1>`
-whenever the PAC changes.
+way to read a clip's *meaning* out of the file — re-derive with `tools/anim_capture.sh <pac> <a1>`
+whenever the PAC changes, or render the source moveset to a captioned contact sheet
+(`blender_mhfu/render_anim_clips.py` + `tools/moveset_sheet.py`, see §4b).
+
+⚠️ **But WHICH clip is loaded is readable, and the `-1` above is not a rule.** The clip-state
+block gives the answer from memory (§4b) and on the Zinogre port `a1` == the slot index **1:1**,
+34/34 clip runs over three cold boots. The v67 Brute's one-off shift was a property of that
+build, not of ports in general — measure it, do not assume either way.
 
 **🔴 Pick behaviour pairs the engine ALREADY USES — this is the one that will cost you a build.**
 `tools/em_moveset.py <ovl> --states` lists every `(main, sub)` the species dispatcher can reach
@@ -305,11 +311,11 @@ one sentence has three consequences you have to know before writing a brain.
 Run the audit — it needs no emulator:
 
 ```bash
-python tools/port_clip_probe.py --pac zinogre_v1.bin \
+python tools/port_clip_probe.py --pac zinogre_v2.bin \
     --coverage workspace/extracted_mhp3/data_files/file_05341.bin
 ```
 
-For the Zinogre port (MHP3rd `file_05341` → `zinogre_v1.bin`) it reports:
+For the Zinogre port (MHP3rd `file_05341` → `zinogre_v2.bin`) it reports:
 
 | | | |
 |---|---:|---|
