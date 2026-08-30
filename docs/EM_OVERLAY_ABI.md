@@ -139,9 +139,13 @@ is static fact, the timing is not.
 
 ## 6. `act_set` and slot 32 — how the semantics channel is entered
 
-The four-argument dispatch of slot 32 sits in `0x09AC89E0`, a function whose single `jal` caller is
-`0x09AC5A70` (itself reached indirectly, not by any `jal` in `game_task`). Argument shape at the
-dispatch:
+The four-argument dispatch of slot 32 sits in **`0x09AC89F0`** — ⚠️ *not* `0x09AC89E0`, which an
+earlier revision of this section named. `0x09AC89E0` is a separate **4-instruction thunk**
+(`lw t9,0(a0); lw t9,0x74(t9); jr t9`) that dispatches `vt+0x74` = abi slot **27**, and it is that
+thunk which has the single `jal` caller `0x09AC5A70`. The real enter-action dispatcher starts one
+instruction pair later with a standard prologue and has **7 `jal` callers** (`0x09AB52C0`,
+`0x09AC7348`, `0x09ACEB3C`, `0x09ACEB68`, `0x09ACED24`, `0x09ACEEEC`, `0x09ACF4C0`). Argument shape
+at the dispatch:
 
 ```
 0x09AC8A3C  addu a1, s2, zero        ; main
@@ -156,6 +160,57 @@ This ties the vtable ABI to the mechanism the project already drives from Lua: w
 `(main, sub)` pair runs the species' **slot-32** implementation, which is the per-action code that
 owns hitboxes and effects. It is the "behaviour channel" of `AI_SCRIPTING_ENGINE.md` §33, now
 located precisely.
+
+### 6b. 🔴 WRITE ORDER: the pair cells are written FIRST, then read back and passed to slot 32
+
+Traced offline 2026-08-30 (`tools/ovl_explore.py` on `file_00070` / `file_06108`), because an
+action-**substitution** pre-hook on slot 32 is only correct if this order is known.
+
+**The write path.** `act_set 0x09AC8690(entity, main, sub, mode)` is a mode selector (`mode` 0..4,
+each arm doing different housekeeping); every arm funnels into `0x09AC87E8`, which funnels into
+**`0x09AC8818(entity, main, sub)` — the only writer of the pair.** In order:
+
+```
+0x09AC8818  sb a1, 0x298(a0)          ; main
+            sb a2, 0x299(a0)          ; sub
+            sb zero, 0x1D5/6/7(a0)    ; the phase counters
+            0x08865CB8(ent,1,8) / (…,1,2) / (…,1,10)   ; three queries; if all false ...
+            ... clear the 4-slot bank +0x1A8..+0x1AB, +0x1B0..+0x1B7, +0x1B8..+0x1BF
+            0x08865CEC(ent, 0)
+            +0x288 &= 0x00100100 ;  +0x28C = 0
+0x09AC87E8  sb zero, 0x769(a0)  (before the call)  ;  sb 1, 0x4B7(s0)  (after it)
+```
+
+**The dispatch path is a different function**, and its callers take the arguments *from the cells*:
+
+```
+0x09AC7340  lbu a1, 0x298(s2)     <- main, read back off the entity
+0x09AC7344  lbu a2, 0x299(s2)     <- sub
+0x09AC7348  jal 0x09AC89F0        -> vt+0x88 (slot 32)
+```
+
+`0x09ACF4B8` does the same; `0x09ACED20` stores `+0x298` in the instruction before the `jal`. So
+**the cells lead and the arguments mirror them** — never the other way round.
+
+**And the two consumers read DIFFERENT copies:**
+
+| consumer | reads |
+|---|---|
+| em75's slot-32 impl `0x09D3D608` (enter-action) | the **arguments** (`a1/a2` → `s2/s1`, compared against 2 / 24 / 22 / 19 / 18 …) |
+| the per-frame phase machine under slot 29, `0x09D351E0` | the **entity cell** — `lbu a1, 0x299(a0)` |
+
+⇒ 🔴 **A slot-32 pre-hook that rewrites `a1`/`a2` alone desyncs the monster.** Our action's
+phase 0 would run once, and then every one of the ~30 frames a second afterwards would run the
+*original* pair's phase machine, because that dispatcher reads `+0x299` off the entity. A
+substitution stub must **also `sb` the substituted pair to `entity+0x298`/`+0x299`.** That stays
+branchless and keeps the armed/unarmed instruction streams identical: `movn`-select the value
+(ours on a match, the incoming one otherwise) and store unconditionally — when unarmed it stores
+back what is already there.
+
+⚠️ This also shows the Lua `act_set` emulation in `monster-ai` is a **subset** of the engine's own
+path: it writes `+0x298/+0x299` and clears `+0x1D5/6/7`, but not `+0x769 = 0`, `+0x4B7 = 1`, the
+`+0x1A8..+0x1BF` slot bank, `+0x288 &= 0x00100100` or `+0x28C = 0`. Unmeasured whether any of that
+matters; it is a candidate explanation for forced pairs behaving unlike engine-entered ones.
 
 ## 7. How a species is CHOSEN — the factory at `0x09AB15D8`
 
