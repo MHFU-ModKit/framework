@@ -97,6 +97,16 @@ Drop it in `ms0:/PSP/PLUGINS/mhfu_framework/mods/` next to `mhfu_port.lua` and c
 The injector is armed **once per boot** however many times `define` runs, so hot-reloading a
 mod file is safe.
 
+**⚠️ The declarative half of that spec now has a home outside Lua.** `ports/<name>.toml`
+(`mhfu_monster_editor.manifest`) carries `name` / `species` / `pac` / `fid` / `replace` / `clips`
+/ `moves` — plus the flag soup the PAC was built with, which used to survive only in a commit
+message. The runtime does **not** read it yet, so a mod still spells the tables out; but the
+manifest is what the porter and the validator agree on, and it is where a wrong clip id gets
+caught. `python -m mhfu_monster_editor.validate ports/<name>.toml --pac <built>` rejects a slot
+that is not in the build and warns on one that holds filler — both of which look identical to
+"the latch didn't work" in game. Keep the two in step; when they disagree, the manifest is the
+one that was checked.
+
 ### `port:brain(fn)`
 
 `fn(s)` runs on every tick with the monster alive. `s` carries:
