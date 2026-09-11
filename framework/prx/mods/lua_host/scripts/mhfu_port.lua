@@ -448,7 +448,9 @@ end
 -- is written ONLY if its live record count equals the exported `cap` on first
 -- contact — otherwise the table is not what the export assumed and it is left
 -- alone, with a log line. Set replacement proven by RAM poke on a native Tigrex
--- (645 -> 152 -> 1381 units); this Lua path is not cold-boot validated yet.
+-- (645 -> 152 -> 1381 units); this Lua path validated live 2026-09-11 (hot-reloaded
+-- into a running quest: 1 attack set(s)/10 volume(s) applied, the ported Zinogre's
+-- lunge connected through the authored sphere, the power lever took).
 local SPECIES_TABLE  = 0x09BB87C0
 local SPECIES_STRIDE = 0x1D0
 local F_SPHERES      = 0x240

@@ -140,9 +140,12 @@ quest, so the table is his alone. Beside a native Tigrex (the ADD path) it would
 the native's hurtboxes too — and re-arm its attacks. Status: the grid half was proven live
 2026-06-28; the hurtbox volumes half on 2026-09-11 (#19, 50+ hits through one injected
 sphere); the attack sets' in-place replacement by RAM poke on a native Tigrex (#37,
-645 -> 152 -> 1381 units) — the generated `attack_sets` / `attacks` path is not
-cold-boot validated yet. `mhfu_monster_editor/tests/lua_attack_harness.lua` runs it
-offline over the real em75 bytes, refusal included.
+645 -> 152 -> 1381 units) and the generated `attack_sets` / `attacks` path live the same
+day (hot-reloaded into a running quest: `1 attack set(s)/10 volume(s)` applied, the ported
+Zinogre's lunge connected through the authored sphere, the power lever took).
+`mhfu_monster_editor/tests/lua_attack_harness.lua` runs it offline over the real em75
+bytes, refusal included. ⚠️ `deploy` copies `mhfu_port.lua` with the module: a stale
+library on the memstick silently drops the fields it does not know.
 
 ### `port:brain(fn)`
 
