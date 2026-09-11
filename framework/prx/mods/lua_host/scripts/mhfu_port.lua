@@ -1276,6 +1276,15 @@ function mhfu_tick()
               .. "id %d; tracking that pair", port.name, rq.name, lm, ls, rq.sub)
           port._entered = { lm, ls }
           port._req = nil
+        elseif st and st.req_done > rq.done and g_tick - rq.at >= 1
+               and st.req_main == rq.main and st.req_sub == rq.sub then
+          -- it LANDED (the cells read our pair right after the call) and the
+          -- pair is already over: a charge the 30 Hz rule ended inside one
+          -- tick reads exactly like this. Let the ended path below handle it —
+          -- it adopts `after` if the engine is standing there, else plays it.
+          log("[port:%s] '%s' entered natively (%d,%d) and was over within the tick "
+              .. "(now (%d,%d))", port.name, rq.name, rq.main, rq.sub, lm, ls)
+          port._req = nil
         elseif st and st.req_done > rq.done and g_tick - rq.at >= 1 then
           -- issued (req_done moved) but the cells never showed it: the enter-
           -- action declined it, or something re-entered in the same frame
