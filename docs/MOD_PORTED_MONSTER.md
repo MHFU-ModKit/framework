@@ -120,6 +120,9 @@ it and the brain module load in either order.
 | `id` | eight hex digits over the content — `framework.log` prints it on `HIT TABLES APPLIED` |
 | `volumes` | list of `{ bone, shape, hitzone_row, part, flags, radius, ax, ay, az, bx, by, bz }` in the `0x28` record order, or `nil` to leave the host's set alone |
 | `grid` | list of states, each 7 rows of 10 percentage bytes, or `nil` |
+| `attack_tables` | `{ volumes, records, n_sets, n_records }` — the host overlay's set-pointer table and `0x18` record array VAs (em75: `0x09D60768` / `0x09D60848`), out of `species/emNN.json`. Required with either of the next two (#33) |
+| `attack_sets` | `{ [set] = { cap, volumes = { <same 12-literal rows, row/part 0> } } }` — each set written IN PLACE over the host's set of that index, then a sentinel. `cap` is the host's record count: the in-place limit AND the fingerprint — a set whose live count differs is REFUSED, nothing written |
+| `attacks` | list of `{ id, power, element, volume }`, `nil` = the host's byte stands; written to `records + id*0x18` at `+0x02` / `+0x09` / `+0x0A` |
 
 **Where it lands, and why in place.** Both tables live in `game_task.ovl`'s species row
 (`0x09BB87C0 + species*0x1D0`): `+0x240` points at the collision-record set this species
@@ -134,8 +137,12 @@ bytes changed under it. Each hit the port takes is logged as `HIT #n -amount hp=
 
 ⚠️ Species data is map-wide: with the port REPLACING the host it is the only em75 in the
 quest, so the table is his alone. Beside a native Tigrex (the ADD path) it would re-skin
-the native's hurtboxes too. Status: the grid half was proven live 2026-06-28; the
-volumes half is issue #19's cold boot.
+the native's hurtboxes too — and re-arm its attacks. Status: the grid half was proven live
+2026-06-28; the hurtbox volumes half on 2026-09-11 (#19, 50+ hits through one injected
+sphere); the attack sets' in-place replacement by RAM poke on a native Tigrex (#37,
+645 -> 152 -> 1381 units) — the generated `attack_sets` / `attacks` path is not
+cold-boot validated yet. `mhfu_monster_editor/tests/lua_attack_harness.lua` runs it
+offline over the real em75 bytes, refusal included.
 
 ### `port:brain(fn)`
 
