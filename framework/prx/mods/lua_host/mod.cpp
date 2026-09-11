@@ -69,8 +69,12 @@ extern "C" {
 #define LUA_MODS_DIR "ms0:/PSP/PLUGINS/mhfu_framework/mods"
 /* Per-file .lua read scratch. Allocated dynamically at init (NOT a .bss array) so
  * it doesn't inflate the PRX's contiguous load image — that 48 KB mattered for
- * fitting MHFU's bare 24 MB user partition on real hardware. */
-#define G_FILEBUF_SZ (48 * 1024)
+ * fitting MHFU's bare 24 MB user partition on real hardware.
+ * 🔴 A script over this size is SKIPPED with one boot-log line and nothing else
+ * — which read as "no Zinogre on the map" on 2026-09-11 when mhfu_port.lua
+ * (the library that carries the quest swap) passed 48 KB. 96 KB now;
+ * mhfu_monster_editor/tests/test_runtime.py pins the library under it. */
+#define G_FILEBUF_SZ (96 * 1024)
 static char  *g_filebuf;
 static SceUID g_filebuf_uid = -1;
 
