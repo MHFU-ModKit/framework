@@ -434,6 +434,21 @@ end
 -- one record and one grid byte, and re-applied (with a log line) if either
 -- changed under us — a reload of the overlay would show up here, not as a
 -- silent revert.
+--
+-- THE ATTACK SIDE (issue #33) — where he hits YOU — is the same shape in the
+-- other direction. A handler spawns an attack by id; the 0x18 record at
+-- `attack_tables.records + id*0x18` names a volume SET (+0x0A), and the set is
+-- the same 0x28 records as above, reached through the overlay's own pointer
+-- table `attack_tables.volumes + set*4`, walked to the sentinel by 0x09C42650.
+-- Both addresses are the species overlay's, static, exported from
+-- species/emNN.json (em75: 0x09D60768 / 0x09D60848). Each authored set goes IN
+-- PLACE over the host's set of that index, then a sentinel; each `attacks` entry
+-- writes only the levers it names (+0x02 power, +0x09 element, +0x0A volume).
+-- ⚠️ These are absolute addresses, not a pointer the engine handed us, so a set
+-- is written ONLY if its live record count equals the exported `cap` on first
+-- contact — otherwise the table is not what the export assumed and it is left
+-- alone, with a log line. Set replacement proven by RAM poke on a native Tigrex
+-- (645 -> 152 -> 1381 units); this Lua path is not cold-boot validated yet.
 local SPECIES_TABLE  = 0x09BB87C0
 local SPECIES_STRIDE = 0x1D0
 local F_SPHERES      = 0x240
@@ -443,6 +458,8 @@ local GRID_BLOCK     = 0x48
 local GRID_ROWS, GRID_COLS = 7, 10
 local SENTINEL       = 0xFFFF
 local MAX_RECORDS    = 512    -- a walk bound; the longest set in the game is 49
+local ATK_REC        = 0x18   -- one attack record
+local ATK_POWER, ATK_ELEMENT, ATK_VOLUME = 0x02, 0x09, 0x0A   -- the measured levers
 
 P._hit = P._hit or {}         -- port name -> table, from the generated module
 
@@ -454,9 +471,12 @@ function P.hit(name, tbl)
   P._hit[name] = tbl
   local port = P.ports[name]
   if port then port._hit_id = nil end       -- a re-export applies on the next tick
-  log("[port:%s] hit tables registered: %s volume(s), %s grid state(s), id %s",
+  local nsets = 0
+  if tbl.attack_sets then for _ in pairs(tbl.attack_sets) do nsets = nsets + 1 end end
+  log("[port:%s] hit tables registered: %s volume(s), %s grid state(s), %d attack "
+      .. "set(s), %s attack record(s), id %s",
       name, tbl.volumes and #tbl.volumes or "no", tbl.grid and #tbl.grid or "no",
-      tostring(tbl.id))
+      nsets, tbl.attacks and #tbl.attacks or "no", tostring(tbl.id))
 end
 
 local function species_row(port)
@@ -477,6 +497,31 @@ end
 local function write_sentinel(at)
   for i = 0, 3 do mhfu.write_u16(at + i * 2, SENTINEL) end
   for i = 8, REC - 4, 4 do mhfu.write_u32(at + i, 0) end
+end
+
+--- The live address of attack volume set `set`, through the overlay's pointer
+--- table, or nil (+why) when the export names a set the table does not have.
+local function attack_set_base(tbl, set)
+  local at = tbl.attack_tables
+  if not at or not at.volumes then return nil, "no attack_tables in the export" end
+  if at.n_sets and set >= at.n_sets then
+    return nil, string.format("set %d but the host has %d", set, at.n_sets)
+  end
+  local base = mhfu.read_u32(at.volumes + set * 4)
+  if base == 0 or not mhfu.mem_valid(base) then
+    return nil, string.format("set %d pointer 0x%08X invalid", set, base)
+  end
+  return base
+end
+
+--- Sorted set indices, so the log and the writes are in one order every time.
+local function attack_set_indices(tbl)
+  local idx = {}
+  if tbl.attack_sets then
+    for k in pairs(tbl.attack_sets) do idx[#idx + 1] = k end
+  end
+  table.sort(idx)
+  return idx
 end
 
 --- Does the live table still carry what we wrote? One record and one byte —
@@ -501,6 +546,29 @@ local function hit_intact(port, tbl)
     if stt == 0 then return false end
     local blk = mhfu.read_u32(stt)
     if blk == 0 or mhfu.read_u8(blk + 1) ~= tbl.grid[1][1][2] then return false end
+  end
+  for _, set in ipairs(attack_set_indices(tbl)) do
+    local spec = tbl.attack_sets[set]
+    local base = attack_set_base(tbl, set)
+    if not base then return false end
+    local cap = (port._atk_caps and port._atk_caps[set]) or spec.cap or #spec.volumes
+    local n = math.min(#spec.volumes, cap)
+    if n == 0 then
+      if mhfu.read_u16(base) ~= SENTINEL then return false end
+    else
+      local r = spec.volumes[1]
+      if mhfu.read_u16(base) ~= r[1] then return false end
+      if math.abs(rf(base + 0x0C) - r[6]) > 0.01 then return false end
+      if mhfu.read_u16(base + n * REC) ~= SENTINEL then return false end
+    end
+  end
+  if tbl.attacks and tbl.attack_tables and tbl.attack_tables.records then
+    for _, a in ipairs(tbl.attacks) do
+      local rec = tbl.attack_tables.records + a.id * ATK_REC
+      if a.power and mhfu.read_u8(rec + ATK_POWER) ~= a.power then return false end
+      if a.element and mhfu.read_u8(rec + ATK_ELEMENT) ~= a.element then return false end
+      if a.volume and mhfu.read_u8(rec + ATK_VOLUME) ~= a.volume then return false end
+    end
   end
   return true
 end
@@ -566,6 +634,74 @@ local function hit_apply(port, tbl)
       end
     end
     wrote[#wrote + 1] = string.format("%d grid state(s) @0x%08X", n, b0)
+  end
+  -- the attack sets: each in place over the host's set of that index. The live
+  -- count is measured ONCE per set (P._once, for the same reload reason as the
+  -- hurtbox cap) and must equal the exported `cap`, or the whole apply fails
+  -- before anything is written: the address is static, and a wrong count means
+  -- the overlay in RAM is not the one the export was built against.
+  local sets = attack_set_indices(tbl)
+  if #sets > 0 then
+    port._atk_caps = port._atk_caps or {}
+    for _, set in ipairs(sets) do
+      local spec = tbl.attack_sets[set]
+      local base, why = attack_set_base(tbl, set)
+      if not base then return false, "attack " .. why end
+      local capkey = string.format("atkcap:%d:%d", port.species, set)
+      if not P._once[capkey] then
+        local n = 0
+        while n < MAX_RECORDS and mhfu.read_u16(base + n * REC) ~= SENTINEL do
+          n = n + 1
+        end
+        if spec.cap and n ~= spec.cap then
+          return false, string.format(
+            "attack set %d @0x%08X holds %d record(s), the export expected %d — "
+            .. "not the table the export was built against; NOT written",
+            set, base, n, spec.cap)
+        end
+        P._once[capkey] = n
+        log("[port:%s] attack set %d @0x%08X holds %d record(s) — the in-place cap",
+            port.name, set, base, n)
+      end
+      port._atk_caps[set] = P._once[capkey]
+    end
+    local n_sets, n_vols = 0, 0
+    for _, set in ipairs(sets) do
+      local spec = tbl.attack_sets[set]
+      local base = attack_set_base(tbl, set)
+      local cap = port._atk_caps[set]
+      local n = #spec.volumes
+      if n > cap then
+        log("[port:%s] ⚠️ attack set %d: %d volume(s) but only %d fit in place — "
+            .. "TRUNCATED", port.name, set, n, cap)
+        n = cap
+      end
+      for i = 1, n do write_record(base + (i - 1) * REC, spec.volumes[i]) end
+      write_sentinel(base + n * REC)
+      n_sets, n_vols = n_sets + 1, n_vols + n
+    end
+    wrote[#wrote + 1] = string.format("%d attack set(s)/%d volume(s) via 0x%08X",
+                                      n_sets, n_vols, tbl.attack_tables.volumes)
+  end
+  if tbl.attacks and #tbl.attacks > 0 then
+    local at = tbl.attack_tables
+    if not at or not at.records then
+      return false, "attacks but no attack_tables.records in the export"
+    end
+    local n = 0
+    for _, a in ipairs(tbl.attacks) do
+      if at.n_records and a.id >= at.n_records then
+        log("[port:%s] ⚠️ attack record %d but the host has %d — skipped",
+            port.name, a.id, at.n_records)
+      else
+        local rec = at.records + a.id * ATK_REC
+        if a.power   then mhfu.write_u8(rec + ATK_POWER,   a.power)   end
+        if a.element then mhfu.write_u8(rec + ATK_ELEMENT, a.element) end
+        if a.volume  then mhfu.write_u8(rec + ATK_VOLUME,  a.volume)  end
+        n = n + 1
+      end
+    end
+    wrote[#wrote + 1] = string.format("%d attack record(s) @0x%08X", n, at.records)
   end
   return true, table.concat(wrote, ", ")
 end
