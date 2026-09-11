@@ -396,6 +396,195 @@ function Port:hold_pin()
   return slip
 end
 
+-- ------------------------------------------------------------- hit tables
+-- Where he can be hit, and for how much — the port's own, written into the game
+-- (issue #19). The editor exports `ports/<name>.toml`'s [[hurtbox]] / [[hitzone]]
+-- as a generated `<name>_hit.lua` that calls `P.hit(port_name, tbl)`; this is the
+-- side that lands it.
+--
+-- TWO TABLES, ONE NUMBER EACH, both in game_task.ovl's species row
+-- (0x09BB87C0 + species*0x1D0; docs/agent_memory_map.md "THE PART SYSTEM"):
+--
+--   +0x240  u32 -> the collision-record set THIS species walks. The overlay holds
+--                  several (em75: four, one per species id 75/76/81/88) and
+--                  references none of them; this pointer is the only edge. Both
+--                  engine walkers (0x09C37F30 game_sub, 0x09A84AFC game_task) read
+--                  0x28-byte records from here until `bone == 0xFFFF`.
+--   +0x2FC  u32 -> the hitzone STATE pointer table; each entry -> a 0x48 block of
+--                  7 rows x 10 percentage bytes. Proven live 2026-06-28.
+--
+-- The volumes go IN PLACE: over the original records, then a sentinel. A SHORTER
+-- list is fine (the walker stops at our sentinel); a LONGER one is not — the
+-- bytes past the original sentinel are someone else's — so the ORIGINAL count
+-- is measured on first contact and is the cap. Nothing is relocated and no
+-- pointer is rewritten, which is also why this needs no PRX change.
+--
+-- ⚠️ Species data is MAP-WIDE and per species id: with the port REPLACING the
+-- host it is the only em75 in the quest, so this is his table alone. Riding
+-- beside a native Tigrex would re-skin the native's hurtboxes too.
+--
+-- Applied once the port's entity is live in-area, re-checked every tick against
+-- one record and one grid byte, and re-applied (with a log line) if either
+-- changed under us — a reload of the overlay would show up here, not as a
+-- silent revert.
+local SPECIES_TABLE  = 0x09BB87C0
+local SPECIES_STRIDE = 0x1D0
+local F_SPHERES      = 0x240
+local F_STATES       = 0x2FC
+local REC            = 0x28
+local GRID_BLOCK     = 0x48
+local GRID_ROWS, GRID_COLS = 7, 10
+local SENTINEL       = 0xFFFF
+local MAX_RECORDS    = 512    -- a walk bound; the longest set in the game is 49
+
+P._hit = P._hit or {}         -- port name -> table, from the generated module
+
+--- Register a port's hit tables. `tbl` = { species, id, volumes = {{bone, shape,
+--- row, part, flags, radius, ax, ay, az, bx, by, bz}, ...} | nil, grid = {{row*7}
+--- x states} | nil }. Keyed by PORT name so the data module and the brain module
+--- can load in either order; the tick joins them.
+function P.hit(name, tbl)
+  P._hit[name] = tbl
+  local port = P.ports[name]
+  if port then port._hit_id = nil end       -- a re-export applies on the next tick
+  log("[port:%s] hit tables registered: %s volume(s), %s grid state(s), id %s",
+      name, tbl.volumes and #tbl.volumes or "no", tbl.grid and #tbl.grid or "no",
+      tostring(tbl.id))
+end
+
+local function species_row(port)
+  return SPECIES_TABLE + port.species * SPECIES_STRIDE
+end
+
+local function write_record(at, r)
+  mhfu.write_u16(at + 0x00, r[1])          -- bone
+  mhfu.write_u16(at + 0x02, r[2])          -- shape
+  mhfu.write_u16(at + 0x04, r[3])          -- hitzone_row
+  mhfu.write_u16(at + 0x06, r[4])          -- part
+  mhfu.write_u32(at + 0x08, r[5])          -- flags
+  wf(at + 0x0C, r[6])                      -- radius
+  wf(at + 0x10, r[7]); wf(at + 0x14, r[8]); wf(at + 0x18, r[9])     -- offset A
+  wf(at + 0x1C, r[10]); wf(at + 0x20, r[11]); wf(at + 0x24, r[12])  -- offset B
+end
+
+local function write_sentinel(at)
+  for i = 0, 3 do mhfu.write_u16(at + i * 2, SENTINEL) end
+  for i = 8, REC - 4, 4 do mhfu.write_u32(at + i, 0) end
+end
+
+--- Does the live table still carry what we wrote? One record and one byte —
+--- cheap enough for every tick, specific enough to catch a reload.
+local function hit_intact(port, tbl)
+  local row = species_row(port)
+  if tbl.volumes then
+    local base = mhfu.read_u32(row + F_SPHERES)
+    if base == 0 then return false end
+    local n = math.min(#tbl.volumes, port._hit_cap or #tbl.volumes)
+    if n == 0 then
+      if mhfu.read_u16(base) ~= SENTINEL then return false end
+    else
+      local r = tbl.volumes[1]
+      if mhfu.read_u16(base) ~= r[1] then return false end
+      if math.abs(rf(base + 0x0C) - r[6]) > 0.01 then return false end
+      if mhfu.read_u16(base + n * REC) ~= SENTINEL then return false end
+    end
+  end
+  if tbl.grid and tbl.grid[1] then
+    local stt = mhfu.read_u32(row + F_STATES)
+    if stt == 0 then return false end
+    local blk = mhfu.read_u32(stt)
+    if blk == 0 or mhfu.read_u8(blk + 1) ~= tbl.grid[1][1][2] then return false end
+  end
+  return true
+end
+
+local function hit_apply(port, tbl)
+  local row = species_row(port)
+  local wrote = {}
+  if tbl.volumes then
+    local base = mhfu.read_u32(row + F_SPHERES)
+    if base == 0 or not mhfu.mem_valid(base) then
+      return false, string.format("no set pointer at 0x%08X", row + F_SPHERES)
+    end
+    -- the cap is the ORIGINAL record count, measured before the first overwrite
+    -- and kept in P._once: a library hot-reload rebuilds the port handle, and
+    -- re-measuring then would count OUR shorter table and shrink the cap for
+    -- the rest of the boot.
+    local capkey = "hitcap:" .. tostring(port.species)
+    if not P._once[capkey] then
+      local n = 0
+      while n < MAX_RECORDS and mhfu.read_u16(base + n * REC) ~= SENTINEL do
+        n = n + 1
+      end
+      P._once[capkey] = n
+      log("[port:%s] host set 0x%08X holds %d record(s) — the in-place cap",
+          port.name, base, n)
+    end
+    port._hit_cap = P._once[capkey]
+    local n = #tbl.volumes
+    if n > port._hit_cap then
+      log("[port:%s] ⚠️ %d volume(s) but only %d fit in place — TRUNCATED",
+          port.name, n, port._hit_cap)
+      n = port._hit_cap
+    end
+    for i = 1, n do write_record(base + (i - 1) * REC, tbl.volumes[i]) end
+    write_sentinel(base + n * REC)
+    wrote[#wrote + 1] = string.format("%d volume(s) @0x%08X", n, base)
+  end
+  if tbl.grid then
+    local stt = mhfu.read_u32(row + F_STATES)
+    if stt == 0 or not mhfu.mem_valid(stt) then
+      return false, string.format("no state table at 0x%08X", row + F_STATES)
+    end
+    -- the state count is stored nowhere: the pointer table sits right after
+    -- the last block it points at, so it is (table - first_block) / 0x48
+    local b0 = mhfu.read_u32(stt)
+    local have = (stt - b0) // GRID_BLOCK
+    if have < 1 or have > 8 then
+      return false, string.format("state table 0x%08X -> 0x%08X: %d states?",
+                                  stt, b0, have)
+    end
+    local n = math.min(#tbl.grid, have)
+    if #tbl.grid ~= have then
+      log("[port:%s] grid: manifest has %d state(s), the species %d — writing %d",
+          port.name, #tbl.grid, have, n)
+    end
+    for s = 1, n do
+      local blk = mhfu.read_u32(stt + (s - 1) * 4)
+      for r = 1, GRID_ROWS do
+        local rowv = tbl.grid[s][r]
+        for c = 1, GRID_COLS do
+          mhfu.write_u8(blk + (r - 1) * GRID_COLS + (c - 1), rowv[c])
+        end
+      end
+    end
+    wrote[#wrote + 1] = string.format("%d grid state(s) @0x%08X", n, b0)
+  end
+  return true, table.concat(wrote, ", ")
+end
+
+--- Called from the tick for a live, in-area port. Applies on the first
+--- opportunity and whenever the live bytes stop matching.
+local function hit_tick(port)
+  local tbl = P._hit[port.name]
+  if not tbl then return end
+  if port._hit_id == tbl.id and hit_intact(port, tbl) then return end
+  local why = port._hit_id == tbl.id and "live table changed under us"
+           or (port._hit_id and "new export" or "first contact")
+  local ok, what = hit_apply(port, tbl)
+  if ok then
+    port._hit_id = tbl.id
+    log("[port:%s] HIT TABLES APPLIED (%s): %s  id=%s", port.name, why, what,
+        tostring(tbl.id))
+  else
+    port._hit_id = nil
+    if (port._hit_fail or 0) % 20 == 0 then
+      log("[port:%s] hit tables NOT applied: %s", port.name, tostring(what))
+    end
+    port._hit_fail = (port._hit_fail or 0) + 1
+  end
+end
+
 -- ------------------------------------------------------------- events
 -- Registered ONCE, at library load, and they dispatch to whatever ports happen
 -- to be defined at the time. That is what makes hot-reloading a mod file safe:
@@ -403,6 +592,18 @@ end
 
 if not P._once.events then
 P._once.events = true
+
+-- Every hit the port takes, with the amount: the number issue #19 is measured
+-- in. Fires from the 5 Hz monster poll (an HP-drop edge), so two hits inside
+-- 200 ms arrive as one line with their sum.
+mhfu.on_bigmonster_damaged(function(ent, mtype, amount, hp, slot)
+  for _, port in pairs(P.ports) do
+    if port.ent == ent then
+      port._hits = (port._hits or 0) + 1
+      log("[port:%s] HIT #%d  -%d  hp=%d", port.name, port._hits, amount, hp)
+    end
+  end
+end)
 
 mhfu.on_quest_targets_building(function(quest)
   if quest == 0 then return end
@@ -609,6 +810,11 @@ function mhfu_tick()
         end
       else
         port.slip = 0
+      end
+      -- the hit tables land once he is live in-area, and are re-checked here
+      if mhfu.get_screen_state() == 17 then
+        local ok, err = pcall(hit_tick, port)
+        if not ok then log("[port:%s] hit error: %s", port.name, tostring(err)) end
       end
       if port._brain then
         local ok, err = pcall(port._brain, port_state(port))

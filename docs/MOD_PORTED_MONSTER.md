@@ -107,6 +107,36 @@ that is not in the build and warns on one that holds filler — both of which lo
 "the latch didn't work" in game. Keep the two in step; when they disagree, the manifest is the
 one that was checked.
 
+### `P.hit(port_name, tbl)` — the port's own hurtboxes and damage grid (2026-09-11)
+
+Not hand-written: `python -m mhfu_monster_editor.runtime ports/<name>.toml` (or the editor's
+Parts panel, *export runtime table*) generates `scripts/<name>_hit.lua` from the manifest's
+`[[hurtbox]]` and `[[hitzone]]` blocks, and that module makes the call. Keyed by PORT name so
+it and the brain module load in either order.
+
+| field | |
+|---|---|
+| `species` | the host species id whose tables are overwritten |
+| `id` | eight hex digits over the content — `framework.log` prints it on `HIT TABLES APPLIED` |
+| `volumes` | list of `{ bone, shape, hitzone_row, part, flags, radius, ax, ay, az, bx, by, bz }` in the `0x28` record order, or `nil` to leave the host's set alone |
+| `grid` | list of states, each 7 rows of 10 percentage bytes, or `nil` |
+
+**Where it lands, and why in place.** Both tables live in `game_task.ovl`'s species row
+(`0x09BB87C0 + species*0x1D0`): `+0x240` points at the collision-record set this species
+walks (em75 holds four; species 75's is `0x09D58CD0`, 42 records) and `+0x2FC` at the
+hitzone state table. The volumes are written over the original records, then a
+`bone = 0xFFFF` sentinel — both engine walkers stop there — so a shorter list is fine and a
+longer one is truncated at the original count (measured on first contact, logged as
+`host set ... holds N record(s)`). Nothing is relocated, no pointer is rewritten, no PRX
+change. Applied once the entity is live in-area (`screen_state == 17`), re-checked every
+tick against one record and one grid byte, and re-applied with a log line if the live
+bytes changed under it. Each hit the port takes is logged as `HIT #n -amount hp=…`.
+
+⚠️ Species data is map-wide: with the port REPLACING the host it is the only em75 in the
+quest, so the table is his alone. Beside a native Tigrex (the ADD path) it would re-skin
+the native's hurtboxes too. Status: the grid half was proven live 2026-06-28; the
+volumes half is issue #19's cold boot.
+
 ### `port:brain(fn)`
 
 `fn(s)` runs on every tick with the monster alive. `s` carries:
