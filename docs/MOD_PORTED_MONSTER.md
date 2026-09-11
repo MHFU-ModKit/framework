@@ -92,7 +92,7 @@ Drop it in `ms0:/PSP/PLUGINS/mhfu_framework/mods/` next to `mhfu_port.lua` and c
 | `inject_dir` | defaults to `ms0:/PSP/PLUGINS/mhfu_framework/inject` |
 | `replace` | list of quest monster ids to swap for `species` at `QUEST_TARGETS_BUILDING` |
 | `clips` | name → executor `a1` |
-| `moves` | name → `{ main, sub, clip }` (or `anim = <a1>` to skip the vocabulary). `latch = <n>` overrides how many executor dispatches the clip covers — **the default is 1**, because one forced pair runs a SEQUENCE of sub-actions (a seven-tick `(2,1)` asked for a1 15, 11, 19 and 18 in turn) and overriding all of them restarts the clip from frame 0 each time |
+| `moves` | name → `{ main, sub, clip }` (or `anim = <a1>` to skip the vocabulary). `latch = <n>` overrides how many executor dispatches the clip covers — **the default is 1**, because one forced pair runs a SEQUENCE of sub-actions (a seven-tick `(2,1)` asked for a1 15, 11, 19 and 18 in turn) and overriding all of them restarts the clip from frame 0 each time. **`after = "<move>"`** is the move handed to when this one is over — the engine has left the pair — or has stood **`hold_max = <ticks>`**; declare it, because a pair written from here is not provisioned the way the engine's own entry provisions it and may never end by itself (§ `play`). (`after`, not `then`: `then` is a Lua keyword.) |
 
 The injector is armed **once per boot** however many times `define` runs, so hot-reloading a
 mod file is safe.
@@ -170,7 +170,7 @@ library on the memstick silently drops the fields it does not know.
 | `pinned`, `slip` | is the coordinate lock on, and how many units it had to correct last tick |
 | `hp`, `player_hp` | |
 
-### `port:play(name [, min_gap])`
+### `port:play(name [, min_gap [, opts]])`
 
 Writes the behaviour pair and latches the clip. Returns `false` if it declined.
 
@@ -178,6 +178,30 @@ Refuses to re-issue the **same** move within `min_gap` ticks (default 2). That g
 politeness: re-entering the executor every tick restarts the move before it ever reaches its
 hitbox frames — the measured failure mode of a held `a1` force — and repeated forcing makes the
 engine OR in the exhaustion bits and halt the AI outright.
+
+🔴 **Refuses to enter the pair he is already in** — yours or the engine's own — and logs why
+(once, then every 20th). `act_set` zeroes the phase cursor, so writing the pair he is in restarts
+the action from phase 0: the clip from frame 0, the hitbox node again (it spawns once per ENTRY),
+and the engine's own walk cut short. A brain that wants "charge again" waits for `s.move == nil`.
+`opts = { force = true }` restarts anyway — a debugging instrument, never a shipping mod's move.
+
+🔴 **A pair written from here is not what the engine writes, so declare the chain.** The engine
+enters a pair through its enter-action and a per-main translator that provisions the handler —
+the Tigrex charge gets its run budget (`+0x76C`) there — and the handler then hands to the next
+pair itself: `(1,4) → (0,3)` (skid) `→ (0,1)/(0,2)` (the brain thinks again). `act_set` here
+writes the two bytes and nothing else, so a forced charge has no budget and PARKS in its last
+phase with its hitbox spent (measured 2026-09-11: 38 s in `(1,4)`, zero spawns, "he phases
+through me"). The engine's own hand-offs are in `species/emNN.json` `next` and drawn in the
+editor's **Moves** tab; the move's `after` / `hold_max` are what this library walks:
+
+- the engine leaves the pair → `after` is played (or ADOPTED, if the engine's own hand-off
+  already landed on `after`'s pair — it is not re-written);
+- the pair still stands after `hold_max` ticks → `after` is played, or the port released;
+- neither declared and the phase byte has not moved for 10 ticks → **logged as PARKED**, once.
+
+A declared pair the **engine** enters by itself gets the port's clip too (the executor hook
+paints it, `latch` dispatches per entry) — the mapping is a fact about the pair, not about who
+entered it — and nothing else: no `move`, no `after`, the engine walks its own chain.
 
 ### `port:latch(a1 [, uses])`
 

@@ -24,11 +24,27 @@
 --
 -- The fix is a DECLARED mapping, and that is what this library is:
 --
---   moves = { charge = { main = 3, sub = 6, clip = "charge" } }
+--   moves = { charge = { main = 3, sub = 6, clip = "charge", after = "skid",
+--                        hold_max = 8 },
+--             skid   = { main = 0, sub = 3, clip = "stop" } }
 --
 -- `port:play("charge")` writes the behaviour pair AND latches the clip, so the
 -- next executor dispatch is overridden to the port's own charge animation. The
 -- host's opinion about which clip belongs to that move is discarded.
+--
+-- 🔴 A MOVE IS ONE LINK OF A CHAIN, AND A PAIR WRITTEN FROM HERE IS NOT WHAT THE
+-- ENGINE WRITES. The engine enters a pair through its ENTER-ACTION (vt+0x88) and a
+-- per-main translator that PROVISIONS the handler — the Tigrex charge gets its run
+-- budget (+0x76C) there — and the handler hands to the next pair itself when that
+-- budget is spent: (1,4) -> (0,3) -> (0,1). This library's act_set writes the two
+-- bytes and nothing else, so a forced charge has no budget and PARKS in its last
+-- phase, hitbox spent, for as long as it stands (measured 2026-09-11: 38 s, zero
+-- spawns; the editor's Moves tab draws the chains, `species/em75.json` `next`).
+-- So declare the chain: `after` is the move handed to when this one is over or
+-- has stood `hold_max` ticks, and `play()` REFUSES to re-enter a pair that is
+-- already running (`{force = true}` restarts it, for debugging; it is never the
+-- right thing in a shipping mod). A move that neither ends nor declares `after`
+-- is logged as parked after PARKED_TICKS.
 --
 -- This generalises to a source monster with NO host analogue (a Zinogre): you
 -- are not aligning the port to the host, you are picking any host behaviour with
@@ -102,6 +118,9 @@ local OFF_FREEZE    = 0x4B8
 local OFF_TARGET    = 0x2F4   -- u32, resolved combat target pointer
 local OFF_ACQUIRED  = 0x2A4   -- u8, aggro-eval target-acquired flag
 local FREEZE_BITS   = 0x100 | 0x10000
+-- a scripted move whose phase byte has not moved for this many ticks (2 Hz) and
+-- that declares neither `after` nor `hold_max` is PARKED: logged once per play
+local PARKED_TICKS  = 10
 
 -- 🔴 The player's WORLD position is the combat entity's transform row 3.
 -- `mhfu.player_pos()` reads 0x09998D50, which is the CAMERA EYE — it reported
@@ -243,7 +262,20 @@ function P.define(spec)
     last_move = nil, last_move_ticks = 0,
     slip    = 0,        -- units the pin had to correct on the last tick
     _brain  = nil,
+    _by_pair = {},      -- main*256+sub -> move name, for pairs the ENGINE enters
+    _refused = {},      -- move name -> refusals, so the log says it once
   }, Port)
+  -- Declared pairs the engine enters ON ITS OWN get the port's clip too — the
+  -- hook below paints them — so the declared mapping holds whether the brain or
+  -- the script picked the move. First name wins for a pair declared twice.
+  local names = {}
+  for n in pairs(self.moves) do names[#names + 1] = n end
+  table.sort(names)
+  for _, n in ipairs(names) do
+    local mv = self.moves[n]
+    local k = (mv.main or 0) * 256 + (mv.sub or 0)
+    if self._by_pair[k] == nil then self._by_pair[k] = n end
+  end
 
   if spec.pac and not P._once["inject:" .. spec.name] then
     P._once["inject:" .. spec.name] = true
@@ -270,7 +302,15 @@ function Port:brain(fn) self._brain = fn; return self end
 --- re-entering the executor every tick restarts the move before it reaches its
 --- hitbox frames — the exact failure a held a1-force already demonstrated. It
 --- also makes the engine OR in the exhaustion bits and halt the AI outright.
-function Port:play(move_name, min_gap)
+---
+--- 🔴 Refuses to enter a pair that is ALREADY RUNNING — ours or the engine's own.
+--- act_set zeroes the phase cursor, so writing the pair he is in restarts the
+--- action from phase 0: the clip from frame 0, the hitbox node (which spawns
+--- once per ENTRY) again, and the engine's own walk (charge -> skid -> think)
+--- cut short every time. A brain that wants "charge again" waits for the move to
+--- END (`s.move == nil`) and plays it then. `opts.force = true` restarts anyway,
+--- for a debugging session; a shipping mod has no use for it.
+function Port:play(move_name, min_gap, opts)
   local mv = self.moves[move_name]
   if not mv then log("[port:%s] no such move '%s'", self.name, tostring(move_name)); return false end
   if self.ent == 0 then return false end
@@ -278,8 +318,23 @@ function Port:play(move_name, min_gap)
   if self._played == move_name and (self._tick - (self._played_at or -99)) < min_gap then
     return false
   end
+  local live_main, live_sub = mhfu.read_u8(self.ent + OFF_MAIN), mhfu.read_u8(self.ent + OFF_SUB)
+  if live_main == mv.main and live_sub == mv.sub and not (opts and opts.force) then
+    local n = (self._refused[move_name] or 0) + 1
+    self._refused[move_name] = n
+    if n == 1 or n % 20 == 0 then
+      log("[port:%s] play('%s') refused: (%d,%d) is already running%s — writing it "
+          .. "again restarts it from phase 0 (the hitbox spawns once per ENTRY). Let it "
+          .. "end (after=/hold_max=), or play(name, gap, {force=true}) for a debug restart.%s",
+          self.name, move_name, mv.main, mv.sub,
+          self.move == move_name and " (ours)" or " (the engine's own)",
+          n > 1 and string.format(" [x%d]", n) or "")
+    end
+    return false
+  end
   act_set(self.ent, mv.main, mv.sub)
   self.move, self._played, self._played_at = move_name, move_name, self._tick
+  self._phase_seen, self._phase_ticks, self._parked = nil, 0, false
   self.clip = mv.clip and self.clips[mv.clip] or mv.anim
   -- 🔴 HOW MANY DISPATCHES THE CLIP OVERRIDE IS GOOD FOR, and one is the right
   -- answer. A forced pair does not correspond to a single executor dispatch:
@@ -316,6 +371,37 @@ function Port:latch(a1, uses)
   if self.ent == 0 then return false end
   self.clip, self._clip_uses = a1, uses or 1
   return true
+end
+
+--- The declared chain: `mv.after`, entered now. Returns true when a next link
+--- was taken. If the engine already moved him INTO that pair (its own hand-off
+--- landed where the declaration points) the move is adopted rather than
+--- re-written — writing it would restart what the engine just started.
+function Port:_walk_after(mv, ended, why)
+  local nxt = mv.after
+  if not nxt then return false end
+  local nm = self.moves[nxt]
+  if not nm then
+    log("[port:%s] move '%s' declares after='%s', which is not a declared move",
+        self.name, ended, tostring(nxt))
+    return false
+  end
+  local lm, ls = mhfu.read_u8(self.ent + OFF_MAIN), mhfu.read_u8(self.ent + OFF_SUB)
+  if lm == nm.main and ls == nm.sub then
+    self.move, self._played, self._played_at = nxt, nxt, self._tick
+    self._phase_seen, self._phase_ticks, self._parked = nil, 0, false
+    self.clip = nm.clip and self.clips[nm.clip] or nm.anim
+    self._clip_uses = nm.latch or 1
+    log("[port:%s] '%s' %s -> after='%s': the engine is already in (%d,%d), adopted",
+        self.name, ended, why, nxt, lm, ls)
+    return true
+  end
+  if self:play(nxt) then
+    log("[port:%s] '%s' %s -> after='%s' (%d,%d)", self.name, ended, why, nxt,
+        nm.main, nm.sub)
+    return true
+  end
+  return false
 end
 
 --- Hand both channels back to the engine's own AI.
@@ -798,13 +884,40 @@ end)
 -- port's. Returning nil abstains and the engine's choice stands.
 mhfu.on_bigmonster_action(function(ctx)
   for _, port in pairs(P.ports) do
-    if ctx.entity == port.ent and port.clip and (port._clip_uses or 0) > 0 then
-      port._clip_uses = port._clip_uses - 1
-      if port.clip ~= ctx.action_id then
-        log("[port:%s] clip %d -> %d  (move=%s)", port.name, ctx.action_id,
-            port.clip, tostring(port.move))
+    if ctx.entity == port.ent then
+      if port.clip and (port._clip_uses or 0) > 0 then
+        port._clip_uses = port._clip_uses - 1
+        if port.clip ~= ctx.action_id then
+          log("[port:%s] clip %d -> %d  (move=%s)", port.name, ctx.action_id,
+              port.clip, tostring(port.move))
+        end
+        return port.clip
       end
-      return port.clip
+      -- No scripted move: is the pair the ENGINE put him in a declared one? Then
+      -- the declared clip paints it, for as many dispatches as its latch says —
+      -- the mapping is a fact about the pair, not about who entered it. Nothing
+      -- else changes: no `move`, no `after`, the engine walks its own chain.
+      if port.ent ~= 0 and next(port._by_pair) ~= nil then
+        local k = mhfu.read_u8(port.ent + OFF_MAIN) * 256 + mhfu.read_u8(port.ent + OFF_SUB)
+        local name = port._by_pair[k]
+        local mv = name and port.moves[name]
+        local clip = mv and (mv.clip and port.clips[mv.clip] or mv.anim)
+        if clip then
+          local paint = port._paint
+          if not paint or paint.key ~= k then
+            paint = { key = k, uses = mv.latch or 1 }
+            port._paint = paint
+          end
+          if paint.uses > 0 then
+            paint.uses = paint.uses - 1
+            if clip ~= ctx.action_id then
+              log("[port:%s] clip %d -> %d  (engine entered '%s' itself)", port.name,
+                  ctx.action_id, clip, name)
+            end
+            return clip
+          end
+        end
+      end
     end
   end
   return nil
@@ -857,6 +970,7 @@ local function port_state(port)
     -- engine refuses instead of re-issuing it forever
     last_move = port.last_move, last_move_ticks = port.last_move_ticks,
     since_play = g_tick - (port._played_at or -999),
+    phase = mhfu.read_u8(ent + OFF_PHASE),
     port = port, ent = ent, tick = g_tick,
     x = mx, y = my, z = mz, px = px, py = py, pz = pz,
     dist = dist,
@@ -937,16 +1051,50 @@ function mhfu_tick()
       -- is precisely the clip/behaviour mismatch this library exists to remove.
       -- The behaviour pair is the ground truth: when the engine has moved off
       -- the pair we wrote, our move is finished.
+      -- the hook's paint of an engine-entered pair is per ENTRY: forget it once
+      -- he has left that pair, so his next native charge gets painted too
+      if port._paint then
+        local k = mhfu.read_u8(port.ent + OFF_MAIN) * 256 + mhfu.read_u8(port.ent + OFF_SUB)
+        if k ~= port._paint.key then port._paint = nil end
+      end
       if port.move then
         local mv = port.moves[port.move]
-        if mv and (mhfu.read_u8(port.ent + OFF_MAIN) ~= mv.main
-                or mhfu.read_u8(port.ent + OFF_SUB) ~= mv.sub) then
-          local held = g_tick - (port._played_at or g_tick)
+        local lm, ls = mhfu.read_u8(port.ent + OFF_MAIN), mhfu.read_u8(port.ent + OFF_SUB)
+        local held = g_tick - (port._played_at or g_tick)
+        if mv and (lm ~= mv.main or ls ~= mv.sub) then
           log("[port:%s] move '%s' ended after %d ticks -> (%d,%d)", port.name,
-              port.move, held,
-              mhfu.read_u8(port.ent + OFF_MAIN), mhfu.read_u8(port.ent + OFF_SUB))
-          port.last_move, port.last_move_ticks = port.move, held
+              port.move, held, lm, ls)
+          local ended = port.move
+          port.last_move, port.last_move_ticks = ended, held
           port.move, port.clip, port._clip_uses = nil, nil, 0
+          port:_walk_after(mv, ended, "ended")
+        elseif mv then
+          -- still standing. `hold_max` ends it from here; otherwise watch the
+          -- phase byte, because a pair whose phase stops moving has nothing
+          -- left to do and will not leave by itself.
+          if mv.hold_max and held >= mv.hold_max then
+            log("[port:%s] move '%s' held %d ticks (hold_max %d) on (%d,%d)", port.name,
+                port.move, held, mv.hold_max, lm, ls)
+            local ended = port.move
+            port.last_move, port.last_move_ticks = ended, held
+            port.move, port.clip, port._clip_uses = nil, nil, 0
+            if not port:_walk_after(mv, ended, "hold_max") then port:release() end
+          elseif not mv.after then
+            local phase = mhfu.read_u8(port.ent + OFF_PHASE)
+            if phase == port._phase_seen then
+              port._phase_ticks = (port._phase_ticks or 0) + 1
+            else
+              port._phase_seen, port._phase_ticks = phase, 0
+            end
+            if port._phase_ticks >= PARKED_TICKS and not port._parked then
+              port._parked = true
+              log("[port:%s] move '%s' PARKED: (%d,%d) phase %d unchanged for %d ticks. "
+                  .. "A parked pair spawns nothing more — the engine provisions this pair "
+                  .. "on its own way in (a run budget, a target) and act_set does not. "
+                  .. "Declare after=/hold_max= on the move, or release().",
+                  port.name, port.move, lm, ls, phase, port._phase_ticks)
+            end
+          end
         end
       end
       if port.pinned then
