@@ -170,4 +170,53 @@ static inline uint32_t mips_movz(uint32_t rd, uint32_t rs, uint32_t rt) {
          | ((rd & 0x1Fu) << 11) | 0x0Au;
 }
 
+/* --- added for em_vhook v3 (the substitution seam and the 30 Hz brain). ---
+ * Every encoding below was checked against an instruction the game itself
+ * uses, quoted in the comment, so a typo here cannot pass as "the JIT". */
+
+/* SLTU rd, rs, rt -> rd = (unsigned)rs < rt. funct 0x2B. Two non-negative IEEE
+ * floats order the same as their bit patterns, so this is also the brain's
+ * float compare once the value is in a GPR (mfc1) — no FP condition bit, no
+ * movt/movf. Game: `sltu v0, zero, v0` at 0x09AD1E98 (0x0002102B). */
+static inline uint32_t mips_sltu(uint32_t rd, uint32_t rs, uint32_t rt) {
+    return mips_r3(rd, rs, rt, 0x2Bu);
+}
+
+/* SRLV rd, rt, rs -> rd = rt >> (rs & 31). funct 0x06; NOTE rs is the shift
+ * amount, rt the value (MIPS puts them that way round). How a main-state
+ * bitmask is tested branchlessly: (mask >> main) & 1. */
+static inline uint32_t mips_srlv(uint32_t rd, uint32_t rt, uint32_t rs) {
+    return ((rs & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16) | ((rd & 0x1Fu) << 11) | 0x06u;
+}
+
+/* SB rt, offset(base) — store byte. opcode 0x28. Game: `sb a1, 0x298(a0)` at
+ * 0x09AC8824 (0xA0850298). */
+static inline uint32_t mips_sb(uint32_t rt, int16_t off, uint32_t base) {
+    return (0x28u << 26) | ((base & 0x1Fu) << 21) | ((rt & 0x1Fu) << 16)
+         | ((uint32_t)(uint16_t)off);
+}
+
+/* LWC1 ft, offset(base) — load a float into COP1 register ft. opcode 0x31.
+ * Game: `lwc1 f0, 0x200(s1)` at 0x09ACE788 (0xC6200200). */
+static inline uint32_t mips_lwc1(uint32_t ft, int16_t off, uint32_t base) {
+    return (0x31u << 26) | ((base & 0x1Fu) << 21) | ((ft & 0x1Fu) << 16)
+         | ((uint32_t)(uint16_t)off);
+}
+
+/* COP1 single-precision arithmetic: fd = fs OP ft. opcode 0x11, fmt S = 0x10,
+ * funct 0 add / 1 sub / 2 mul. */
+static inline uint32_t mips_fop_s(uint32_t fd, uint32_t fs, uint32_t ft, uint32_t funct) {
+    return (0x11u << 26) | (0x10u << 21) | ((ft & 0x1Fu) << 16)
+         | ((fs & 0x1Fu) << 11) | ((fd & 0x1Fu) << 6) | (funct & 0x3Fu);
+}
+static inline uint32_t mips_add_s(uint32_t fd, uint32_t fs, uint32_t ft) { return mips_fop_s(fd, fs, ft, 0x00u); }
+static inline uint32_t mips_sub_s(uint32_t fd, uint32_t fs, uint32_t ft) { return mips_fop_s(fd, fs, ft, 0x01u); }
+static inline uint32_t mips_mul_s(uint32_t fd, uint32_t fs, uint32_t ft) { return mips_fop_s(fd, fs, ft, 0x02u); }
+
+/* MFC1 rt, fs — move the raw 32 bits of COP1 register fs into GPR rt. opcode
+ * 0x11, rs field 0x00. */
+static inline uint32_t mips_mfc1(uint32_t rt, uint32_t fs) {
+    return (0x11u << 26) | ((rt & 0x1Fu) << 16) | ((fs & 0x1Fu) << 11);
+}
+
 #endif /* MHFU_MIPS_ENCODER_H */

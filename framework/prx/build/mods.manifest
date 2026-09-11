@@ -43,9 +43,13 @@ brute_overlay_hook
 # em_vhook: takes over a big monster's AI by patching its species VTABLE, which
 # is EBOOT rodata and writable at runtime (proven live 2026-08-27 — Stage A/B/C
 # in docs/EM_OVERLAY_ABI.md). Wraps abi slot 29 (per-frame AI, 30.8/s measured)
-# and slot 32 (enter-action, exactly 2 per (main,sub) transition). Stubs are
-# frame-free and branchless, so they cannot tip the engine's construction-thread
-# stack into the PRX. Inert until em_vhook_arm() is called.
+# and slot 32 (enter-action). Stubs are branchless (slot 29 also frame-free), so
+# they cannot tip the engine's construction-thread stack into the PRX.
+# v3.0 (2026-09-11, issues #15/#16): substitution of the engine's own enter-action
+# choice, a request slot (a pair entered PROVISIONED through the engine's own
+# dispatcher), 4 native 30 Hz rules — all driven from Lua (mhfu.em_*), which is
+# how mhfu_port.lua's play()/claim/rule work. lua_host binds the API WEAKLY, so
+# disabling this line still links; the runtime then falls back to cell writes.
 em_vhook
 
 # --- disabled --------------------------------------------------------------

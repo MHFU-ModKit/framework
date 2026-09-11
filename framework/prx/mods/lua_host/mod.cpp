@@ -42,6 +42,7 @@
 #include <math.h>
 
 #include "mhfu/mhfu.h"
+#include "mhfu/em_vhook.h"
 #include "mhfu/mips.h"
 #include "mhfu/bigmon_overlay.h"
 #include "mhfu/inject.h"
@@ -1609,6 +1610,161 @@ static int lb_on_action(lua_State *L)
     return 0;
 }
 
+/* ------------------------------------------------------------ em_vhook seams
+ * The big-monster vtable seams (mods/em_vhook, include/mhfu/em_vhook.h). Bound
+ * WEAK so the PRX still links with em_vhook off the manifest; every binding then
+ * returns nil/false and the Lua runtime falls back to its byte-writing act_set.
+ *
+ *   mhfu.em_installed()                         -> bool
+ *   mhfu.em_request(main, sub [, mode])         -> bool   enter the pair on the
+ *        next AI frame through the engine's own dispatcher (PROVISIONED — the
+ *        charge gets its run budget; a cell write does not)
+ *   mhfu.em_substitute(slot, from_mask, from_sub, to_main, to_sub, count)
+ *        the engine's own choice of (main, id) with main in the mask and id ==
+ *        from_sub (mhfu.EM_ANY = any) is entered as (to_main, to_sub) instead;
+ *        count = mhfu.EM_UNLIMITED for a standing entry, 0 clears
+ *   mhfu.em_rule(slot, { from_mask=, from_sub=, to_main=, to_sub=, mode=,
+ *        min_frames=, dist_lo=, dist_hi=, receding=, closing=, cooldown=,
+ *        count= })   or  mhfu.em_rule(slot, nil)   a native 30 Hz brain rule
+ *   mhfu.em_clear()
+ *   mhfu.em_status() -> { installed, ai_ticks, act_enters, last_main, last_sub,
+ *        frames, dist, sub_hits, sub_landed, sub_last_main, sub_last_sub,
+ *        sub_last_mode, brain_fires, req_pending, req_done, req_main, req_sub,
+ *        ring = { {main, sub, mode, subst}, ... oldest first },
+ *        rule_fired = {..}, rule_left = {..}, sub_left = {..} }
+ */
+extern "C" int  em_vhook_installed(void) __attribute__((weak));
+extern "C" int  em_vhook_request(uint8_t, uint8_t, uint8_t) __attribute__((weak));
+extern "C" void em_vhook_substitute(int, uint8_t, uint8_t, uint8_t, uint8_t, uint32_t) __attribute__((weak));
+extern "C" void em_vhook_rule(int, const em_vhook_rule_t *) __attribute__((weak));
+extern "C" void em_vhook_clear(void) __attribute__((weak));
+extern "C" void em_vhook_status(em_vhook_status_t *) __attribute__((weak));
+
+static int lb_em_installed(lua_State *L)
+{
+    lua_pushboolean(L, em_vhook_installed ? em_vhook_installed() : 0);
+    return 1;
+}
+static int lb_em_request(lua_State *L)
+{
+    if (!em_vhook_request) { lua_pushboolean(L, 0); return 1; }
+    int ok = em_vhook_request((uint8_t)luaL_checkinteger(L, 1),
+                              (uint8_t)luaL_checkinteger(L, 2),
+                              (uint8_t)luaL_optinteger(L, 3, 0));
+    lua_pushboolean(L, ok);
+    return 1;
+}
+static int lb_em_substitute(lua_State *L)
+{
+    if (!em_vhook_substitute) { lua_pushboolean(L, 0); return 1; }
+    em_vhook_substitute((int)luaL_checkinteger(L, 1),
+                        (uint8_t)luaL_checkinteger(L, 2),
+                        (uint8_t)luaL_checkinteger(L, 3),
+                        (uint8_t)luaL_checkinteger(L, 4),
+                        (uint8_t)luaL_checkinteger(L, 5),
+                        (uint32_t)luaL_checkinteger(L, 6));
+    lua_pushboolean(L, 1);
+    return 1;
+}
+static lua_Integer tbl_int(lua_State *L, int idx, const char *k, lua_Integer def)
+{
+    lua_getfield(L, idx, k);
+    lua_Integer v = lua_isnil(L, -1) ? def : luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+    return v;
+}
+static lua_Number tbl_num(lua_State *L, int idx, const char *k, lua_Number def)
+{
+    lua_getfield(L, idx, k);
+    lua_Number v = lua_isnil(L, -1) ? def : luaL_checknumber(L, -1);
+    lua_pop(L, 1);
+    return v;
+}
+static int tbl_bool(lua_State *L, int idx, const char *k)
+{
+    lua_getfield(L, idx, k);
+    int v = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    return v;
+}
+static int lb_em_rule(lua_State *L)
+{
+    if (!em_vhook_rule) { lua_pushboolean(L, 0); return 1; }
+    int slot = (int)luaL_checkinteger(L, 1);
+    if (lua_isnoneornil(L, 2)) { em_vhook_rule(slot, 0); lua_pushboolean(L, 1); return 1; }
+    luaL_checktype(L, 2, LUA_TTABLE);
+    em_vhook_rule_t r;
+    r.from_mask  = (uint8_t)tbl_int(L, 2, "from_mask", 0);
+    r.from_sub   = (uint8_t)tbl_int(L, 2, "from_sub", EM_VHOOK_SUB_ANY);
+    r.to_main    = (uint8_t)tbl_int(L, 2, "to_main", 0);
+    r.to_sub     = (uint8_t)tbl_int(L, 2, "to_sub", 0);
+    r.mode       = (uint8_t)tbl_int(L, 2, "mode", 0);
+    r.flags      = (uint8_t)((tbl_bool(L, 2, "receding") ? EM_VHOOK_RULE_RECEDING : 0)
+                           | (tbl_bool(L, 2, "closing")  ? EM_VHOOK_RULE_CLOSING  : 0));
+    r.min_frames = (uint32_t)tbl_int(L, 2, "min_frames", 0);
+    r.dist_lo    = (float)tbl_num(L, 2, "dist_lo", 0.0);
+    r.dist_hi    = (float)tbl_num(L, 2, "dist_hi", 1.0e9);
+    r.cooldown   = (uint32_t)tbl_int(L, 2, "cooldown", 0);
+    r.count      = (uint32_t)tbl_int(L, 2, "count", (lua_Integer)EM_VHOOK_UNLIMITED);
+    em_vhook_rule(slot, &r);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+static int lb_em_clear(lua_State *L)
+{
+    if (em_vhook_clear) em_vhook_clear();
+    lua_pushboolean(L, em_vhook_clear != 0);
+    return 1;
+}
+static int lb_em_status(lua_State *L)
+{
+    if (!em_vhook_status) { lua_pushnil(L); return 1; }
+    em_vhook_status_t st;
+    em_vhook_status(&st);
+    lua_newtable(L);
+#define SF_INT(name, v) do { lua_pushinteger(L, (lua_Integer)(v)); lua_setfield(L, -2, name); } while (0)
+    lua_pushboolean(L, (int)st.installed);   lua_setfield(L, -2, "installed");
+    SF_INT("ai_ticks",   st.ai_ticks);
+    SF_INT("act_enters", st.act_enters);
+    SF_INT("last_main",  (st.last_pair >> 8) & 0xFF);
+    SF_INT("last_sub",    st.last_pair & 0xFF);
+    SF_INT("frames",     st.frames);
+    lua_pushnumber(L, st.dist);              lua_setfield(L, -2, "dist");
+    SF_INT("sub_hits",   st.sub_hits);
+    SF_INT("sub_landed", st.sub_landed);
+    SF_INT("sub_last_main", (st.sub_last_in >> 8) & 0xFF);
+    SF_INT("sub_last_sub",   st.sub_last_in & 0xFF);
+    SF_INT("sub_last_mode", (st.sub_last_in >> 16) & 0xFF);
+    SF_INT("brain_fires", st.brain_fires);
+    SF_INT("req_pending", st.req_pending);
+    SF_INT("req_done",    st.req_done);
+    SF_INT("req_main",   (st.req_result >> 8) & 0xFF);
+    SF_INT("req_sub",     st.req_result & 0xFF);
+    lua_newtable(L);
+    for (int i = 0; i < EM_VHOOK_RING; i++) {
+        /* oldest first: the newest entry sits at ring_idx */
+        uint32_t e = st.ring[(st.ring_idx + 1 + i) % EM_VHOOK_RING];
+        lua_newtable(L);
+        SF_INT("main", (e >> 8) & 0xFF);
+        SF_INT("sub",   e & 0xFF);
+        SF_INT("mode", (e >> 16) & 0xFF);
+        SF_INT("subst", (e >> 24) & 0xFF);
+        lua_rawseti(L, -2, i + 1);
+    }
+    lua_setfield(L, -2, "ring");
+    lua_newtable(L);
+    for (int i = 0; i < EM_VHOOK_RULES; i++) { lua_pushinteger(L, (lua_Integer)st.rule_fired[i]); lua_rawseti(L, -2, i + 1); }
+    lua_setfield(L, -2, "rule_fired");
+    lua_newtable(L);
+    for (int i = 0; i < EM_VHOOK_RULES; i++) { lua_pushinteger(L, (lua_Integer)st.rule_left[i]); lua_rawseti(L, -2, i + 1); }
+    lua_setfield(L, -2, "rule_left");
+    lua_newtable(L);
+    for (int i = 0; i < EM_VHOOK_SUBS; i++) { lua_pushinteger(L, (lua_Integer)st.sub_left[i]); lua_rawseti(L, -2, i + 1); }
+    lua_setfield(L, -2, "sub_left");
+#undef SF_INT
+    return 1;
+}
+
 /* ------------------------------------------------------------ api table */
 
 static const luaL_Reg k_mhfu_api[] = {
@@ -1684,6 +1840,13 @@ static const luaL_Reg k_mhfu_api[] = {
     { "inject_now",       lb_inject_now },
     { "inject_locate",    lb_inject_locate },
     { "action_ptr_for",   lb_action_ptr_for },
+    /* the big-monster vtable seams (em_vhook) */
+    { "em_installed",     lb_em_installed },
+    { "em_request",       lb_em_request },
+    { "em_substitute",    lb_em_substitute },
+    { "em_rule",          lb_em_rule },
+    { "em_clear",         lb_em_clear },
+    { "em_status",        lb_em_status },
     /* AI override-event registration */
     { "on_quest_targets_building",  lb_on_quest },
     { "on_bigmonster_spawn",        lb_on_spawn },
@@ -1705,6 +1868,11 @@ static void register_mhfu_api(lua_State *L)
     lua_pushinteger(L, 0x46); lua_setfield(L, -2, "MON_POPO");
     lua_pushinteger(L, 0x4B); lua_setfield(L, -2, "MON_TIGREX");
     lua_pushinteger(L, 0x4D); lua_setfield(L, -2, "MON_GIADROME");
+    /* em_vhook: the "any sub" wildcard and the standing count. ⚠️ EM_UNLIMITED
+     * is 0xFFFFFFFF, which is -1 on the 32-bit lua_Integer of this build; it is
+     * cast back to uint32_t on the way in, so the value survives. */
+    lua_pushinteger(L, (lua_Integer)EM_VHOOK_SUB_ANY);   lua_setfield(L, -2, "EM_ANY");
+    lua_pushinteger(L, (lua_Integer)EM_VHOOK_UNLIMITED); lua_setfield(L, -2, "EM_UNLIMITED");
     /* PSP_CTRL_* button masks (for mhfu.buttons()) */
     lua_pushinteger(L, PSP_CTRL_SELECT);   lua_setfield(L, -2, "CTRL_SELECT");
     lua_pushinteger(L, PSP_CTRL_START);    lua_setfield(L, -2, "CTRL_START");

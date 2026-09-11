@@ -209,8 +209,17 @@ back what is already there.
 
 ⚠️ This also shows the Lua `act_set` emulation in `monster-ai` is a **subset** of the engine's own
 path: it writes `+0x298/+0x299` and clears `+0x1D5/6/7`, but not `+0x769 = 0`, `+0x4B7 = 1`, the
-`+0x1A8..+0x1BF` slot bank, `+0x288 &= 0x00100100` or `+0x28C = 0`. Unmeasured whether any of that
-matters; it is a candidate explanation for forced pairs behaving unlike engine-entered ones.
+`+0x1A8..+0x1BF` slot bank, `+0x288 &= 0x00100100` or `+0x28C = 0`. (2026-09-11: the part that
+DOES matter turned out to sit one level up — the per-main translator inside enter-action, which
+provisions the handler before act_set runs; `tools/em_chain.py`, §15.)
+
+🔴 **Read with §15 before building on "the cells lead".** The `0x09AC7340` site above is the
+snapshot-RESTORE path (`0x09AC7258` replays the 2-entry action history `0x09ACE750` records at
+`+0x6E8`); the brain's own decision site `0x09ACE878` writes the cells in the `jal`'s delay slot
+and then the translator's act_set rewrites them from the ARGUMENTS. Neither enter-action
+`0x09D3D608` nor any translator reads `+0x298/+0x299` first, and enter-action has an early return
+with no act_set at all (mode 3/4 while `+0x6DB == 0`). So a substitution pre-hook rewrites the
+arguments ONLY — pre-writing the cells is what would desync the phase machine, not what prevents it.
 
 ## 7. How a species is CHOSEN — the factory at `0x09AB15D8`
 
@@ -887,6 +896,7 @@ tools/wrap_em_slot.py --mode survey --dwell 150 --pin-hp        # which pairs oc
 tools/wrap_em_slot.py --mode duration --main 2 --sub 9 \
                       --frames 30 --dwell 140 --pin-hp          # §13: own the action clock
 tools/wrap_em_slot.py --mode duration --verify-gated <ovl>      # re-derive the 27 and diff
+tools/em_vhook_check.py [--dis]     # §15: assemble the v3 stubs on the host, decode, assert
 ```
 
 ⚠️ `callers` matches on the vtable byte offset alone, which many unrelated classes share. High
@@ -894,3 +904,57 @@ counts (slot 25 → 284, slot 32 → 669) are contaminated; read the low-count s
 treat the totals as an upper bound.
 
 `em_abi.py` reads `workspace/extracted/` only — no emulator, no cold boot. The two verification scripts need a running emulator and load the savestate cold.
+
+## 15. 🟢 em_vhook v3 — the substitution, request and rule seams (issues #15 / #16, 2026-09-11)
+
+The provisioning gap, closed. `tools/em_chain.py` had shown that a handler does not end by
+calling act_set: it calls **enter-action** (`vt+0x88`, slot 32) with a literal `(main, id)`, and
+enter-action's per-main **translator** provisions the handler — em75's main-1 translator sets the
+charge's run budget `+0x76C` (`0x09AD9860(ent, 2, 1000.0, -700.0)`) and only then calls act_set.
+A pair written into `+0x298/+0x299` from Lua skips that, so a forced `(1,4)` parked 38 s with its
+hitbox spent. Everything below enters through the engine's own dispatcher `0x09AC89F0(entity,
+main, id, mode)` so the translator runs.
+
+Three capabilities, all data-driven (the stubs read a config block on every dispatch, so Lua
+retargets them without a rebuild; `include/mhfu/em_vhook.h` is the surface, `mods/em_vhook/stubs.h`
+the assembly, `tools/em_vhook_check.py` the offline proof):
+
+| seam | what | how |
+|---|---|---|
+| **substitution** (slot-32 PRE) | the engine's own `(main, id)` becomes a declared pair BEFORE the species enter-action runs | 4-entry table `{main bitmask, id or ANY} -> (to_main, to_sub)`, first match wins, `movn`-selected into `a1/a2`; a count per entry (`EM_VHOOK_UNLIMITED` = standing). After the call the stub checks the cells against the pair it put in (`sub_landed`) |
+| **request** (slot-29 PRE) | a pair Lua wants entered NOW | Lua writes `(main, sub, mode)` + `pending = 1`; the stub issues the dispatcher call inside the next AI frame on the game thread — `play()` in `mhfu_port.lua` is this |
+| **rules** (slot-29 PRE) | a native 30 Hz brain | 4 rules: `(main bitmask, sub or ANY)`, `min_frames` in the pair, player XZ distance² window, receding/closing (this frame's d² vs last), cooldown, fire budget → `enter(to_main, to_sub, mode)` |
+
+Plus v2's `+0x414` budget override, unchanged.
+
+**The pre-hook rewrites the arguments and NOT the cells** — §6b's amended note says why: on the
+decision path the arguments lead and act_set (inside the translator) writes the cells from them;
+the one path with no act_set (mode 3/4 while pinned) is exactly where a pre-written cell would
+leave the phase machine on an unprovisioned pair. Issue #15's "must write both" was filed on
+the restore-path trace and is retracted by this section.
+
+**Branchless, and the slot-29 stub frame-free, with one call in it.** The decision to call is a
+0/1 in a register; the `jalr` target is `movn`-selected between `0x09AC89F0` and a `jr ra` in our
+own block, so the jalr ALWAYS executes and the instruction stream never forks. Its `ra` and the
+step's `a0..a3` go to config words (not reentrant — and the step is dispatched once per frame from
+one site; nothing under enter-action dispatches it). Float compares are done on the raw bits with
+`sltu`: `d²`, `lo²`, `hi²` are all non-negative, and non-negative IEEE floats order like unsigned
+ints, so no FP condition bit and no `movt/movf`. `f0..f3` are clobbered at the step's entry
+(caller-saved). The slot-32 stub keeps v2's 16-byte frame because slot 32 is reentrant ((2,9)'s
+handler calls `vt+0x88` from inside enter-action). `tools/em_vhook_check.py` assembles both with
+the host `cc` from the same `stubs.h`, decodes them with `tools/mips_dis.py` and asserts: no
+branch, no `$sp` in slot 29, one `jal` in slot 32, every jump target one of {original, dispatcher,
+ret stub}, every config offset inside the block. Sizes: slot 29 = 422 insns, slot 32 = 176.
+
+**Unmeasured (the cold boot this ships for):** whether the "2 dispatches per transition" of §10
+are two calls with the SAME arguments — in which case a one-shot substitution is undone by the
+second call and the Zinogre's standing claim is the only shape that works — or the handler's own
+follow-up. The enter-action ring the stub keeps (`em_status().ring`, last 8 `(main, id, mode)`
+with a `*` on rewritten ones) answers it from the first `framework.log`.
+
+**Sites named here** (game_task, `file_00070`): `0x09ACE878` the brain's commit (writes the cells
+in the `jal` delay slot, then `enter(main, id, mode 0)`, then `0x09ACE750(ent, 0)`);
+`0x09ACE750` records a 2-entry action snapshot at `+0x6E8` (64 B each: position, pair, section,
+`+0x414`); `0x09AC7258` replays it through enter-action from the cells; `0x09AC4CA8` the spawn's
+`enter(7, 16, 0)`; enter-action's early return `0x09D3D780..` for mode 3/4 while `+0x6DB == 0`.
+

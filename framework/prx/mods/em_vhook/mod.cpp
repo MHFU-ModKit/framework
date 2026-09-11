@@ -20,34 +20,70 @@
  * not assumed — tools/wrap_em_slot.py --mode count):
  *
  *   abi slot 29 (vt+0x7C)  the per-frame AI step   — 30.8 dispatches/second
- *   abi slot 32 (vt+0x88)  enter-action            — exactly 2 per (main,sub)
- *                          transition, 0 otherwise; args (entity, main, sub, mode)
+ *   abi slot 32 (vt+0x88)  enter-action            — the call that ENTERS a
+ *                          behaviour pair; args (entity, main, id, mode)
  *
- * Two capabilities, one per seam:
- *   slot 32 post-hook  sets `entity+0x414` for the 15 gated actions whose handler
- *                      only consumes the budget;
- *   slot 29 pre-hook   a ONE-SHOT on the action's second frame, for the 12 whose
- *                      phase-0 block re-seeds it after slot 32 has written.
- *                      `em_vhook_seam29(1)` turns it on; off by default.
+ * v3.0 (issues #15 and #16) puts four data-driven capabilities on them. The
+ * stubs read a config block on every dispatch, so all of it is retargetable
+ * from Lua without a rebuild; the public surface is include/mhfu/em_vhook.h.
+ *
+ *   SUBSTITUTION  slot-32 PRE   the engine's own (main, id) is rewritten to a
+ *                 declared pair BEFORE the species enter-action runs. That is
+ *                 the whole point: enter-action is where a pair is PROVISIONED
+ *                 (em75's main-1 translator sets the charge's run budget
+ *                 +0x76C, then act_set writes +0x298/+0x299), so a substituted
+ *                 charge ends into the skid the way a native one does instead
+ *                 of parking for 38 s with its hitbox spent — which is what a
+ *                 pair written straight into the cells did (tools/em_chain.py).
+ *   REQUEST       slot-29 PRE   a pair Lua wants entered now, issued on the
+ *                 game thread inside the next AI frame through the engine's
+ *                 own dispatcher 0x09AC89F0 (so, provisioned too).
+ *   RULES         slot-29 PRE   a native 30 Hz brain: "in pair P for N frames,
+ *                 player at [lo,hi), receding -> enter Q", cooldown, budget.
+ *   BUDGET        slot-32 POST + slot-29 one-shot: the +0x414 override of v2,
+ *                 unchanged (§13 of the ABI doc for why post, and why one-shot).
+ *
+ * 🔴 WHY THE PRE-HOOK REWRITES THE ARGUMENTS AND NOT THE CELLS. Issue #15 was
+ * filed saying the stub "must write both". Reading the enter-action end to end
+ * (em_chain.py, 2026-09-11) says otherwise: on the normal path the arguments
+ * lead — the translator calls act_set, which is the only writer of the cells,
+ * from the (rewritten) arguments; neither enter-action 0x09D3D608 nor any
+ * translator reads +0x298/+0x299 first. The "cells lead" trace in §6b is the
+ * snapshot-RESTORE path (0x09AC7258), not a decision. And enter-action has an
+ * early return with no act_set (mode 3/4 while pinned, +0x6DB == 0): a stub
+ * that pre-wrote the cells there would leave the phase machine running a pair
+ * nobody provisioned — exactly the Lua failure this seam exists to end. So the
+ * stub rewrites a1/a2 only, and counts, after the call, whether the cells took
+ * our pair (`sub_landed`). The phase machine and the enter-action agree because
+ * one function wrote both.
  *
  * 🔴 BOTH STUBS ARE BRANCHLESS; the slot-29 one is also FRAME-FREE. The engine's
  * big-monster construction-thread stack sits INSIDE the PRX image (~0x09D8A000),
  * so a C-call frame from a hook is what clobbered the Lua VM in the long
- * "Lua VM corruption" hunt. Selection is done with MOVN rather than a branch so
- * each stub stays a single basic block and the JIT cannot mis-handle it.
- *
- * The slot-32 stub (v2.0) does use a 16-byte hand-written frame, because it has
- * to CALL the original before storing — see the block comment on build_act_stub
- * for why that ordering is mandatory and why this particular frame is safe.
+ * "Lua VM corruption" hunt. Every decision is a MOVN/MOVZ select so each stub
+ * is a single basic block; the slot-29 stub's one call (the request / a rule
+ * firing) is a `jalr` whose TARGET is selected — the engine's dispatcher or a
+ * `jr ra` in our own block — so the jalr always executes, and its ra and the
+ * step's arguments are spilled to config words, never to the stack. The
+ * slot-32 stub keeps v2's 16-byte hand-written frame (see build_act_stub in
+ * stubs.h for why calling the original first is mandatory there).
  *
  * ⚠️ A vtable slot's VALUE is static EBOOT data, but the code behind it is only
  * valid while THAT species' overlay is resident. We therefore latch onto the
  * vtable of a big monster the engine has actually spawned, and restore on quest
- * exit — never a hardcoded species.
+ * exit — never a hardcoded species. Every rule, substitution and request is
+ * dropped at the same moment: a new quest's script re-declares them at spawn.
+ *
+ * ⚠️ One config block per LATCHED VTABLE, not per entity. Two live monsters of
+ * the latched species would share the dwell counter and the distance; the
+ * ports this serves run one.
  */
 #include "mhfu/mhfu.h"
 #include "mhfu/mips.h"
+#include "mhfu/em_vhook.h"
+#include "stubs.h"
 #include <pspsysmem.h>
+#include <stddef.h>
 
 #define MOD_ID "em_vhook"
 
@@ -56,65 +92,64 @@
  * in this repo number slots as vptr+4k, so doc_slot = abi_slot + 2. */
 #define VT_SLOT(k)      (8u + 4u * (k))
 #define SLOT_AI_STEP    29u          /* vt+0x7C, ~30 Hz */
-#define SLOT_ENTER_ACT  32u          /* vt+0x88, (entity, main, sub, mode) */
-
-#define ENT_MAIN        0x298        /* u8 */
-#define ENT_SUB         0x299        /* u8 */
+#define SLOT_ENTER_ACT  32u          /* vt+0x88, (entity, main, id, mode) */
 
 /* The 17 species entity vtables all live in this EBOOT band. A sanity gate so a
  * corrupt entity pointer can never make us scribble somewhere arbitrary. */
 #define VT_LO           0x089BB000u
 #define VT_HI           0x089BF800u
 
-/* Runtime-configurable so an experiment does not need a rebuild.
- * Layout is FIXED — the stubs index it by byte offset. */
+/* The config block, field for field the layout stubs.h indexes by offset. */
 typedef struct {
-    uint8_t  want_main;      /* +0x00  match this (main,sub) ... */
-    uint8_t  want_sub;       /* +0x01 */
-    uint8_t  armed;          /* +0x02  0 = stub stores to sink only */
-    uint8_t  arm29;          /* +0x03  1 = the SLOT-29 stub owns patch_off too */
-    uint32_t patch_off;      /* +0x04  ... then store to entity+patch_off */
-    uint32_t patch_val;      /* +0x08  ... this value */
-    uint32_t sink;           /* +0x0C  harmless target when unmatched */
-    uint32_t ai_ticks;       /* +0x10  slot-29 dispatch counter */
-    uint32_t act_enters;     /* +0x14  slot-32 dispatch counter */
-    uint32_t last_pair;      /* +0x18  last (main<<8)|sub seen at enter-action */
-    uint32_t canary;         /* +0x1C  CFG_CANARY; if this ever reads back wrong,
-                              *        the block was overwritten and nothing the
-                              *        stubs load from it can be trusted */
-    uint32_t prev_pair;      /* +0x20  (main<<8)|sub at the previous slot-29 tick */
-    uint32_t prev2_pair;     /* +0x24  ... and the one before that. Together they
-                              *        make a branchless "this is the SECOND tick
-                              *        of this action" one-shot — see build_ai_stub */
+    uint8_t  from_mask, from_sub, to_main, to_sub;
+    uint32_t left;
+} cfg_sub_t;
+typedef struct {
+    uint8_t  from_mask, from_sub, to_main, to_sub, mode, flags, _pad0, _pad1;
+    uint32_t min_frames, d2_lo, d2_hi, left, fired, last_fire, cooldown, _pad2;
+} cfg_rule_t;
+typedef struct {
+    uint8_t  want_main, want_sub, armed, arm29;    /* +0x00 */
+    uint32_t patch_off, patch_val, sink;            /* +0x04 */
+    uint32_t ai_ticks, act_enters, last_pair;       /* +0x10 */
+    uint32_t canary;                                /* +0x1C */
+    uint32_t prev_pair, prev2_pair;                 /* +0x20 */
+    uint32_t frames;                                /* +0x28 */
+    uint32_t ra_spill, a_spill[4];                  /* +0x2C */
+    uint32_t d2, d2_prev, brain_fires, scratch;     /* +0x40 */
+    uint32_t req_pending;                           /* +0x50 */
+    uint8_t  req_main, req_sub, req_mode, _pad;     /* +0x54 */
+    uint32_t req_done, req_result;                  /* +0x58 */
+    cfg_sub_t subs[EM_VHOOK_SUBS];                  /* +0x60 */
+    uint32_t sub_hits, sub_landed, sub_last_in;     /* +0x80 */
+    uint32_t sub_pending, sub_to_pending;           /* +0x8C */
+    uint32_t ring_idx;                              /* +0x94 */
+    uint32_t ring[EM_VHOOK_RING];                   /* +0x98 */
+    cfg_rule_t rules[EM_VHOOK_RULES];               /* +0xB8 */
 } em_vhook_cfg_t;
 
-#define CFG_CANARY 0x5645484Bu   /* 'VEHK' */
+static_assert(offsetof(em_vhook_cfg_t, prev_pair)   == CFG_PREV,        "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, frames)      == CFG_FRAMES,      "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, ra_spill)    == CFG_RA_SPILL,    "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, a_spill)     == CFG_A0_SPILL,    "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, d2)          == CFG_D2,          "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, scratch)     == CFG_SCRATCH,     "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, req_pending) == CFG_REQ_PENDING, "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, req_main)    == CFG_REQ_MAIN,    "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, req_result)  == CFG_REQ_RESULT,  "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, subs)        == CFG_SUB_BASE,    "cfg layout");
+static_assert(sizeof(cfg_sub_t)                     == SUB_STRIDE,      "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, sub_hits)    == CFG_SUB_HITS,    "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, sub_to_pending) == CFG_SUB_TO_PEND, "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, ring_idx)    == CFG_RING_IDX,    "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, ring)        == CFG_RING,        "cfg layout");
+static_assert(offsetof(em_vhook_cfg_t, rules)       == CFG_RULE_BASE,   "cfg layout");
+static_assert(sizeof(cfg_rule_t)                    == RULE_STRIDE,     "cfg layout");
+static_assert(offsetof(cfg_rule_t, min_frames)      == RULE_MIN_FRAMES, "cfg layout");
+static_assert(offsetof(cfg_rule_t, cooldown)        == RULE_COOLDOWN,   "cfg layout");
+static_assert(sizeof(em_vhook_cfg_t)                == CFG_SIZE,        "cfg layout");
 
-/* 🔴 The entity is 0x800 bytes (the species factory at 0x09AB15D8 allocates
- * 2048, align 16). Masking patch_off to 0x7FC bounds every store to the
- * monster's own struct and keeps it word-aligned, branchlessly — so even a
- * garbage config can only ever scribble on the monster, never on RAM at large.
- * (This was first added on the theory that a clobbered config caused the v1.0
- * hang. It did not — the STUB BYTES were what got overwritten, see the block
- * comment below. The mask is cheap insurance and stays.) */
-#define PATCH_OFF_MASK 0x7FCu
-
-/* want_sub value meaning "any sub state" — see build_act_stub. 0xFE, because
- * 0xFF is already the never-match idle value the mod initialises with. */
-#define SUB_ANY 0xFEu
-
-#define CFG_WANT_MAIN 0x00
-#define CFG_WANT_SUB  0x01
-#define CFG_ARM29     0x03
-#define CFG_PATCH_OFF 0x04
-#define CFG_PATCH_VAL 0x08
-#define CFG_SINK      0x0C
-#define CFG_AI_TICKS  0x10
-#define CFG_ACT_ENTER 0x14
-#define CFG_LAST_PAIR 0x18
-#define CFG_CANARY_OFF 0x1C
-#define CFG_PREV      0x20
-#define CFG_PREV2     0x24
+#define CFG_CANARY_VAL 0x5645484Bu   /* 'VEHK' */
 
 /* 🔴 THE STUBS AND THE CONFIG MUST NOT LIVE IN THE PRX IMAGE.
  *
@@ -129,16 +164,25 @@ typedef struct {
  * The debugger-driven proofs (Stage B/C) never saw this because they wrote their
  * stub to 0x08A5E000, outside the PRX. So: allocate from the user partition,
  * exactly as entity.cpp does for clones, and keep only pointers here. */
-/* The slot-32 post-hook is 40 instructions; the slot-29 counter is 7. A too-small
- * value here would run one stub into the next, so build_act_stub assembles into a
- * local buffer and refuses to install if it does not fit. */
-#define STUB_INSNS 48
-#define BLOCK_BYTES (2 * STUB_INSNS * 4 + 64)
+#define RET_INSNS   4     /* jr ra; nop, padded to 16 bytes */
+#define BLOCK_BYTES ((STUB_AI_INSNS + STUB_ACT_INSNS + RET_INSNS) * 4 + CFG_SIZE + 128)
 
 static uint32_t *g_stub_ai;
 static uint32_t *g_stub_act;
+static uint32_t *g_stub_ret;
 static em_vhook_cfg_t *g_cfgp;
 static SceUID g_block = -1;
+
+static void cfg_reset_live(void)
+{
+    /* everything the stubs derive from the running monster */
+    g_cfgp->prev_pair = g_cfgp->prev2_pair = 0xFFFFFFFFu;  /* (0,0) packs to 0: a
+        zeroed history would read as "in (0,0) for two ticks" and fire the
+        one-shot on install */
+    g_cfgp->frames = 0;
+    g_cfgp->d2 = g_cfgp->d2_prev = 0;
+    g_cfgp->sub_pending = g_cfgp->sub_to_pending = 0;
+}
 
 static int alloc_block(void)
 {
@@ -168,15 +212,14 @@ static int alloc_block(void)
     }
     base = (uint8_t *)(((uintptr_t)base + 63) & ~(uintptr_t)63);
     g_stub_ai  = (uint32_t *)base;
-    g_stub_act = (uint32_t *)(base + STUB_INSNS * 4);
-    g_cfgp     = (em_vhook_cfg_t *)(base + 2 * STUB_INSNS * 4);
+    g_stub_act = (uint32_t *)(base + STUB_AI_INSNS * 4);
+    g_stub_ret = (uint32_t *)(base + (STUB_AI_INSNS + STUB_ACT_INSNS) * 4);
+    g_cfgp     = (em_vhook_cfg_t *)(base + (STUB_AI_INSNS + STUB_ACT_INSNS + RET_INSNS) * 4);
     for (unsigned k = 0; k < sizeof(*g_cfgp) / 4; k++)
         ((uint32_t *)g_cfgp)[k] = 0;
-    /* NOT zero: (0,0) packs to 0, so a zeroed history would read as "the monster
-     * has been in (0,0) for two ticks" and could fire the one-shot on install. */
-    g_cfgp->prev_pair = g_cfgp->prev2_pair = 0xFFFFFFFFu;
-    mhfu_log("[%s] block @0x%08X (outside the PRX image)",
-             MOD_ID, (unsigned)(uintptr_t)base);
+    cfg_reset_live();
+    mhfu_log("[%s] block @0x%08X (outside the PRX image), cfg @0x%08X",
+             MOD_ID, (unsigned)(uintptr_t)base, (unsigned)(uintptr_t)g_cfgp);
     return 0;
 }
 
@@ -185,118 +228,60 @@ static uint32_t g_orig_ai;
 static uint32_t g_orig_act;
 static int      g_installed;
 
-/* --- slot 29: count, optionally SET THE ACTION BUDGET, then tail-call. -----
+/* --- slot 29: count, request, rules, one-shot budget, then tail-call. ------
  *
- * Why this seam exists at all. A slot-32 post-hook owns `entity+0x414` for 15 of
- * the 27 timer-gated actions; the other 12 re-seed it in their handler's
- * **phase-0 block**, which runs on the FIRST slot-29 tick — one frame after any
- * slot-32 hook can write. Measured: armed on (2,ANY) -> 1234, `(2,24)` held our
- * value 13/13 while `(2,16)` counted down from its own 150.
+ * Why the budget seam exists at all. A slot-32 post-hook owns `entity+0x414`
+ * for 15 of the 27 timer-gated actions; the other 12 re-seed it in their
+ * handler's **phase-0 block**, which runs on the FIRST slot-29 tick — one frame
+ * after any slot-32 hook can write. Measured: armed on (2,ANY) -> 1234, `(2,24)`
+ * held our value 13/13 while `(2,16)` counted down from its own 150.
  * `em_phase_map.py <ovl> --budget-owner` names both sets.
  *
  * 🔴 THE ONE-SHOT IS THE DESIGN. Re-asserting the budget every frame would not
  * "set the duration", it would FREEZE it — the handler decrements, we put it
  * back, and the action never ends. So we write on exactly ONE tick per action
  * instance: the SECOND one. Tick 1 is the phase-0 tick, where the handler seeds
- * its own literal AFTER us (this stub is frame-free, so it must stay a pre-hook);
- * tick 2 is the first phase-1 tick, which only decrements, so our value lands and
- * then counts down naturally from there. Shortening and lengthening both work —
- * a clamp ("only write if the budget is bigger than ours") would have been one
- * instruction cheaper and could only ever shorten.
+ * its own literal AFTER us (this stub is a pre-hook); tick 2 is the first
+ * phase-1 tick, which only decrements, so our value lands and then counts down
+ * naturally from there.
  *
- * "Second tick" is decided branchlessly from two history words:
  *      write  iff  matched  &&  prev == cur  &&  prev2 != cur
- * with prev/prev2 shifted every tick. No stack, no branch, one basic block.
  *
- * ⚠️ This one runs at ~30 Hz, which is why it stays FRAME-FREE where the slot-32
- * post-hook did not: the engine parks thread stacks inside the PRX image, and
- * frequency is what turns a marginal stack cost into a collision.
+ * The request and the rules run BEFORE that, so a pair they enter this frame
+ * has its phase-0 tick in the original step that follows, and the one-shot
+ * lands on its second tick like any other — the same clock as an engine entry.
+ *
+ * ⚠️ This one runs at ~30 Hz, which is why it stays FRAME-FREE: the engine
+ * parks thread stacks inside the PRX image, and frequency is what turns a
+ * marginal stack cost into a collision. Its one `jalr` spills ra and the step's
+ * arguments to config words (not reentrant — and it need not be: the step is
+ * dispatched once per frame from one site, and nothing under enter-action
+ * dispatches it).
  */
 static void build_ai_stub(uint32_t original)
 {
     uint32_t cfg = (uint32_t)(uintptr_t)g_cfgp;
-    uint32_t s[STUB_INSNS + 32];
-    int i = 0;
-
-    s[i++] = mips_lui(MIPS_REG_T7, (uint16_t)(cfg >> 16));
-    s[i++] = mips_ori(MIPS_REG_T7, MIPS_REG_T7, (uint16_t)cfg);
-    s[i++] = mips_lw (MIPS_REG_T0, CFG_AI_TICKS, MIPS_REG_T7);
-    s[i++] = mips_addiu(MIPS_REG_T0, MIPS_REG_T0, 1);
-    s[i++] = mips_sw (MIPS_REG_T0, CFG_AI_TICKS, MIPS_REG_T7);
-
-    /* cur = (main<<8)|sub, straight off the entity — a0 is still the entity
-     * because nothing has been called yet. */
-    s[i++] = mips_lbu(MIPS_REG_T0, ENT_MAIN, MIPS_REG_A0);
-    s[i++] = mips_lbu(MIPS_REG_T1, ENT_SUB,  MIPS_REG_A0);
-    s[i++] = mips_sll(MIPS_REG_T8, MIPS_REG_T0, 8);
-    s[i++] = mips_or (MIPS_REG_T8, MIPS_REG_T8, MIPS_REG_T1);   /* t8 = cur */
-
-    /* matched? same wildcard convention as the slot-32 stub. */
-    s[i++] = mips_lbu(MIPS_REG_T2, CFG_WANT_MAIN, MIPS_REG_T7);
-    s[i++] = mips_lbu(MIPS_REG_T3, CFG_WANT_SUB,  MIPS_REG_T7);
-    s[i++] = mips_xor(MIPS_REG_T0, MIPS_REG_T0, MIPS_REG_T2);
-    s[i++] = mips_xor(MIPS_REG_T1, MIPS_REG_T1, MIPS_REG_T3);
-    s[i++] = mips_xori(MIPS_REG_T3, MIPS_REG_T3, SUB_ANY);
-    s[i++] = mips_sltiu(MIPS_REG_T3, MIPS_REG_T3, 1);
-    s[i++] = mips_movn(MIPS_REG_T1, MIPS_REG_ZERO, MIPS_REG_T3);
-    s[i++] = mips_or (MIPS_REG_T0, MIPS_REG_T0, MIPS_REG_T1);
-    s[i++] = mips_sltiu(MIPS_REG_T2, MIPS_REG_T0, 1);           /* 1 iff match */
-
-    /* ... and only if this seam was explicitly armed. The slot-32 hook stays
-     * usable on its own; a mod picks the seam that owns the action it wants. */
-    s[i++] = mips_lbu(MIPS_REG_T3, CFG_ARM29, MIPS_REG_T7);
-    s[i++] = mips_sltiu(MIPS_REG_T3, MIPS_REG_T3, 1);           /* 1 iff off */
-    s[i++] = mips_xori(MIPS_REG_T3, MIPS_REG_T3, 1);            /* 1 iff on  */
-    s[i++] = mips_and(MIPS_REG_T2, MIPS_REG_T2, MIPS_REG_T3);
-
-    /* second tick of this action: prev == cur && prev2 != cur */
-    s[i++] = mips_lw (MIPS_REG_T4, CFG_PREV,  MIPS_REG_T7);
-    s[i++] = mips_lw (MIPS_REG_T5, CFG_PREV2, MIPS_REG_T7);
-    s[i++] = mips_xor(MIPS_REG_T6, MIPS_REG_T4, MIPS_REG_T8);
-    s[i++] = mips_sltiu(MIPS_REG_T6, MIPS_REG_T6, 1);           /* 1 iff prev==cur */
-    s[i++] = mips_and(MIPS_REG_T2, MIPS_REG_T2, MIPS_REG_T6);
-    s[i++] = mips_xor(MIPS_REG_T6, MIPS_REG_T5, MIPS_REG_T8);
-    s[i++] = mips_sltiu(MIPS_REG_T6, MIPS_REG_T6, 1);
-    s[i++] = mips_xori(MIPS_REG_T6, MIPS_REG_T6, 1);            /* 1 iff prev2!=cur */
-    s[i++] = mips_and(MIPS_REG_T2, MIPS_REG_T2, MIPS_REG_T6);
-
-    /* shift the history every tick, armed or not */
-    s[i++] = mips_sw (MIPS_REG_T4, CFG_PREV2, MIPS_REG_T7);
-    s[i++] = mips_sw (MIPS_REG_T8, CFG_PREV,  MIPS_REG_T7);
-
-    /* same bounded, branchless store as slot 32: entity+patch_off on a match,
-     * cfg.sink otherwise, identical instructions either way. */
-    s[i++] = mips_lw (MIPS_REG_T4, CFG_PATCH_OFF, MIPS_REG_T7);
-    s[i++] = mips_lw (MIPS_REG_T5, CFG_PATCH_VAL, MIPS_REG_T7);
-    s[i++] = mips_andi(MIPS_REG_T4, MIPS_REG_T4, PATCH_OFF_MASK);
-    s[i++] = mips_addu(MIPS_REG_T4, MIPS_REG_A0, MIPS_REG_T4);
-    s[i++] = mips_addiu(MIPS_REG_T6, MIPS_REG_T7, CFG_SINK);
-    s[i++] = mips_movn(MIPS_REG_T6, MIPS_REG_T4, MIPS_REG_T2);
-    s[i++] = mips_sw (MIPS_REG_T5, 0, MIPS_REG_T6);
-
-    s[i++] = mips_j(original);           /* tail call: a0..a3 and ra untouched */
-    s[i++] = MIPS_NOP;                                   /* j delay slot */
-
-    if (i > STUB_INSNS) {
-        mhfu_log("[%s] ai stub is %d insns > STUB_INSNS %d - installing a plain "
-                 "trampoline instead", MOD_ID, i, STUB_INSNS);
+    uint32_t ret = (uint32_t)(uintptr_t)g_stub_ret;
+    int overflow = 0;
+    int n = emv_build_ai_stub(g_stub_ai, STUB_AI_INSNS, cfg, original, ret, &overflow);
+    if (overflow) {
+        mhfu_log("[%s] ai stub is %d insns > STUB_AI_INSNS %d - installing a plain "
+                 "trampoline instead", MOD_ID, n, STUB_AI_INSNS);
         g_stub_ai[0] = mips_j(original);
         g_stub_ai[1] = MIPS_NOP;
         return;
     }
-    for (int k = 0; k < i; k++) g_stub_ai[k] = s[k];
-    for (int k = i; k < STUB_INSNS; k++) g_stub_ai[k] = MIPS_NOP;
-    mhfu_log("[%s] ai stub: pre-hook + one-shot budget, %d insns, frame-free",
-             MOD_ID, i);
+    for (int k = n; k < STUB_AI_INSNS; k++) g_stub_ai[k] = MIPS_NOP;
+    mhfu_log("[%s] ai stub: request + %d rules + one-shot budget, %d insns, frame-free",
+             MOD_ID, EM_VHOOK_RULES, n);
 }
 
-/* --- slot 32: POST-hook. Call the species' own enter-action FIRST, then, on a
- * matching (main,sub), store patch_val at entity+patch_off.
+/* --- slot 32: substitution PRE part, the original, v2's POST part. ---------
  *
- * 🔴 THE ORDERING IS THE WHOLE POINT. v1.0/v1.1 stored and then TAIL-CALLED the
- * original, so the species code ran last and simply overwrote us: armed on all
- * nine gated (2,x) actions, exactly 1 of 85 samples ever read our value back —
- * the gap between our store and the handler's. Reversed, on `(2,9)`:
+ * 🔴 THE POST ORDERING FOR THE BUDGET IS THE WHOLE POINT. v1.0/v1.1 stored and
+ * then TAIL-CALLED the original, so the species code ran last and simply
+ * overwrote us: armed on all nine gated (2,x) actions, exactly 1 of 85 samples
+ * ever read our value back. Reversed, on `(2,9)`:
  *
  *     forced +0x414 | value read back | longest occupancy of (2,9)
  *     --            | 498             | 3.30 s
@@ -315,118 +300,48 @@ static void build_ai_stub(uint32_t original)
  *     addition to the high-water mark is noise;
  *   - the identical frame ran on this exact dispatch path 100+ times per run
  *     across three multi-minute debugger sessions with no incident;
- *   - the stubs and config no longer live in the image at all (see alloc_block).
- * A frame-free post-hook IS possible — spill `ra` to a config word instead of the
- * stack and let `jal` set it — but that is not reentrant, and slot 32 fires twice
- * per transition and can be re-entered from a handler (the (2,9) handler itself
- * calls vt+0x88). The stack is the reentrant answer.
+ *   - the stubs and config do not live in the image at all (see alloc_block).
+ * Slot 32 fires twice per transition and can be re-entered from a handler (the
+ * (2,9) handler itself calls vt+0x88), so its ra goes on the stack — the
+ * reentrant answer — not in a config word.
  *
- * ⚠️ It also matches on the ARGUMENTS (a1,a2) rather than entity+0x298/+0x299.
- * The pre-hook read the struct, but `act_set` runs INSIDE the original, so before
- * the call those bytes still hold the PREVIOUS action — and some paths through
- * the original return early without ever reaching act_set. The args are the
- * intent, and they are what the validated tools/wrap_em_slot.py stub matched on.
+ * ⚠️ The budget match keys on the pair ACTUALLY ENTERED (after substitution),
+ * off the frame, rather than entity+0x298/+0x299: act_set runs INSIDE the
+ * original, so before the call those bytes still hold the PREVIOUS action.
  *
- * Branchless after the call: compute BOTH candidate store addresses and pick with
- * MOVN. On a miss the store lands in cfg.sink, which nothing reads. Armed and
- * unarmed runs therefore execute an identical instruction stream — the property
- * that made the extra-RAM crash diagnosable.
+ * Branchless throughout: compute BOTH candidate values/addresses and pick with
+ * MOVN. On a miss the substitution leaves a1/a2 as they came and the budget
+ * store lands in cfg.sink, which nothing reads. Armed and unarmed runs execute
+ * an identical instruction stream — the property that made the extra-RAM crash
+ * diagnosable.
  */
-#define ACT_FRAME   0x10
-#define ACT_SP_ENT  0x00
-#define ACT_SP_MAIN 0x04
-#define ACT_SP_SUB  0x08
-#define ACT_SP_RA   0x0C
-
 static void build_act_stub(uint32_t original)
 {
     uint32_t cfg = (uint32_t)(uintptr_t)g_cfgp;
-    uint32_t s[STUB_INSNS + 32];      /* assemble here, bounds-check, then copy */
-    int i = 0;
-
-    /* prologue: spill ra and the three args the original may clobber */
-    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, -ACT_FRAME);
-    s[i++] = mips_sw(MIPS_REG_RA, ACT_SP_RA,   MIPS_REG_SP);
-    s[i++] = mips_sw(MIPS_REG_A0, ACT_SP_ENT,  MIPS_REG_SP);
-    s[i++] = mips_sw(MIPS_REG_A1, ACT_SP_MAIN, MIPS_REG_SP);
-    s[i++] = mips_sw(MIPS_REG_A2, ACT_SP_SUB,  MIPS_REG_SP);
-
-    /* the species' own enter-action, with a0..a3 untouched. `jal` (not jalr)
-     * because the stub block and the overlay share a 256 MB region, same as the
-     * slot-29 stub's `j original`. */
-    s[i++] = mips_jal(original);
-    s[i++] = MIPS_NOP;                                   /* jal delay slot */
-
-    /* reload and tear the frame down: everything below is registers only.
-     * $v0/$v1 are never touched — the original's return value has to survive. */
-    s[i++] = mips_lw(MIPS_REG_T8, ACT_SP_ENT,  MIPS_REG_SP);   /* entity */
-    s[i++] = mips_lw(MIPS_REG_T0, ACT_SP_MAIN, MIPS_REG_SP);
-    s[i++] = mips_lw(MIPS_REG_T1, ACT_SP_SUB,  MIPS_REG_SP);
-    s[i++] = mips_lw(MIPS_REG_RA, ACT_SP_RA,   MIPS_REG_SP);
-    s[i++] = mips_addiu(MIPS_REG_SP, MIPS_REG_SP, ACT_FRAME);
-
-    s[i++] = mips_lui(MIPS_REG_T7, (uint16_t)(cfg >> 16));
-    s[i++] = mips_ori(MIPS_REG_T7, MIPS_REG_T7, (uint16_t)cfg);
-    s[i++] = mips_andi(MIPS_REG_T0, MIPS_REG_T0, 0xFF);        /* main */
-    s[i++] = mips_andi(MIPS_REG_T1, MIPS_REG_T1, 0xFF);        /* sub  */
-
-    /* bookkeeping: ++act_enters, last_pair = (main<<8)|sub */
-    s[i++] = mips_lw (MIPS_REG_T6, CFG_ACT_ENTER, MIPS_REG_T7);
-    s[i++] = mips_addiu(MIPS_REG_T6, MIPS_REG_T6, 1);
-    s[i++] = mips_sw (MIPS_REG_T6, CFG_ACT_ENTER, MIPS_REG_T7);
-    s[i++] = mips_sll(MIPS_REG_T6, MIPS_REG_T0, 8);
-    s[i++] = mips_or (MIPS_REG_T6, MIPS_REG_T6, MIPS_REG_T1);
-    s[i++] = mips_sw (MIPS_REG_T6, CFG_LAST_PAIR, MIPS_REG_T7);
-
-    s[i++] = mips_lbu(MIPS_REG_T2, CFG_WANT_MAIN, MIPS_REG_T7);
-    s[i++] = mips_lbu(MIPS_REG_T3, CFG_WANT_SUB,  MIPS_REG_T7);
-    s[i++] = mips_xor(MIPS_REG_T0, MIPS_REG_T0, MIPS_REG_T2);  /* 0 iff main ok */
-    s[i++] = mips_xor(MIPS_REG_T1, MIPS_REG_T1, MIPS_REG_T3);  /* 0 iff sub ok  */
-
-    /* WILDCARD: want_sub == SUB_ANY means "any sub of this main state".
-     * Betting on one exact pair is a poor bet — the timer-gated actions are
-     * transient, and a 300 s watch armed on (2,9) caught it zero times even
-     * though a survey minutes earlier saw it 39 times. Matching a whole main
-     * state fires on all nine gated (2,x) actions at once.
-     * Branchless: force the sub difference to 0 when the wildcard is set. */
-    s[i++] = mips_xori(MIPS_REG_T3, MIPS_REG_T3, SUB_ANY);   /* 0 iff wildcard */
-    s[i++] = mips_sltiu(MIPS_REG_T3, MIPS_REG_T3, 1);        /* 1 iff wildcard */
-    s[i++] = mips_movn(MIPS_REG_T1, MIPS_REG_ZERO, MIPS_REG_T3);
-
-    s[i++] = mips_or (MIPS_REG_T0, MIPS_REG_T0, MIPS_REG_T1); /* 0 iff match */
-    s[i++] = mips_sltiu(MIPS_REG_T2, MIPS_REG_T0, 1);         /* 1 iff match */
-
-    s[i++] = mips_lw (MIPS_REG_T4, CFG_PATCH_OFF, MIPS_REG_T7);
-    s[i++] = mips_lw (MIPS_REG_T5, CFG_PATCH_VAL, MIPS_REG_T7);
-    s[i++] = mips_andi(MIPS_REG_T4, MIPS_REG_T4, PATCH_OFF_MASK);  /* bound it */
-    s[i++] = mips_addu(MIPS_REG_T4, MIPS_REG_T8, MIPS_REG_T4); /* &entity[off] */
-    s[i++] = mips_addiu(MIPS_REG_T6, MIPS_REG_T7, CFG_SINK);   /* &cfg.sink   */
-    s[i++] = mips_movn(MIPS_REG_T6, MIPS_REG_T4, MIPS_REG_T2); /* pick on match */
-    s[i++] = mips_sw (MIPS_REG_T5, 0, MIPS_REG_T6);
-
-    s[i++] = mips_jr(MIPS_REG_RA);
-    s[i++] = MIPS_NOP;                                   /* jr delay slot */
-
-    if (i > STUB_INSNS) {
-        /* Cannot happen with the code above, but if someone extends the stub
-         * past the slot it would overrun the config block — fall back to a plain
-         * tail-call so the monster still behaves, and say so. */
-        mhfu_log("[%s] act stub is %d insns > STUB_INSNS %d - installing a plain "
-                 "trampoline instead", MOD_ID, i, STUB_INSNS);
+    int overflow = 0;
+    int n = emv_build_act_stub(g_stub_act, STUB_ACT_INSNS, cfg, original, &overflow);
+    if (overflow) {
+        mhfu_log("[%s] act stub is %d insns > STUB_ACT_INSNS %d - installing a plain "
+                 "trampoline instead", MOD_ID, n, STUB_ACT_INSNS);
         g_stub_act[0] = mips_j(original);
         g_stub_act[1] = MIPS_NOP;
         return;
     }
-    for (int k = 0; k < i; k++) g_stub_act[k] = s[k];
-    for (int k = i; k < STUB_INSNS; k++) g_stub_act[k] = MIPS_NOP;
-    mhfu_log("[%s] act stub: POST-hook, %d insns, frame 0x%X", MOD_ID, i, ACT_FRAME);
+    for (int k = n; k < STUB_ACT_INSNS; k++) g_stub_act[k] = MIPS_NOP;
+    mhfu_log("[%s] act stub: %d-entry substitution PRE, original, budget POST; "
+             "%d insns, frame 0x%X", MOD_ID, EM_VHOOK_SUBS, n, ACT_FRAME);
 }
 
-/* Public control surface — a mod (or the Lua host) can retarget the override
- * without a rebuild, because the stubs read the config every dispatch. */
+/* ------------------------------------------------------------ public API */
+
+extern "C" int em_vhook_installed(void) { return g_installed; }
+
+/* v2 surface — the +0x414 budget override. A mod (or the Lua host) can retarget
+ * it without a rebuild, because the stubs read the config every dispatch. */
 extern "C" void em_vhook_arm(uint8_t main_state, uint8_t sub_state,
                              uint32_t off, uint32_t val)
 {
+    if (!g_cfgp) return;
     g_cfgp->want_main = main_state;
     g_cfgp->want_sub  = sub_state;
     g_cfgp->patch_off = off;
@@ -437,18 +352,15 @@ extern "C" void em_vhook_arm(uint8_t main_state, uint8_t sub_state,
 }
 
 /* Pick which seam owns the armed action's `entity+0x414` budget.
- *
  *   off (default)  slot 32 only. Correct for the 15 gated actions whose handler
  *                  merely CONSUMES the budget.
  *   on             slot 29 as well — a one-shot on the action's second frame.
  *                  Needed for the 12 whose phase-0 block re-seeds the budget
  *                  after any slot-32 hook has already written.
- *
- * `em_phase_map.py <ovl> --budget-owner` says which set an action is in. Turning
- * this on for an action the slot-32 hook already owns is harmless but pointless:
- * both write the same value, so the budget just restarts once. */
+ * `em_phase_map.py <ovl> --budget-owner` says which set an action is in. */
 extern "C" void em_vhook_seam29(uint8_t on)
 {
+    if (!g_cfgp) return;
     g_cfgp->arm29 = on ? 1 : 0;
     g_cfgp->prev_pair = g_cfgp->prev2_pair = 0xFFFFFFFFu;   /* no stale one-shot */
     mhfu_log("[%s] slot-29 budget seam %s", MOD_ID, on ? "ON" : "off");
@@ -456,10 +368,130 @@ extern "C" void em_vhook_seam29(uint8_t on)
 
 extern "C" void em_vhook_stats(uint32_t *ai, uint32_t *acts, uint32_t *last)
 {
+    if (!g_cfgp) { if (ai) *ai = 0; if (acts) *acts = 0; if (last) *last = 0; return; }
     if (ai)   *ai   = g_cfgp->ai_ticks;
     if (acts) *acts = g_cfgp->act_enters;
     if (last) *last = g_cfgp->last_pair;
 }
+
+/* v3: substitution table. `count` 0 clears; EM_VHOOK_UNLIMITED is standing. */
+extern "C" void em_vhook_substitute(int slot, uint8_t from_mask, uint8_t from_sub,
+                                    uint8_t to_main, uint8_t to_sub, uint32_t count)
+{
+    if (!g_cfgp || slot < 0 || slot >= EM_VHOOK_SUBS) return;
+    cfg_sub_t *s = &g_cfgp->subs[slot];
+    /* order: disable first (left = 0 is the stub's off switch), then the
+     * bytes, then enable — a dispatch racing in between sees off or the
+     * complete new entry, never a half-written one */
+    s->left = 0;
+    s->from_mask = count ? from_mask : 0;
+    s->from_sub  = from_sub;
+    s->to_main   = to_main;
+    s->to_sub    = to_sub;
+    s->left      = count;
+    if (count)
+        mhfu_log("[%s] substitute[%d]: main mask 0x%02X sub %s -> (%u,%u) x%s",
+                 MOD_ID, slot, from_mask,
+                 from_sub == EM_VHOOK_SUB_ANY ? "any" : "exact", to_main, to_sub,
+                 count == EM_VHOOK_UNLIMITED ? "standing" : "n");
+    else
+        mhfu_log("[%s] substitute[%d]: cleared", MOD_ID, slot);
+}
+
+/* v3: a pair to enter on the next AI frame, through the engine's dispatcher. */
+extern "C" int em_vhook_request(uint8_t main_state, uint8_t sub_state, uint8_t mode)
+{
+    if (!g_cfgp || !g_installed) return 0;
+    g_cfgp->req_pending = 0;
+    g_cfgp->req_main = main_state;
+    g_cfgp->req_sub  = sub_state;
+    g_cfgp->req_mode = mode;
+    g_cfgp->req_pending = 1;
+    return 1;
+}
+
+/* v3: a native brain rule. NULL clears the slot. Distances come in units and
+ * go into the block squared, as raw f32 bits, which is what the stub compares. */
+static uint32_t f32_bits(float f) { union { float f; uint32_t u; } v; v.f = f; return v.u; }
+
+extern "C" void em_vhook_rule(int slot, const em_vhook_rule_t *r)
+{
+    if (!g_cfgp || slot < 0 || slot >= EM_VHOOK_RULES) return;
+    cfg_rule_t *c = &g_cfgp->rules[slot];
+    c->left = 0;                                    /* off while we write */
+    if (!r || r->count == 0 || r->from_mask == 0) {
+        c->from_mask = 0;
+        mhfu_log("[%s] rule[%d]: cleared", MOD_ID, slot);
+        return;
+    }
+    float lo = r->dist_lo < 0 ? 0 : r->dist_lo;
+    float hi = r->dist_hi < 0 ? 0 : r->dist_hi;
+    c->from_mask  = r->from_mask;
+    c->from_sub   = r->from_sub;
+    c->to_main    = r->to_main;
+    c->to_sub     = r->to_sub;
+    c->mode       = r->mode;
+    c->flags      = r->flags;
+    c->min_frames = r->min_frames;
+    c->d2_lo      = f32_bits(lo * lo);
+    c->d2_hi      = f32_bits(hi * hi);
+    c->cooldown   = r->cooldown;
+    c->fired      = 0;
+    c->last_fire  = 0;
+    c->left       = r->count;
+    mhfu_log("[%s] rule[%d]: main mask 0x%02X sub %s, >=%u frames, d in [%d,%d)%s%s "
+             "-> enter (%u,%u,m%u), cooldown %u, x%s",
+             MOD_ID, slot, r->from_mask,
+             r->from_sub == EM_VHOOK_SUB_ANY ? "any" : "exact",
+             (unsigned)r->min_frames, (int)lo, (int)hi,
+             (r->flags & EM_VHOOK_RULE_RECEDING) ? ", receding" : "",
+             (r->flags & EM_VHOOK_RULE_CLOSING)  ? ", closing"  : "",
+             r->to_main, r->to_sub, r->mode, (unsigned)r->cooldown,
+             r->count == EM_VHOOK_UNLIMITED ? "standing" : "n");
+}
+
+extern "C" void em_vhook_clear(void)
+{
+    if (!g_cfgp) return;
+    g_cfgp->req_pending = 0;
+    for (int i = 0; i < EM_VHOOK_SUBS; i++)  { g_cfgp->subs[i].left = 0; g_cfgp->subs[i].from_mask = 0; }
+    for (int i = 0; i < EM_VHOOK_RULES; i++) { g_cfgp->rules[i].left = 0; g_cfgp->rules[i].from_mask = 0; }
+}
+
+static float bits_f32(uint32_t u) { union { float f; uint32_t u; } v; v.u = u; return v.f; }
+static float sqrt_approx(float x)
+{
+    /* the status is for logs; `sqrt.s` is one Allegrex instruction */
+    if (!(x > 0)) return 0;
+    return __builtin_sqrtf(x);
+}
+
+extern "C" void em_vhook_status(em_vhook_status_t *out)
+{
+    if (!out) return;
+    for (unsigned k = 0; k < sizeof(*out) / 4; k++) ((uint32_t *)out)[k] = 0;
+    if (!g_cfgp) return;
+    out->installed   = (uint32_t)g_installed;
+    out->ai_ticks    = g_cfgp->ai_ticks;
+    out->act_enters  = g_cfgp->act_enters;
+    out->last_pair   = g_cfgp->last_pair;
+    out->frames      = g_cfgp->frames;
+    out->dist        = sqrt_approx(bits_f32(g_cfgp->d2));
+    out->sub_hits    = g_cfgp->sub_hits;
+    out->sub_landed  = g_cfgp->sub_landed;
+    out->sub_last_in = g_cfgp->sub_last_in;
+    out->brain_fires = g_cfgp->brain_fires;
+    out->req_pending = g_cfgp->req_pending;
+    out->req_done    = g_cfgp->req_done;
+    out->req_result  = g_cfgp->req_result;
+    out->ring_idx    = g_cfgp->ring_idx;
+    for (int i = 0; i < EM_VHOOK_RING; i++)  out->ring[i] = g_cfgp->ring[i];
+    for (int i = 0; i < EM_VHOOK_RULES; i++) { out->rule_fired[i] = g_cfgp->rules[i].fired;
+                                               out->rule_left[i]  = g_cfgp->rules[i].left; }
+    for (int i = 0; i < EM_VHOOK_SUBS; i++)  out->sub_left[i] = g_cfgp->subs[i].left;
+}
+
+/* ------------------------------------------------------------ latch */
 
 static void install_for(uint32_t entity)
 {
@@ -476,6 +508,9 @@ static void install_for(uint32_t entity)
     g_orig_ai  = mhfu_read_u32(vt + VT_SLOT(SLOT_AI_STEP));
     g_orig_act = mhfu_read_u32(vt + VT_SLOT(SLOT_ENTER_ACT));
 
+    cfg_reset_live();
+    emv_build_ret_stub(g_stub_ret);
+    g_stub_ret[2] = MIPS_NOP; g_stub_ret[3] = MIPS_NOP;
     build_ai_stub(g_orig_ai);
     build_act_stub(g_orig_act);
     mhfu_flush_caches();
@@ -499,9 +534,12 @@ static void uninstall(void)
     mhfu_write_u32(g_vtable + VT_SLOT(SLOT_AI_STEP),   g_orig_ai);
     mhfu_write_u32(g_vtable + VT_SLOT(SLOT_ENTER_ACT), g_orig_act);
     g_installed = 0;
-    mhfu_log("[%s] restored vtable 0x%08X (ai_ticks=%u act_enters=%u)",
-             MOD_ID, (unsigned)g_vtable,
-             (unsigned)g_cfgp->ai_ticks, (unsigned)g_cfgp->act_enters);
+    em_vhook_clear();
+    mhfu_log("[%s] restored vtable 0x%08X (ai_ticks=%u act_enters=%u sub %u/%u "
+             "req %u brain %u)", MOD_ID, (unsigned)g_vtable,
+             (unsigned)g_cfgp->ai_ticks, (unsigned)g_cfgp->act_enters,
+             (unsigned)g_cfgp->sub_hits, (unsigned)g_cfgp->sub_landed,
+             (unsigned)g_cfgp->req_done, (unsigned)g_cfgp->brain_fires);
 }
 
 static void on_spawn(const mhfu_monster_spawn_ctx_t *ctx)
@@ -515,9 +553,11 @@ static void on_quest(const mhfu_event_ctx_t *ctx)
     (void)ctx;
     /* A new quest may load a DIFFERENT species overlay, so the slots we saved
      * no longer describe resident code. Drop the hook and re-latch on the next
-     * big-monster spawn. */
+     * big-monster spawn. Everything declared for the old monster goes too. */
     uninstall();
     g_cfgp->ai_ticks = g_cfgp->act_enters = 0;
+    g_cfgp->sub_hits = g_cfgp->sub_landed = g_cfgp->brain_fires = 0;
+    g_cfgp->req_done = 0;
 }
 
 static int em_vhook_init(void)
@@ -527,10 +567,10 @@ static int em_vhook_init(void)
     g_cfgp->patch_val = 900;
     g_cfgp->want_main = 0xFF;      /* matches nothing until armed */
     g_cfgp->want_sub  = 0xFF;
-    g_cfgp->canary    = CFG_CANARY;
+    g_cfgp->canary    = CFG_CANARY_VAL;
     mhfu_on_monster_spawned(on_spawn);
     mhfu_on_quest_beginning(on_quest);
-    mhfu_log("[%s] ready; cfg @0x%08X, stubs @0x%08X / 0x%08X", MOD_ID,
+    mhfu_log("[%s] v3.0 ready; cfg @0x%08X, stubs @0x%08X / 0x%08X", MOD_ID,
              (unsigned)(uintptr_t)g_cfgp,
              (unsigned)(uintptr_t)g_stub_ai, (unsigned)(uintptr_t)g_stub_act);
     return 0;
@@ -538,6 +578,6 @@ static int em_vhook_init(void)
 
 static void em_vhook_shutdown(void) { uninstall(); }
 
-MHFU_MOD(.id = MOD_ID, .version = "2.1",
+MHFU_MOD(.id = MOD_ID, .version = "3.0",
          .needs = 0, .conflicts = 0,
          .init = em_vhook_init, .shutdown = em_vhook_shutdown);

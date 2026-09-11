@@ -46,6 +46,26 @@
 -- right thing in a shipping mod). A move that neither ends nor declares `after`
 -- is logged as parked after PARKED_TICKS.
 --
+-- 🟢 THE NATIVE SEAMS (em_vhook v3, issues #15/#16) FIX THE PROVISIONING GAP.
+-- When the framework was built with `em_vhook` and it has latched the monster's
+-- vtable (`mhfu.em_installed()`), this library stops writing the two cells:
+--
+--   play(name)   -> mhfu.em_request(main, sub): the pair is entered on the GAME
+--                   THREAD inside the next AI frame through the engine's own
+--                   enter-action, so the translator provisions it — a requested
+--                   charge gets its run budget and hands to the skid by itself.
+--   claim        -> mhfu.em_substitute: a move that CLAIMS host pairs (`claim =
+--                   { main = 1 }` = every main-1 attack the host brain picks) is
+--                   entered instead of them, before the species enter-action runs.
+--                   The host's brain keeps deciding WHEN; the port decides WHAT.
+--   port:rule{}  -> mhfu.em_rule: a 30 Hz trigger evaluated every frame in the
+--                   slot-29 stub — "in (1,4) >= 15 frames, receding, d >= 250 ->
+--                   lunge_stop" — with no Lua in the loop. Up to 4.
+--
+-- Without the seam (old PRX, mod off the manifest) everything below falls back
+-- to the byte-writing act_set, `after`/`hold_max` end the pair from here, and
+-- the log says so once.
+--
 -- This generalises to a source monster with NO host analogue (a Zinogre): you
 -- are not aligning the port to the host, you are picking any host behaviour with
 -- the physics you want and putting your own clip on top of it.
@@ -192,16 +212,64 @@ local function drain()
   PEND_N = 0
 end
 
+-- ------------------------------------------------------------- native seams
+-- em_vhook v3 (framework/prx/mods/em_vhook, docs/EM_OVERLAY_ABI.md §15). The
+-- bindings exist on a framework built with the mod; the seam is LIVE once the
+-- mod has latched the spawned monster's vtable, which happens on the same spawn
+-- event this library binds `port.ent` on — so the first tick after the spawn is
+-- the earliest anything native can be declared, and `_arm_native` runs there.
+local EM_ANY       = mhfu.EM_ANY or 0xFE
+local EM_UNLIMITED = mhfu.EM_UNLIMITED or -1
+local MAX_SUBS, MAX_RULES = 4, 4
+
+local function native_ready()
+  return mhfu.em_installed ~= nil and mhfu.em_installed() == true
+end
+P.native_ready = native_ready
+
+--- The seam's counters, or nil without it. `ring` is the last 8 enter-action
+--- dispatches the engine made (oldest first: main, sub, mode, subst) — the thing
+--- to read when a request or a substitution did not land.
+function P.native_status()
+  if mhfu.em_status == nil then return nil end
+  return mhfu.em_status()
+end
+
+local function ring_text(st)
+  if not st or not st.ring then return "?" end
+  local t = {}
+  for _, e in ipairs(st.ring) do
+    t[#t + 1] = string.format("(%d,%d,m%d)%s", e.main, e.sub, e.mode,
+                              e.subst ~= 0 and "*" or "")
+  end
+  return table.concat(t, " ")
+end
+
+--- A move's `claim` as a main-state bitmask + sub: `{ main = 1 }`, `{ main = {0, 1} }`,
+--- `{ main = 1, sub = 7 }`. Returns mask, sub (EM_ANY when none).
+local function claim_of(mv)
+  local c = mv.claim
+  if c == nil then return nil end
+  if type(c) == "number" then c = { main = c } end
+  local mains = c.main
+  if type(mains) == "number" then mains = { mains } end
+  local mask = 0
+  for _, m in ipairs(mains or {}) do mask = mask | (1 << m) end
+  if mask == 0 then return nil end
+  return mask, c.sub or EM_ANY
+end
+
 -- ------------------------------------------------------------- act_set
--- act_set (0x09AC8690) reimplemented with plain memory writes, because the
--- framework has no native-call binding for it. ⚠️ That is a gap, not a wall: the
--- PRX builds from `pspdev/pspdev:latest` via `make -C framework/prx` and the
--- image is on this box, so a real binding — and a tick faster than 2 Hz — is
--- work rather than a blocker. The engine's version also clears the per-slot
--- cursors behind two
--- condition checks; this does the unconditional part, which is the minimum a
--- handler needs to run from its first phase. Measured: a pair written this way
--- ran a complete attack and killed the hunter.
+-- act_set (0x09AC8690) reimplemented with plain memory writes — THE FALLBACK,
+-- used only while the native seam is not live (`native_ready()` false: an old
+-- PRX, or em_vhook off the manifest). ⚠️ A pair written this way is NOT
+-- PROVISIONED: the engine's own way in runs the per-main translator first
+-- (the charge's run budget +0x76C is set there), and this skips it — so a
+-- forced charge parks in its last phase with its hitbox spent, which is what
+-- `after`/`hold_max` exist to end. The engine's version also clears the
+-- per-slot cursors behind two condition checks; this does the unconditional
+-- part, which is the minimum a handler needs to run from its first phase.
+-- Measured: a pair written this way ran a complete attack and killed the hunter.
 --
 -- ⚠️ PULSED, never per-tick. Rewriting the pair every tick restarts the move
 -- before it reaches its hitbox frames (the same failure a held a1-force showed),
@@ -235,6 +303,10 @@ Port.__index = Port
 --   clips   name -> executor a1. THE PORT'S OWN animation vocabulary.
 --   moves   name -> { main, sub, clip } — the ALIGNMENT: which host behaviour
 --           runs, and which of the port's clips is shown while it does.
+--           `claim = { main = 1 }` (or `{ main = {0, 1}, sub = 7 }`): every
+--           enter-action the HOST BRAIN makes for a pair in that set is entered
+--           as this move instead (the substitution seam). A move with a claim
+--           is how a port with one attack rides the host's whole attack timing.
 --
 -- Returns a port handle. Safe to call again (hot reload): the injector is only
 -- armed once per boot.
@@ -264,6 +336,9 @@ function P.define(spec)
     _brain  = nil,
     _by_pair = {},      -- main*256+sub -> move name, for pairs the ENGINE enters
     _refused = {},      -- move name -> refusals, so the log says it once
+    _rules  = {},       -- Port:rule{} declarations, installed by _arm_native
+    _native_armed = false,
+    _req    = nil,      -- a play() issued through the seam, until it lands
   }, Port)
   -- Declared pairs the engine enters ON ITS OWN get the port's clip too — the
   -- hook below paints them — so the declared mapping holds whether the brain or
@@ -309,7 +384,9 @@ function Port:brain(fn) self._brain = fn; return self end
 --- once per ENTRY) again, and the engine's own walk (charge -> skid -> think)
 --- cut short every time. A brain that wants "charge again" waits for the move to
 --- END (`s.move == nil`) and plays it then. `opts.force = true` restarts anyway,
---- for a debugging session; a shipping mod has no use for it.
+--- for a debugging session; a shipping mod has no use for it. `opts.raw = true`
+--- writes the cells by hand even when the native seam is live (debugging the
+--- seam itself; nothing else wants an unprovisioned pair).
 function Port:play(move_name, min_gap, opts)
   local mv = self.moves[move_name]
   if not mv then log("[port:%s] no such move '%s'", self.name, tostring(move_name)); return false end
@@ -332,10 +409,29 @@ function Port:play(move_name, min_gap, opts)
     end
     return false
   end
-  act_set(self.ent, mv.main, mv.sub)
   self.move, self._played, self._played_at = move_name, move_name, self._tick
   self._phase_seen, self._phase_ticks, self._parked = nil, 0, false
+  self._entered = { mv.main, mv.sub }
   self.clip = mv.clip and self.clips[mv.clip] or mv.anim
+  -- 🟢 THE PROVISIONED WAY IN. With the seam live the pair is not written from
+  -- here at all: the slot-29 stub issues the engine's own enter-action on the
+  -- next AI frame (<= 33 ms), the translator provisions the handler, act_set
+  -- writes the cells. The clip latch above is set FIRST because the executor
+  -- dispatch that opens the move happens on the game thread inside that same
+  -- frame. The landing is checked on the next tick (`_req`).
+  if native_ready() and not (opts and opts.raw) then
+    local st = P.native_status()
+    self._req = { name = move_name, at = self._tick, done = st and st.req_done or 0,
+                  main = mv.main, sub = mv.sub }
+    mhfu.em_request(mv.main, mv.sub, mv.mode or 0)
+  else
+    if not P._once.raw_warned and mhfu.em_installed == nil then
+      P._once.raw_warned = true
+      log("[port] this framework has no em_vhook seam: pairs are written by hand "
+          .. "(unprovisioned — a forced charge parks; after=/hold_max= end it)")
+    end
+    act_set(self.ent, mv.main, mv.sub)
+  end
   -- 🔴 HOW MANY DISPATCHES THE CLIP OVERRIDE IS GOOD FOR, and one is the right
   -- answer. A forced pair does not correspond to a single executor dispatch:
   -- filmed live, one `(2,1)` lasting seven ticks asked the executor for a1
@@ -390,6 +486,7 @@ function Port:_walk_after(mv, ended, why)
   if lm == nm.main and ls == nm.sub then
     self.move, self._played, self._played_at = nxt, nxt, self._tick
     self._phase_seen, self._phase_ticks, self._parked = nil, 0, false
+    self._entered = { nm.main, nm.sub }
     self.clip = nm.clip and self.clips[nm.clip] or nm.anim
     self._clip_uses = nm.latch or 1
     log("[port:%s] '%s' %s -> after='%s': the engine is already in (%d,%d), adopted",
@@ -407,7 +504,104 @@ end
 --- Hand both channels back to the engine's own AI.
 function Port:release()
   self.move, self.clip, self._played, self._clip_uses = nil, nil, nil, 0
+  self._req, self._entered = nil, nil
   self:unpin()
+end
+
+--- A native 30 Hz brain rule (the slot-29 seam; issue #16). Evaluated every
+--- frame by the stub, no Lua in the loop:
+---
+---   port:rule{ from = "lunge",            -- a move name, or { main = 1, sub = 4 },
+---              from_main = { 0, 1 },      -- ...or a set of main states (any sub)
+---              min_frames = 15,           -- the pair must have stood this long
+---              dist = { 250, 1e9 },       -- player XZ distance window [lo, hi)
+---              receding = true,           -- only while the gap is GROWING
+---              closing = false,           -- only while it is SHRINKING
+---              play = "lunge_stop",       -- the move to enter (its main, sub)
+---              mode = 0, cooldown = 30, count = mhfu.EM_UNLIMITED }
+---
+--- Fires at most once per entry into `from` (the pair changes when it fires),
+--- then `cooldown` frames must pass. Up to 4 rules per port; declared in the
+--- mod's setup and installed when the seam is live. Without the seam the rule
+--- is inert and logged as such — the 2 Hz brain is the fallback.
+function Port:rule(spec)
+  if #self._rules >= MAX_RULES then
+    log("[port:%s] rule ignored: the seam holds %d", self.name, MAX_RULES)
+    return self
+  end
+  local r = { mask = 0, sub = EM_ANY, min_frames = spec.min_frames or 0,
+              dist_lo = spec.dist and spec.dist[1] or 0,
+              dist_hi = spec.dist and spec.dist[2] or 1.0e9,
+              receding = spec.receding and true or false,
+              closing = spec.closing and true or false,
+              mode = spec.mode or 0, cooldown = spec.cooldown or 0,
+              count = spec.count or EM_UNLIMITED, play = spec.play, label = spec.label }
+  local from = spec.from
+  if type(from) == "string" then
+    local mv = self.moves[from]
+    if not mv then log("[port:%s] rule: no such move '%s'", self.name, from); return self end
+    r.mask, r.sub = 1 << mv.main, mv.sub
+  elseif type(from) == "table" then
+    r.mask, r.sub = 1 << (from.main or 0), from.sub or EM_ANY
+  end
+  local fm = spec.from_main
+  if type(fm) == "number" then fm = { fm } end
+  for _, m in ipairs(fm or {}) do r.mask = r.mask | (1 << m) end
+  local to = self.moves[spec.play or ""]
+  if not to then
+    log("[port:%s] rule: play='%s' is not a declared move", self.name, tostring(spec.play))
+    return self
+  end
+  r.to_main, r.to_sub = to.main, to.sub
+  if r.mask == 0 then
+    log("[port:%s] rule -> '%s': no `from` pair, ignored", self.name, spec.play)
+    return self
+  end
+  self._rules[#self._rules + 1] = r
+  self._native_armed = false          -- (re)install on the next tick
+  return self
+end
+
+--- Install every claim and rule on the seam. Runs on the first tick the seam
+--- is live for this port, and again after a redefine (hot reload). Idempotent:
+--- the table is rewritten slot by slot, unused slots cleared.
+function Port:_arm_native()
+  self._native_armed = true
+  local names = {}
+  for n, mv in pairs(self.moves) do if claim_of(mv) then names[#names + 1] = n end end
+  table.sort(names)
+  local slot = 0
+  for _, n in ipairs(names) do
+    local mv = self.moves[n]
+    local mask, sub = claim_of(mv)
+    if slot < MAX_SUBS then
+      mhfu.em_substitute(slot, mask, sub, mv.main, mv.sub, EM_UNLIMITED)
+      log("[port:%s] claim: host enter-actions with main in 0x%02X%s -> '%s' (%d,%d), standing",
+          self.name, mask, sub == EM_ANY and "" or string.format(" sub %d", sub),
+          n, mv.main, mv.sub)
+    else
+      log("[port:%s] claim on '%s' ignored: the seam holds %d", self.name, n, MAX_SUBS)
+    end
+    slot = slot + 1
+  end
+  for k = slot, MAX_SUBS - 1 do mhfu.em_substitute(k, 0, EM_ANY, 0, 0, 0) end
+  for i = 1, MAX_RULES do
+    local r = self._rules[i]
+    if r then
+      mhfu.em_rule(i - 1, { from_mask = r.mask, from_sub = r.sub, to_main = r.to_main,
+                            to_sub = r.to_sub, mode = r.mode, min_frames = r.min_frames,
+                            dist_lo = r.dist_lo, dist_hi = r.dist_hi, receding = r.receding,
+                            closing = r.closing, cooldown = r.cooldown, count = r.count })
+      log("[port:%s] rule %d: main 0x%02X%s >=%d frames d[%d,%s)%s%s -> '%s' (%d,%d)",
+          self.name, i, r.mask, r.sub == EM_ANY and "" or (" sub " .. r.sub),
+          r.min_frames, math.floor(r.dist_lo),
+          r.dist_hi >= 1e9 and "inf" or tostring(math.floor(r.dist_hi)),
+          r.receding and " receding" or "", r.closing and " closing" or "",
+          r.play, r.to_main, r.to_sub)
+    else
+      mhfu.em_rule(i - 1, nil)
+    end
+  end
 end
 
 --- Point the monster at (x, z). Writes +0x1F4 only, so the engine's own VFPU
@@ -991,6 +1185,8 @@ local function port_state(port)
     -- 100 % and shows a solid eye (savestate `tigrex_s6`).
     --
     -- Gate on this and you are gating on "has noticed you".
+    -- true while the em_vhook seam drives play()/claims/rules (see the header)
+    native = native_ready(),
     engaged = mhfu.entity_engaged(ent),
     -- 🔴 WHO he has committed to, which is NOT what `engaged` says.
     -- `+0x2F4` is the resolved combat target pointer, selected by the priority
@@ -1057,16 +1253,60 @@ function mhfu_tick()
         local k = mhfu.read_u8(port.ent + OFF_MAIN) * 256 + mhfu.read_u8(port.ent + OFF_SUB)
         if k ~= port._paint.key then port._paint = nil end
       end
+      -- the seam comes up on the spawn event; the first tick after it is where
+      -- the claims and rules go in (and again after a redefine)
+      if not port._native_armed and native_ready() then
+        if not P._once["native:" .. port.name] then
+          P._once["native:" .. port.name] = true
+          log("[port:%s] native seam live: play() enters through the engine's "
+              .. "enter-action (provisioned); claims and rules installed", port.name)
+        end
+        port:_arm_native()
+      end
+      -- a play() issued through the seam: did the engine take it?
+      if port._req then
+        local rq, st = port._req, P.native_status()
+        local lm, ls = mhfu.read_u8(port.ent + OFF_MAIN), mhfu.read_u8(port.ent + OFF_SUB)
+        if lm == rq.main and ls == rq.sub then
+          log("[port:%s] '%s' entered natively (%d,%d), provisioned", port.name, rq.name, lm, ls)
+          port._req = nil
+        elseif ls == rq.sub then
+          -- the translator's alternative main (em75 id 4: (1,4) or (2,4))
+          log("[port:%s] '%s' entered natively as (%d,%d) — the translator's main for "
+              .. "id %d; tracking that pair", port.name, rq.name, lm, ls, rq.sub)
+          port._entered = { lm, ls }
+          port._req = nil
+        elseif st and st.req_done > rq.done and g_tick - rq.at >= 1 then
+          -- issued (req_done moved) but the cells never showed it: the enter-
+          -- action declined it, or something re-entered in the same frame
+          log("[port:%s] '%s' (%d,%d) was requested and issued but the cells read "
+              .. "(%d,%d) — result after the call (%d,%d); last enter-actions: %s",
+              port.name, rq.name, rq.main, rq.sub, lm, ls, st.req_main, st.req_sub,
+              ring_text(st))
+          port._req, port.move, port.clip, port._clip_uses = nil, nil, nil, 0
+          port._entered = nil
+        elseif g_tick - rq.at >= 3 then
+          log("[port:%s] '%s' request never issued after %d ticks (req_done %s) — "
+              .. "is the seam still latched?", port.name, rq.name, g_tick - rq.at,
+              tostring(st and st.req_done))
+          port._req, port.move, port.clip, port._clip_uses = nil, nil, nil, 0
+          port._entered = nil
+        end
+      end
       if port.move then
         local mv = port.moves[port.move]
         local lm, ls = mhfu.read_u8(port.ent + OFF_MAIN), mhfu.read_u8(port.ent + OFF_SUB)
         local held = g_tick - (port._played_at or g_tick)
-        if mv and (lm ~= mv.main or ls ~= mv.sub) then
-          log("[port:%s] move '%s' ended after %d ticks -> (%d,%d)", port.name,
-              port.move, held, lm, ls)
+        local em, es = mv and mv.main, mv and mv.sub
+        if port._entered then em, es = port._entered[1], port._entered[2] end
+        if port._req then
+          -- not landed yet (<= 1 tick): nothing to judge
+        elseif mv and (lm ~= em or ls ~= es) then
+          log("[port:%s] move '%s' (%d,%d) ended after %d ticks -> (%d,%d)", port.name,
+              port.move, em, es, held, lm, ls)
           local ended = port.move
           port.last_move, port.last_move_ticks = ended, held
-          port.move, port.clip, port._clip_uses = nil, nil, 0
+          port.move, port.clip, port._clip_uses, port._entered = nil, nil, 0, nil
           port:_walk_after(mv, ended, "ended")
         elseif mv then
           -- still standing. `hold_max` ends it from here; otherwise watch the
@@ -1077,7 +1317,7 @@ function mhfu_tick()
                 port.move, held, mv.hold_max, lm, ls)
             local ended = port.move
             port.last_move, port.last_move_ticks = ended, held
-            port.move, port.clip, port._clip_uses = nil, nil, 0
+            port.move, port.clip, port._clip_uses, port._entered = nil, nil, 0, nil
             if not port:_walk_after(mv, ended, "hold_max") then port:release() end
           elseif not mv.after then
             local phase = mhfu.read_u8(port.ent + OFF_PHASE)

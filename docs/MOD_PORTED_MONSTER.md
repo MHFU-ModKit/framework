@@ -92,7 +92,7 @@ Drop it in `ms0:/PSP/PLUGINS/mhfu_framework/mods/` next to `mhfu_port.lua` and c
 | `inject_dir` | defaults to `ms0:/PSP/PLUGINS/mhfu_framework/inject` |
 | `replace` | list of quest monster ids to swap for `species` at `QUEST_TARGETS_BUILDING` |
 | `clips` | name → executor `a1` |
-| `moves` | name → `{ main, sub, clip }` (or `anim = <a1>` to skip the vocabulary). `latch = <n>` overrides how many executor dispatches the clip covers — **the default is 1**, because one forced pair runs a SEQUENCE of sub-actions (a seven-tick `(2,1)` asked for a1 15, 11, 19 and 18 in turn) and overriding all of them restarts the clip from frame 0 each time. **`after = "<move>"`** is the move handed to when this one is over — the engine has left the pair — or has stood **`hold_max = <ticks>`**; declare it, because a pair written from here is not provisioned the way the engine's own entry provisions it and may never end by itself (§ `play`). (`after`, not `then`: `then` is a Lua keyword.) |
+| `moves` | name → `{ main, sub, clip }` (or `anim = <a1>` to skip the vocabulary). `latch = <n>` overrides how many executor dispatches the clip covers — **the default is 1**, because one forced pair runs a SEQUENCE of sub-actions (a seven-tick `(2,1)` asked for a1 15, 11, 19 and 18 in turn) and overriding all of them restarts the clip from frame 0 each time. **`after = "<move>"`** is the move handed to when this one is over — the engine has left the pair — or has stood **`hold_max = <ticks>`**; the fallback chain for a framework without the native seam (§ `play`). (`after`, not `then`: `then` is a Lua keyword.) **`claim = { main = 1 }`** (or `{ main = {0, 1}, sub = 7 }`): every enter-action the HOST brain issues for a pair in that set is entered as this move instead — the substitution seam; the host decides *when*, the port decides *what* (§ `claim`). |
 
 The injector is armed **once per boot** however many times `define` runs, so hot-reloading a
 mod file is safe.
@@ -172,7 +172,19 @@ library on the memstick silently drops the fields it does not know.
 
 ### `port:play(name [, min_gap [, opts]])`
 
-Writes the behaviour pair and latches the clip. Returns `false` if it declined.
+Enters the behaviour pair and latches the clip. Returns `false` if it declined.
+
+🟢 **With the native seam live it does not write the pair at all** (em_vhook v3, issues #15/#16;
+`s.native` / `P.native_ready()`): the request goes to the slot-29 stub, which on the very next AI
+frame (≤ 33 ms, on the game thread) calls the engine's own enter-action dispatcher `0x09AC89F0`
+— so the species translator PROVISIONS the pair (the charge gets its run budget) and act_set
+writes the cells, exactly as for a native entry. The next tick confirms it: `'lunge' entered
+natively (1,4), provisioned`. If the translator routed the id to its other main (em75's id 4 is
+`(1,4)` or `(2,4)`) the library tracks that pair; if the engine declined it, the line says so
+with the last eight enter-actions it made (`last enter-actions: (1,4,m0) ...`, `*` = one the
+substitution rewrote) and the move is dropped WITHOUT walking `after`. `opts = { raw = true }`
+writes the cells by hand anyway — for debugging the seam, nothing else. Without the seam (an
+old PRX, `em_vhook` off the manifest) it is the byte write below and the log says so once.
 
 Refuses to re-issue the **same** move within `min_gap` ticks (default 2). That guard is not
 politeness: re-entering the executor every tick restarts the move before it ever reaches its
@@ -185,7 +197,7 @@ the action from phase 0: the clip from frame 0, the hitbox node again (it spawns
 and the engine's own walk cut short. A brain that wants "charge again" waits for `s.move == nil`.
 `opts = { force = true }` restarts anyway — a debugging instrument, never a shipping mod's move.
 
-🔴 **A pair written from here is not what the engine writes, so declare the chain.** The engine
+🔴 **A pair written by hand (no seam) is not what the engine writes, so declare the chain.** The engine
 enters a pair through its enter-action and a per-main translator that provisions the handler —
 the Tigrex charge gets its run budget (`+0x76C`) there — and the handler then hands to the next
 pair itself: `(1,4) → (0,3)` (skid) `→ (0,1)/(0,2)` (the brain thinks again). `act_set` here
@@ -202,6 +214,48 @@ editor's **Moves** tab; the move's `after` / `hold_max` are what this library wa
 A declared pair the **engine** enters by itself gets the port's clip too (the executor hook
 paints it, `latch` dispatches per entry) — the mapping is a fact about the pair, not about who
 entered it — and nothing else: no `move`, no `after`, the engine walks its own chain.
+
+### `claim` — put the port on the host's clock (em_vhook v3, #15)
+
+```lua
+lunge = { main = 1, sub = 4, clip = "lunge_forward", claim = { main = 1 } }
+```
+
+The slot-32 stub sits in front of the species enter-action and rewrites the `(main, id)` the
+engine passes: an incoming call whose main is in the claim's set (and whose id is `sub`, if
+given) becomes `(1,4)`. The Tigrex brain still decides *when* to attack, how to position, when
+to turn; every attack it picks is the lunge, provisioned like its own, ending into the skid like
+its own, painted with the port's clip by the hook (`engine entered 'lunge' itself`). Standing
+until the port is redefined or the quest ends; four claims per port (the seam's table). The
+heartbeat counter `sub=hits/landed` says how many calls were rewritten and how many the cells
+confirmed. The hand-offs the handler itself makes (`(1,4) → (0,3)`) are main 0 and pass through
+— claim main states you want to REPLACE, not ones the chain hands to.
+
+### `port:rule{...}` — a 30 Hz brain rule, no Lua in the loop (em_vhook v3, #16)
+
+```lua
+zin:rule{ from = "lunge", min_frames = 15, receding = true, dist = { 250, 1e9 },
+          play = "lunge_stop", cooldown = 30 }
+```
+
+Evaluated every AI frame by the slot-29 stub: the live pair is in `from` (a move, or
+`from_main = {0, 1}` for whole main states), has stood `min_frames`, the hunter's XZ distance is
+in `[lo, hi)`, the gap is growing (`receding`) / shrinking (`closing`) if asked, the cooldown has
+passed and the fire budget (`count`, default standing) is not spent → the stub enters `play`'s
+pair through the same dispatcher a request uses. Fires once per entry into `from` (the pair
+changes when it fires). Four per port. A 2 Hz brain reads the world 500 ms late — a charge is
+~650 units further on by then; this reads it 33 ms late. `brain=` in the heartbeat counts fires.
+Declared in the mod's setup (before or after the seam is live — the library installs them on the
+first live tick and again after a hot reload).
+
+### `P.native_ready()` · `P.native_status()`
+
+`native_ready()` is true while em_vhook has latched the monster's vtable (from its spawn to the
+next quest). `native_status()` is the seam's counter block — `ai_ticks`, `act_enters`,
+`sub_hits/landed`, `brain_fires`, `req_done`, `dist` as the stub measured it, `ring` (the last 8
+enter-actions), `rule_fired[]` — or `nil` without the mod. The raw bindings underneath are
+`mhfu.em_installed/em_request/em_substitute/em_rule/em_clear/em_status`
+(`framework/prx/include/mhfu/em_vhook.h`).
 
 ### `port:latch(a1 [, uses])`
 
