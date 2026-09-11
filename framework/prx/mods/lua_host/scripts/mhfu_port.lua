@@ -88,7 +88,14 @@ local OFF_PREV_MAIN = 0x460   -- act_set stores the outgoing pair here; handlers
 local OFF_PREV_SUB  = 0x461   -- read it on transitions
 local OFF_PHASE     = 0x1D5   -- per-action phase cursor (+0x1D5..+0x1D7)
 local OFF_SECTION   = 0x29A   -- u16, compares against get_area_index()
-local OFF_HP        = 0x41E
+-- 🔴 +0x2E4 is CURRENT HP (the framework's entity_hp; the player's is the same
+-- offset). +0x41E is the MAX — the resolver's clamp. port_state.hp read +0x41E
+-- until 2026-09-11 and printed a flat 3200 through a fight the HIT lines
+-- counted down from.
+local OFF_HP        = 0x2E4
+local OFF_MAX_HP    = 0x41E
+local OFF_HZ_STATE  = 0x481   -- s8, which hitzone grid state the damage math reads
+local OFF_FLAGS     = 0x638   -- u32 flag word (0x8000 = visible; bit 0x20 <-> +0x481)
 local OFF_FREEZE    = 0x4B8
 -- The two cells that say WHO the monster has committed to, as opposed to
 -- whether it has noticed anyone. See `targets_player` in the state table.
@@ -590,20 +597,27 @@ end
 -- to be defined at the time. That is what makes hot-reloading a mod file safe:
 -- the mod's setup runs again, P.ports is rebuilt, and no handler is ever stacked.
 
-if not P._once.events then
-P._once.events = true
-
 -- Every hit the port takes, with the amount: the number issue #19 is measured
 -- in. Fires from the 5 Hz monster poll (an HP-drop edge), so two hits inside
--- 200 ms arrive as one line with their sum.
+-- 200 ms arrive as one line with their sum. `st` is entity+0x481, the grid
+-- STATE the hit was multiplied through (measured 2026-09-11: it follows bit
+-- 0x20 of +0x638 — set = state 1, clear = state 0 — and flips mid-fight), and
+-- `f638` the flag word, so a damage number can be read against the right row.
+-- Registered OUTSIDE the once-block on purpose: lb_on_damaged installs its C
+-- trampoline once and store_ref() replaces the closure, so a library reload
+-- picks up a new format here without stacking handlers.
 mhfu.on_bigmonster_damaged(function(ent, mtype, amount, hp, slot)
   for _, port in pairs(P.ports) do
     if port.ent == ent then
       port._hits = (port._hits or 0) + 1
-      log("[port:%s] HIT #%d  -%d  hp=%d", port.name, port._hits, amount, hp)
+      log("[port:%s] HIT #%d  -%d  hp=%d  st=%d f638=0x%X", port.name, port._hits,
+          amount, hp, mhfu.read_u8(ent + OFF_HZ_STATE), mhfu.read_u32(ent + OFF_FLAGS))
     end
   end
 end)
+
+if not P._once.events then
+P._once.events = true
 
 mhfu.on_quest_targets_building(function(quest)
   if quest == 0 then return end
@@ -745,6 +759,8 @@ local function port_state(port)
     acquired = mhfu.read_u8(ent + OFF_ACQUIRED),
     main = mhfu.read_u8(ent + OFF_MAIN), sub = mhfu.read_u8(ent + OFF_SUB),
     hp = mhfu.read_u16(ent + OFF_HP),
+    max_hp = mhfu.read_u16(ent + OFF_MAX_HP),
+    hz_state = mhfu.read_u8(ent + OFF_HZ_STATE),
     player_hp = mhfu.get_player_hp(),
   }
 end
