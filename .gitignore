@@ -1,0 +1,37 @@
+# PRX build artefacts — rebuilt by `make` in framework/prx (pspdev Docker image)
+framework/prx/*.elf
+framework/prx/*.prx
+framework/prx/*.o
+framework/prx/src/*.o
+framework/prx/mods/*/*.elf
+framework/prx/mods/*/*.prx
+framework/prx/mods/*/*.o
+framework/prx/mods/*/*.S
+framework/prx/mods/*/src/*.o
+framework/prx/framework_exports.c
+framework/prx/mods/*/exports.c
+framework/prx/himem_launcher/EBOOT*.PBP
+framework/prx/himem_launcher/PARAM.SFO
+framework/prx/himem_launcher/*.elf
+framework/prx/himem_launcher/*.o
+framework/prx/memgrow_vsh/*.prx
+framework/prx/memgrow_vsh/*.elf
+framework/prx/memgrow_vsh/*.o
+framework/prx/memprobe/*.prx
+framework/prx/memprobe/*.elf
+framework/prx/memprobe/*.o
+framework/prx/memprobe/diag/*.prx
+framework/prx/memprobe/diag/*.bak
+framework/prx/bootstrap_loader/*.o
+framework/prx/bootstrap_loader/mi.bin
+
+# Python
+__pycache__/
+*.pyc
+
+# Game files are never committed — your own dump lives here
+workspace/
+
+.DS_Store
+.vscode/
+.idea/
