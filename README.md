@@ -4,6 +4,8 @@
 
 # MHFU ModKit — the framework
 
+> **Archived.** This code now lives in [MHFU-ModKit/modkit](https://github.com/MHFU-ModKit/modkit), at [`framework`](https://github.com/MHFU-ModKit/modkit/tree/main/framework). Open issues and pull requests there.
+
 **A runtime mod framework for Monster Hunter Freedom Unite (PSP)** — load mods into the running
 game without patching or redistributing the ISO. Write a mod as a Lua script on the memory stick
 and hot-reload it while the game runs, or compile one into the plugin for full hook access.
